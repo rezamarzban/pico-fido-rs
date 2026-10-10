@@ -20,3 +20,32 @@
 | 5 | Flash error panic | Fixed (errors are returned and reported as CTAP `OTHER`). |
 | 5 | Fixed USB serial | Fixed. Derived from the flash chip unique ID. |
 | 5 | Unused keyboard interface | Removed (`src/usb/hid.rs`, `usbd-hid`), leaving a single FIDO HID interface. |
+
+# Second review round (se-harden0 follow-up)
+
+Edited without a Rust toolchain: nothing below has been compiled or run. Run `cargo fmt`, clippy and `host-test/run.sh`.
+
+| # | Finding | Result |
+|---|---------|--------|
+| 1 | getAssertion `up=false` skips touch | Fixed. `up` is validated but ignored; touch always required, UP flag set. e2e test updated. |
+| 2 | Reset with unknown storage position can resurrect old key | Fixed. `store::save` always scans both slots (read errors abort), uses `newest seq + 1` in the other slot, wipes the old slot with erase-retry then zero-overwrite fallback. Tests: higher-seq survivor, stuck slots. |
+| 3 | Reset fails in session but succeeds after reboot | Fixed. `store::replace` re-reads flash after any failure and returns `New` / `Kept` / `NoKey` / `Unknown`; the firmware sets its key from that (fail closed on `Unknown`). Failed unverified record is rolled back. Tests added. |
+| 4 | Reset deadline checked after touch | Fixed. The arrival timestamp is used for both calls. |
+| 5 | Map order / key types | Fixed. Canonical order (length, then bytewise) and int/text keys enforced at every depth. |
+| 6 | Floats rejected | Fixed. float16/32/64 and simple values 20..23 accepted; other simple values / break rejected. |
+| 7 | CANCEL handling | Fixed. Ignored unless it targets the active transaction; non-zero length -> INVALID_LEN. |
+| 8 | Zero-length CBOR | Fixed. INVALID_LEN at framing level, before any assembly. |
+| 9 | Channel eviction | Fixed. LRU; never evicts the active channel or one with a partial message; evicted-channel state is cleared. |
+| 10 | Nested missing-field error | Fixed. `CBOR_UNEXPECTED_TYPE` for missing user.id, descriptor members and pubKeyCredParams members. Top-level missing keys stay `MISSING_PARAMETER`. |
+| 11 | Stable CI vs nightly feature | Fixed by making nightly explicit: firmware CI, clippy and fmt use nightly; the host tests use a stable `host-test/rust-toolchain.toml`. |
+| 12 | Clippy `map_or` | Fixed (rewritten as a `match`; `--all-features` removed from CI because `flash_*` are exclusive). |
+| 13 | Fault-injection tests | Added: erase refused with data intact, stuck slots, verify-read failure, unknown position, unreadable flash, wrap-around. |
+| 14 | RNG health | Improved (RCT, APT, repeated sample) and documented as a failure detector only. Not entropy validation. |
+| 15 | Flash size | Configurable via `flash_*` features; `build.rs` generates `memory.x`. No runtime chip-size check (not verified on hardware). |
+| 16 | Unique-ID errors | Fixed. Serial omitted if unreadable or constant. |
+| 17 | CBOR 64-bit writer | Fixed + boundary tests. |
+| 18 | Crypto blocks CTAP task | Not changed (design limitation, documented; measure on hardware). |
+| 19 | Allocation / quadratic key check | Fixed. Linear, allocation-free map validation. |
+| 20 | Prototype USB IDs | Not fixable in code: constants isolated and documented; a real VID/PID must be obtained. |
+| 21 | Persistent serial privacy | `usb_serial` feature (default on) can be disabled. |
+| 22 | Docs | README added; SECURITY.md updated; hardware-verification gaps stated. |
