@@ -7,6 +7,8 @@ authors = ["sawyer bristol <sawyerbristol@gmail.com>"]
 [features]
 default = ["rp2040_board"] # official non w board
 rp2040_board = []
+# One-time, IRREVERSIBLE ATECC608 setup (writes + locks config/data zones). See README.
+provision = []
 
 [dependencies]
 cortex-m = { version = "0.7.7", features = ["inline-asm"] }
@@ -50,6 +52,7 @@ futures = { version = "0.3.17", default-features = false, features = [
 
 
 embedded-io-async = { version = "0.6.1", features = ["defmt-03"] }
+embedded-hal-async = "1.0"
 embedded-storage = { version = "0.3" }
 static_cell = "2"
 log = "0.4"

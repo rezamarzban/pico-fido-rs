@@ -8,7 +8,6 @@ use embassy_usb::class::hid::{HidReader, HidWriter};
 
 use crate::ctap::{err, Ctap, Resp};
 use crate::ctaphid::{self, Hid, Rx};
-use crate::keys::{self, Fl};
 use crate::{LedState, LED_SIGNAL};
 
 pub type Reader = HidReader<'static, Driver<'static, USB>, 64>;
@@ -62,11 +61,9 @@ pub async fn ctap_task(
     mut wr: Writer,
     mut ctap: Ctap,
     mut button: BOOTSEL,
-    mut flash: Fl,
 ) {
     let mut hid = Hid::new();
     let mut buf = [0u8; 64];
-    let mut rng = |b: &mut [u8]| keys::fill_random(b);
     LED_SIGNAL.signal(LedState::Active);
     loop {
         rd.ready().await;
@@ -78,21 +75,17 @@ pub async fn ctap_task(
             Rx::Reply(cid, cmd, d) => send(&mut wr, cid, cmd, &d).await,
             Rx::Cbor(cid, req) => {
                 LED_SIGNAL.signal(LedState::Processing);
-                let mut r = ctap.handle(&req, false, &mut rng);
+                let mut r = ctap.handle(&req, false).await;
                 if let Resp::NeedUp = r {
                     LED_SIGNAL.signal(LedState::Confirm);
                     r = match wait_touch(cid, &mut rd, &mut wr, &mut hid, &mut button).await {
                         Ok(()) => {
                             LED_SIGNAL.signal(LedState::Processing);
                             send(&mut wr, cid, ctaphid::KEEPALIVE, &[1]).await; // 1 = processing
-                            ctap.handle(&req, true, &mut rng)
+                            ctap.handle(&req, true).await
                         }
                         Err(code) => Resp::Err(code),
                     };
-                }
-                if ctap.dirty {
-                    keys::save(&mut flash, ctap.master());
-                    ctap.dirty = false;
                 }
                 let out: Vec<u8> = match r {
                     Resp::Ok(v) => v,
