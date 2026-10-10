@@ -5,8 +5,16 @@ version = "0.1.0"
 authors = ["sawyer bristol <sawyerbristol@gmail.com>"]
 
 [features]
-default = ["rp2040_board"] # official non w board
+default = ["rp2040_board", "flash_2m", "usb_serial"] # official non w board, 2 MiB flash
 rp2040_board = []
+# Flash size of the board: enable EXACTLY ONE (build.rs writes memory.x from it; store.rs uses
+# the last 8 KiB). Do not use --all-features.
+flash_2m = []
+flash_4m = []
+flash_8m = []
+flash_16m = []
+# Expose the flash chip's unique ID as USB serial number (disable to avoid host-side tracking).
+usb_serial = []
 
 [dependencies]
 cortex-m = { version = "0.7.7", features = ["inline-asm"] }

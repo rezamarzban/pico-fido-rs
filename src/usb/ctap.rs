@@ -10,7 +10,6 @@ use embassy_usb::class::hid::{HidReader, HidWriter};
 use crate::ctap::{err, Ctap, Resp};
 use crate::ctaphid::{self, Hid, Rx};
 use crate::keys::{self, Fl};
-use crate::store::Pos;
 use crate::{LedState, LED_SIGNAL};
 
 pub type Reader = HidReader<'static, Driver<'static, USB>, 64>;
@@ -99,7 +98,6 @@ pub async fn ctap_task(
     mut ctap: Ctap,
     mut button: BOOTSEL,
     mut flash: Fl,
-    mut pos: Option<Pos>,
 ) {
     let mut hid = Hid::new();
     let mut buf = [0u8; 64];
@@ -115,7 +113,10 @@ pub async fn ctap_task(
             Rx::Reply(cid, cmd, d) => send(&mut wr, cid, cmd, &d).await,
             Rx::Cbor(cid, req) => {
                 LED_SIGNAL.signal(LedState::Processing);
-                let mut r = ctap.handle(&req, false, now_ms(), &mut rng);
+                // The reset window is judged on when the request ARRIVED, not on when the
+                // user finally pressed the button, so both calls use this timestamp.
+                let arrived = now_ms();
+                let mut r = ctap.handle(&req, false, arrived, &mut rng);
                 if let Resp::NeedUp = r {
                     LED_SIGNAL.signal(LedState::Confirm);
                     match wait_touch(cid, &mut rd, &mut wr, &mut hid, &mut button).await {
@@ -123,7 +124,7 @@ pub async fn ctap_task(
                             LED_SIGNAL.signal(LedState::Processing);
                             send(&mut wr, cid, ctaphid::KEEPALIVE, &[1]).await; // 1 = processing
                             let t = Instant::now();
-                            r = ctap.handle(&req, true, now_ms(), &mut rng);
+                            r = ctap.handle(&req, true, arrived, &mut rng);
                             // P-256 runs without yielding; this shows how long the host waits.
                             info!("crypto took {} ms", t.elapsed().as_millis());
                         }
@@ -138,14 +139,17 @@ pub async fn ctap_task(
                     Resp::Ok(v) => v,
                     Resp::Err(c) => vec![c],
                     Resp::NeedUp => vec![err::OTHER],
-                    Resp::Reset(key) => match keys::replace(&mut flash, &key, pos) {
-                        Ok(p) => {
-                            pos = Some(p);
-                            ctap.install_key(key);
+                    Resp::Reset(key) => {
+                        // Flash is the source of truth: after success OR failure the running key
+                        // is set to exactly what the next boot will load (or none if unknowable).
+                        let o = keys::replace(&mut flash, &key);
+                        ctap.set_key(o.active);
+                        if o.ok {
                             vec![0]
+                        } else {
+                            vec![err::OTHER]
                         }
-                        Err(()) => vec![err::OTHER],
-                    },
+                    }
                 };
                 send(&mut wr, cid, ctaphid::CBOR, &out).await;
                 hid.end();

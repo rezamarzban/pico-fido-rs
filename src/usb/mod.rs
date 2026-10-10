@@ -21,19 +21,28 @@ async fn run_usb(mut usb: UsbDevice<'static, Driver<'static, USB>>) {
     usb.run().await;
 }
 
+/// PROTOTYPE USB identifiers. They are not assigned to this project and must be replaced before
+/// the device is distributed (open-source projects can request a PID under VID 0x1209 from
+/// pid.codes; commercial products need their own VID). The strings are placeholders as well.
+pub const USB_VID: u16 = 0xc0de;
+pub const USB_PID: u16 = 0xcafe;
+pub const USB_MANUFACTURER: &str = "LegtCamper";
+pub const USB_PRODUCT: &str = "Pico Fido";
+
+/// `serial = None` presents no serial number (see keys::serial and the `usb_serial` feature).
 pub fn create_usb_tasks(
     usb: USB,
-    serial: &'static str,
+    serial: Option<&'static str>,
 ) -> (SpawnToken<impl Sized>, CtapReader, CtapWriter) {
     let driver = Driver::new(usb, Irqs);
 
     // These are what is reconized by ctap apps like yubikey
     // and may need to be changed to be reconized
     // Create embassy-usb Config - VID, PID
-    let mut config = Config::new(0xc0de, 0xcafe);
-    config.manufacturer = Some("LegtCamper");
-    config.product = Some("Pico Fido");
-    config.serial_number = Some(serial);
+    let mut config = Config::new(USB_VID, USB_PID);
+    config.manufacturer = Some(USB_MANUFACTURER);
+    config.product = Some(USB_PRODUCT);
+    config.serial_number = serial;
     config.max_power = 100;
     config.max_packet_size_0 = 64;
 

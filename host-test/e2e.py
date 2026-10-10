@@ -52,9 +52,12 @@ cred = {"type": "public-key", "id": cid}
 a = ctap.get_assertion("example.com", cdh, [cred])
 pub.verify(bytes(a.auth_data) + cdh, a.signature); assert a.credential["id"] == cid and a.auth_data.flags == 0x01
 print("registration + assertion signature: VALID")
+# policy (SECURITY.md): every signature needs a fresh touch, whatever the request's "up" option says
 t = dev.touches; a2 = ctap.get_assertion("example.com", cdh, [cred], options={"up": False})
-assert dev.touches == t and a2.auth_data.flags == 0; pub.verify(bytes(a2.auth_data) + cdh, a2.signature)
-print("up=false probe: ok, no touch")
+assert dev.touches == t + 1, "up=false must NOT skip the button press"
+assert a2.auth_data.flags == 0x01; pub.verify(bytes(a2.auth_data) + cdh, a2.signature)
+t = dev.touches; ctap.get_assertion("example.com", cdh, [cred], options={"up": True}); assert dev.touches == t + 1
+print("up=false cannot bypass the touch requirement")
 
 # ---------- credential / option errors ---------------------------------------------------------
 expect(0x2E, lambda: ctap.get_assertion("evil.com", cdh, [cred]))
@@ -81,23 +84,29 @@ def mc_missing(key):
 assert dev.status(mc_missing(3)) == 0x14, "user entity is required"
 assert dev.status(mc_missing(4)) == 0x14, "pubKeyCredParams is required"
 assert dev.status(mc_missing(1)) == 0x14 and dev.status(mc_missing(2)) == 0x14
-assert dev.status(mc({3: {"name": "x"}})) == 0x14, "user.id is required"
+assert dev.status(mc({3: {"name": "x"}})) == 0x11, "user.id is required (nested member -> CBOR_UNEXPECTED_TYPE)"
 assert dev.status(mc({3: {"id": b""}})) == 0x02 and dev.status(mc({3: {"id": b"x" * 65}})) == 0x02
-assert dev.status(mc({4: [{"type": "public-key"}]})) == 0x14
-assert dev.status(mc({5: [{"id": cid}]})) == 0x14, "descriptor without type"
-assert dev.status(mc({5: [{"type": "public-key"}]})) == 0x14, "descriptor without id"
+assert dev.status(mc({4: [{"type": "public-key"}]})) == 0x11
+assert dev.status(mc({5: [{"id": cid}]})) == 0x11, "descriptor without type"
+assert dev.status(mc({5: [{"type": "public-key"}]})) == 0x11, "descriptor without id"
 assert dev.status(mc({1: b"short"})) == 0x02
 assert dev.status(mc({8: b"x" * 16, 9: 1})) == 0x35
 ga = lambda o={}: b"\x02" + cbor.encode({**{1: "example.com", 2: cdh, 3: [cred]}, **o})
 assert dev.status(ga()) == 0
-assert dev.status(ga({3: [{"id": cid}]})) == 0x14 and dev.status(ga({3: [{"type": "public-key"}]})) == 0x14
+assert dev.status(ga({3: [{"id": cid}]})) == 0x11 and dev.status(ga({3: [{"type": "public-key"}]})) == 0x11
 assert dev.status(ga({5: {"uv": True}})) == 0x2B
 good = mc()
 assert dev.status(good + b"\x00") == 0x12, "trailing bytes"
 assert dev.status(good.replace(b"\xa4\x01", b"\xa4\x18\x01", 1)) == 0x12, "non-minimal key"
 assert dev.status(b"\x01\xa2\x01\x41\x00\x01\x41\x00") == 0x12, "duplicate key"
 assert dev.status(b"\x01\xa1\x01\xc1\x00") == 0x12, "tag"
-assert dev.status(b"\x01\xa1\x01\xf9\x00\x00") == 0x12, "float"
+base = cbor.encode({1: cdh, 2: rp, 3: user, 4: kp}); assert base[0] == 0xa4
+withfloat = b"\x01\xa5" + base[1:] + b"\x18\x63\xf9\x3c\x00"          # extra unknown key 99 = float16 1.0
+assert dev.status(withfloat) == 0, "floats in unknown fields are ignored, not rejected"
+assert dev.status(b"\x01\xa1\x01\xf9\x00\x00") == 0x11, "float where a byte string is expected"
+assert dev.status(b"\x01\xa2\x02\x41\x00\x01\x41\x00") == 0x12, "map keys out of canonical order"
+assert dev.status(b"\x01\xa1\x41\x00\x00") == 0x11, "byte-string map key"
+assert dev.status(b"\x01\xa1\x80\x00") == 0x11, "array map key"
 assert dev.status(b"\x01\xa1\x01\x81\x81\x81\x81\x00") == 0x12, "nesting depth 5"
 assert dev.status(b"\x01\x80") == 0x11 and dev.status(b"\x01") == 0x12 and dev.status(b"") == 0x03
 assert dev.status(b"\x04\x00") == 0x03 and dev.status(b"\x07\x00") == 0x03 and dev.status(b"\x0b\xa0") == 0x03

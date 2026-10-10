@@ -1,5 +1,7 @@
 #![no_std]
 #![no_main]
+// Nightly-only feature: the firmware must be built with the nightly toolchain pinned by
+// rust-toolchain.toml (CI does the same). Host tests (host-test/) build on stable.
 #![feature(impl_trait_in_assoc_type)]
 
 #[global_allocator]
@@ -20,14 +22,25 @@ use {defmt_rtt as _, panic_probe as _};
 mod cbor;
 mod ctap;
 mod ctaphid;
+mod health;
 mod keys;
 mod store;
 mod usb;
 use ctap::Ctap;
 use usb::{create_usb_tasks, ctap_task};
 
-// Two 4K sectors at the end of this much flash hold the master key (see memory.x, store.rs).
-pub const FLASH_SIZE: usize = 2 * 1024 * 1024;
+// Two 4K sectors at the end of the flash hold the master key (see store.rs). The flash size is a
+// deliberate board setting: enable exactly one `flash_*` Cargo feature. build.rs derives the
+// linker script (memory.x) from the same feature, so code and linker layout always agree.
+const FLASH_MB: usize = (cfg!(feature = "flash_2m") as usize) * 2
+    + (cfg!(feature = "flash_4m") as usize) * 4
+    + (cfg!(feature = "flash_8m") as usize) * 8
+    + (cfg!(feature = "flash_16m") as usize) * 16;
+const _: () = assert!(
+    matches!(FLASH_MB, 2 | 4 | 8 | 16),
+    "enable exactly one of the flash_2m / flash_4m / flash_8m / flash_16m features"
+);
+pub const FLASH_SIZE: usize = FLASH_MB * 1024 * 1024;
 
 const HEAP_SIZE: usize = 32 * 1024;
 static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
@@ -39,9 +52,15 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
-    let (master, pos) = keys::load(&mut flash);
+    let master = keys::load(&mut flash);
     let ctap = Ctap::new(master);
-    let serial = keys::serial(&mut flash);
+    // A persistent serial number lets hosts recognise this exact device across connections
+    // (privacy trade-off): build without the `usb_serial` feature to omit it.
+    let serial = if cfg!(feature = "usb_serial") {
+        keys::serial(&mut flash)
+    } else {
+        None
+    };
 
     // Get board specific pin
     let led_pin = {
@@ -54,7 +73,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(blinker(led_pin)).unwrap();
     spawner.spawn(usb_task).unwrap();
     spawner
-        .spawn(ctap_task(ctap_rd, ctap_wr, ctap, p.BOOTSEL, flash, pos))
+        .spawn(ctap_task(ctap_rd, ctap_wr, ctap, p.BOOTSEL, flash))
         .unwrap();
 }
 
@@ -65,7 +84,7 @@ pub enum LedState {
     Confirm, // Waiting for user to confirm
     #[default]
     Idle, // Pico goes to sleep
-    Active,  // Awake and waiting for a command
+    Active, // Awake and waiting for a command
     Processing, // Busy and cannot receive new commands
 }
 
