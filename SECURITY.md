@@ -10,11 +10,20 @@ This is a small, software-only FIDO2 key for the RP2040. Read this before relyin
   the authenticator itself: a getAssertion with `options.up = false` still requires (and reports) a touch.
 
 ## What it does NOT protect against
-* **Anyone who can read the flash.** The 32-byte master key is stored in plain flash (two sectors at the end,
-  see `src/store.rs`). The RP2040 has no secure storage, no flash encryption and no OTP key area, and the
+* **Anyone who can read the flash, when no PIN is set.** Without a PIN the 32-byte master key is stored in plain
+  flash (see `src/store.rs`). The RP2040 has no secure storage, no flash encryption and no OTP key area, and the
   USB bootloader or SWD can read the whole flash. With the master key and a credential ID, the private key
-  can be re-derived. Treat physical access as full compromise. A secure element (e.g. ATECC608, OPTIGA) that
-  signs internally is the only real fix.
+  can be re-derived. **Set a PIN** (see below) to raise the cost of this attack; it does not remove it.
+  A secure element (e.g. ATECC608, OPTIGA) that signs internally is the only real fix.
+* **Anyone who can read the flash, when a PIN is set: offline PIN guessing.** The wrapped key can be attacked at
+  Argon2id speed on a fast PC; the retry counter only limits attempts made through the USB interface. With
+  `m = 96 KiB` (RAM-limited, see `src/wrap.rs`) the memory hardness is low, so security rests on the
+  **PIN entropy**: use a long passphrase (the firmware enforces at least 10 characters; 5 random words or more is
+  much better). The Argon2 parameters were not measured on hardware.
+* **Anyone who can read RAM while a PIN session is open** (debugger / SWD): the unwrapped key is in RAM for up to
+  2 minutes after a successful PIN entry. The RP2040 has no debug lockout.
+* **Cutting power at exactly the right moment** can defeat the retry counter only for an attacker who controls
+  the device's power with millisecond precision; such an attacker can read the flash anyway (see above).
 * **Weak randomness.** The RP2040 has a ring oscillator, not a certified TRNG. `keys.rs` consumes 512 raw bytes
   per 32 output bytes, mixes timer jitter and a running pool through SHA-256, and halts if continuous health tests
   (`src/health.rs`: SP 800-90B-style repetition-count and adaptive-proportion tests, plus a check for identical
@@ -24,7 +33,24 @@ This is a small, software-only FIDO2 key for the RP2040. Read this before relyin
 * **Side channels / fault injection.** No countermeasures.
 
 ## Behaviour worth knowing
-* Credentials are stateless (no resident keys, no PIN, sign counter always 0, attestation "none").
+* Credentials are stateless (no resident keys, sign counter always 0, attestation "none").
+* **PIN (optional, CTAP2 ClientPIN, protocols 1 and 2).** Setting a PIN replaces the plain key in flash with a
+  *wrapped* record: the master key encrypted-then-MACed under keys from Argon2id(PIN hash, random salt)
+  (`src/wrap.rs`). The plain key is not in flash and is only in RAM while a PIN session is valid:
+  `getPinToken` unwraps it and returns a token valid for 2 minutes; the key is wiped when the token expires
+  (checked once a second while idle and at every request), on USB reset, suspend or disable, and on `lock`.
+  Credentials created before the PIN stay valid (the master key itself does not change).
+  Every `makeCredential`/`getAssertion` then needs a valid `pinUvAuthParam` **and** the button; the UV flag is set.
+  `setPIN`/`changePIN` also need the button, so an attacker with USB access cannot silently set a PIN.
+* **Retry counter.** An attempt is written to flash *before* the guess is evaluated and marked correct only
+  afterwards, so cutting power does not give free guesses. 8 failures block the PIN (`PIN_BLOCKED`); 3 in a row
+  since power-up require a power cycle (`PIN_AUTH_BLOCKED`). A blocked or forgotten PIN is recovered only by a
+  CTAP reset (touch, within 10 s of plug-in), which destroys all credentials. A correct PIN needs no flash erase.
+* If the wrapped record is damaged there is no way to recover the key (by design); reset is the way out.
+* Minimum PIN length is 10 Unicode code points (`MIN_PIN_LEN`), enforced by the authenticator
+  (`PIN_POLICY_VIOLATION`).
+* The firmware needs a 160 KiB heap for Argon2 and reserves the last **12 KiB** of flash (retry counter + two
+  key slots). Records written by older firmware (56-byte plain key) are still read.
 * If the key record is damaged or flash cannot be read, the device **refuses to operate** (CTAP error
   `OTHER`) instead of silently generating a new key. A CTAP reset (touch, within 10 s of plugging in) starts over.
   Reset destroys every credential.
