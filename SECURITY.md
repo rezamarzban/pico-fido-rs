@@ -31,6 +31,7 @@ This is a small, software-only FIDO2 key for the RP2040. Read this before relyin
   not measure entropy. Hashing cannot create entropy that is not there; the key is only as unpredictable as the
   ROSC. Not evaluated against NIST SP 800-90B. Do not use for high-value accounts without reviewing this.
 * **Side channels / fault injection.** No countermeasures.
+* **Unverified on hardware.** See `README.md`, "Verification status". Simulated flash and host tests are not a physical test.
 
 ## Behaviour worth knowing
 * Credentials are stateless (no resident keys, sign counter always 0, attestation "none").
@@ -46,6 +47,15 @@ This is a small, software-only FIDO2 key for the RP2040. Read this before relyin
   afterwards, so cutting power does not give free guesses. 8 failures block the PIN (`PIN_BLOCKED`); 3 in a row
   since power-up require a power cycle (`PIN_AUTH_BLOCKED`). A blocked or forgotten PIN is recovered only by a
   CTAP reset (touch, within 10 s of plug-in), which destroys all credentials. A correct PIN needs no flash erase.
+* **Failed wipes are reported.** After setPIN, changePIN or reset the new state is always the one the next boot
+  will load. If the *old* key record could not be wiped (or the wipe could not be read back), the command answers
+  with an error (`OTHER`) although the new state is active and durable; retrying is safe, and the old record is
+  wiped again at every boot (`purge_stale`). Until then old key material may remain readable in flash.
+* **A USB reset, suspend or disable ends the PIN session** and cancels a command that is waiting for the button
+  (error `OTHER`), also on a key without a PIN. The ephemeral key-agreement key is discarded whenever the session
+  ends (lock, expiry, USB events, any PIN write). A client that holds a key-agreement object across such an event
+  must fetch a new one.
+* A client's COSE key-agreement object must carry `kty` = 2 and `crv` = 1 (and `alg` = -25 if present).
 * If the wrapped record is damaged there is no way to recover the key (by design); reset is the way out.
 * Minimum PIN length is 10 Unicode code points (`MIN_PIN_LEN`), enforced by the authenticator
   (`PIN_POLICY_VIOLATION`).

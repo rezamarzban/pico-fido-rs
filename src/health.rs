@@ -4,7 +4,10 @@
 //! conservative assumption of >= 1 bit of entropy per byte (alpha = 2^-20):
 //! * Repetition Count Test: the same byte `RCT_CUTOFF` times in a row is a failure.
 //! * Adaptive Proportion Test: in a window of `APT_WINDOW` bytes, the first byte of the window
-//!   occurring `APT_CUTOFF` times or more is a failure.
+//!   occurring `APT_CUTOFF` times or more is a failure. For H = 1 bit per byte a byte value has
+//!   probability p = 2^-1, and the cutoff is 1 + the smallest c with P(Binomial(512, 1/2) > c)
+//!   <= 2^-20, which is 311 (SP 800-90B, table for W = 512). 410 would correspond to only
+//!   H = 0.5 bit per byte, a much weaker assumption than the one documented here.
 //! Additionally, two identical consecutive 64-byte samples are a failure; this catches a source
 //! frozen on a non-uniform pattern, which the two tests above cannot see.
 //!
@@ -14,7 +17,7 @@
 pub const SAMPLE: usize = 64;
 const RCT_CUTOFF: u32 = 21;
 const APT_WINDOW: u32 = 512;
-const APT_CUTOFF: u32 = 410;
+const APT_CUTOFF: u32 = 311;
 
 pub struct Health {
     last: [u8; SAMPLE],

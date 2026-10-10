@@ -23,7 +23,7 @@
 
 # Second review round (se-harden0 follow-up)
 
-Edited without a Rust toolchain: nothing below has been compiled or run. Run `cargo fmt`, clippy and `host-test/run.sh`.
+Written without a Rust toolchain; **compiled and tested since** (see the verification summary of the third round).
 
 | # | Finding | Result |
 |---|---------|--------|
@@ -52,9 +52,7 @@ Edited without a Rust toolchain: nothing below has been compiled or run. Run `ca
 
 # PIN round (ClientPIN + wrapped master key)
 
-Written without a Rust toolchain: **nothing here has been compiled or run**; expect to fix compile errors,
-`cargo fmt` and clippy findings, and to update `Cargo.lock` (new crates: `aes`, `cbc`, `argon2`, `zeroize`,
-and `p256`'s `ecdh` feature).
+Written without a Rust toolchain; **compiled and tested since** (see the verification summary of the third round).
 
 | Area | Change |
 |------|--------|
@@ -66,4 +64,44 @@ and `p256`'s `ecdh` feature).
 | Tests | Retry-counter and compaction tests, wrap tamper tests, PIN crypto KATs, full flows for both protocols (set/change/token/expiry/lockout/reset/failed writes), python-fido2 end-to-end section. |
 
 Known limits: offline PIN guessing against a flash dump (Argon2 memory is RAM-limited), key in RAM during a session,
-no `pinUvAuthToken` permissions / RP-ID binding (CTAP 2.0 style `getPinToken` only), no `minPinLength` extension.
+no `pinUvAuthToken` permissions / RP-ID binding (CTAP 2.0 style `getPinToken` only). (`minPINLength` is reported by `getInfo` since the third round.)
+
+# Third round (firmware-fixes.patch + tests-fixes.patch, `build.sh`, `guide.md`)
+
+| # | Finding | Result |
+|---|---------|--------|
+| `main.rs` assert | `use defmt::*` shadows the const `assert!` | Fixed: `core::assert!`. The `sed` step in `build.sh` is now a no-op. |
+| 1 | Old key slot not wiped | Fixed. `commit()` reports "done" or "done, old record remains"; in the second case setPIN / changePIN / reset answer `0x7F` but the new durable state is adopted. `purge_stale()` retries the wipe at every boot. |
+| 9 | Erase not read back | Fixed. `wipe()` reads the slot back after every erase (software read-back, not proof of physical erasure). |
+| 2 | USB wipe during touch wait / crypto | Fixed. `wait_touch()` polls `WIPE` every 10 ms; the task re-checks after the touch, before the second pass and before the response. |
+| 3 | Key-agreement key survives a session | Fixed. `lock()` clears it (so expiry does too). |
+| 4 | `finish_try` result ignored | Fixed. A failure fails the command: no key, no token. |
+| 5 | `clear_tries` result ignored | Fixed. The error is propagated in reset and setPIN. |
+| 6 | Wrong APT cutoff | Fixed. 410 -> 311 (SP 800-90B, W = 512, H = 1 bit/byte). |
+| 7 | COSE metadata unchecked | Fixed. `kty` = 2 and `crv` = 1 required; `alg` = -25 if present. |
+| 8 | Stale timestamp | Fixed. `handle_at(arrived_ms, now_ms)`: the reset window uses the arrival time, token expiry the current time. `handle()` is kept as a wrapper. |
+| 18 | `minPINLength` | Added to `getInfo`; `versions` stays `FIDO_2_0` on purpose. |
+| - | Clippy `deprecated` (GenericArray) | `#![allow(deprecated)]` in `pin.rs`, to be removed with the cipher 0.5 / generic-array 1.x move. |
+
+Behaviour changes: a failed wipe now reports an error although the new state is active (retry is safe); a USB
+reset/suspend while a command waits for the button cancels it; clients whose key-agreement object omits `kty` or
+`crv` are rejected (test with your real client set).
+
+## Integration of the third round
+* Both patches applied cleanly to `pico-fido-rs-lite-3`; no `.orig`/`.rej` files.
+* **One test-helper fix:** `a_token_that_expires_while_the_button_is_awaited_is_refused` failed after the patches
+  (79th test, `PIN_INVALID`). Cause: the test helper sent *getKeyAgreement* with a fixed clock of 1000 ms right
+  before a *getPinToken* at 200 000 ms, so time ran backwards; the expiry tick of the second request then discarded
+  the key-agreement key (fix #3) and the PIN hash could not be decrypted. The helper now takes the clock of the
+  call it belongs to (`Plat::agree_at`). The firmware was not changed. A real client would have to see the old
+  session expire exactly between its two back-to-back requests; the effect would be one spurious failed PIN try
+  (forgiven by the next correct PIN).
+* `rustfmt` applied to `src/`; the new code in `ctap.rs` was not formatted.
+* `.gitignore` no longer ignores `Cargo.lock` (see below) and ignores `out/` and `work/`.
+* **Verified here:** 79 unit tests + the python-fido2 2.2.1 end-to-end test pass; the firmware builds and links
+  for 2/4/8/16 MiB flash (with and without `usb_serial`) with zero warnings (Ubuntu rustc 1.91.1,
+  `RUSTC_BOOTSTRAP=1`, `-Zbuild-std`; not the CI nightly); enabling two `flash_*` features is refused by `build.rs`.
+* **Not verified:** clippy, the CI workflow, `build.sh` end to end, anything on hardware. Still open from earlier
+  rounds: P-256 / Argon2 timing on the Pico, RNG on a real ring oscillator, real flash failures, USB IDs.
+* Tests still missing for this round: wipe or counter failures, session expiry during a touch wait, COSE metadata
+  cases (the patches did not add them).

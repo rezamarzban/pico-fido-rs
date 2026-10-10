@@ -4,6 +4,10 @@
 //! Protocol 1: secret = SHA-256(Z); zero IV, no IV on the wire; MAC = first 16 bytes of HMAC.
 //! Protocol 2: HKDF-SHA-256 (zero salt) with info "CTAP2 HMAC key" / "CTAP2 AES key";
 //!             random IV prepended to the ciphertext; MAC = full 32 bytes of HMAC.
+// The RustCrypto `cipher` 0.4 API used here names `GenericArray`, which newer generic-array
+// releases mark deprecated. Remove this allow when moving to the cipher 0.5 / generic-array 1.x API.
+#![allow(deprecated)]
+
 use aes::cipher::{generic_array::GenericArray, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use aes::Aes256;
 use alloc::vec::Vec;
@@ -69,7 +73,11 @@ fn mac_len(v: u8) -> usize {
 
 /// Checks a pinUvAuthParam made with the pinUvAuthToken (`token` is the HMAC key).
 pub fn verify_token(v: u8, token: &[u8; 32], parts: &[&[u8]], tag: &[u8]) -> bool {
-    tag_matches(&hmac_of(token, parts).finalize().into_bytes(), tag, mac_len(v))
+    tag_matches(
+        &hmac_of(token, parts).finalize().into_bytes(),
+        tag,
+        mac_len(v),
+    )
 }
 
 impl Shared {
@@ -176,11 +184,17 @@ pub fn new_secret(rng: &mut dyn FnMut(&mut [u8])) -> SecretKey {
     }
 }
 
-/// Parses a COSE_Key (ECDH-ES+HKDF-256, P-256) from the platform.
+/// Parses a COSE_Key (ECDH-ES+HKDF-256, P-256) from the platform. The coordinates are always read
+/// as P-256, so the key must also say so: kty = 2 (EC2) and crv = 1 (P-256) are required, and alg
+/// must be -25 (ECDH-ES+HKDF-256) when present (some clients omit it). Contradictions are rejected.
 pub fn parse_cose(r: &mut R) -> Result<PublicKey, u8> {
+    let (mut kty, mut alg, mut crv) = (None, None, None);
     let (mut x, mut y) = (None, None);
     for _ in 0..r.map()? {
         match r.int()? {
+            1 => kty = Some(r.int()?),
+            3 => alg = Some(r.int()?),
+            -1 => crv = Some(r.int()?),
             -2 => x = Some(r.bytes()?),
             -3 => y = Some(r.bytes()?),
             _ => r.skip()?,
@@ -196,7 +210,14 @@ pub fn parse_cose(r: &mut R) -> Result<PublicKey, u8> {
     sec[0] = 4;
     sec[1..33].copy_from_slice(x);
     sec[33..].copy_from_slice(y);
-    PublicKey::from_sec1_bytes(&sec).map_err(|_| err::INVALID_PARAMETER)
+    let pk = PublicKey::from_sec1_bytes(&sec).map_err(|_| err::INVALID_PARAMETER)?;
+    if kty.is_none() || crv.is_none() {
+        return Err(err::MISSING_PARAMETER);
+    }
+    if kty != Some(2) || crv != Some(1) || !matches!(alg, None | Some(-25)) {
+        return Err(err::INVALID_PARAMETER);
+    }
+    Ok(pk)
 }
 
 /// COSE_Key of the authenticator's key agreement key.
