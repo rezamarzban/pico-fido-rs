@@ -33,6 +33,8 @@ pub enum Error {
     Size,
     /// Status byte returned by the chip (0x0F = execution error, 0x03 = parse error, ...).
     Status(u8),
+    /// Chip identity/config does not match what provisioning expects.
+    Config,
 }
 
 /// CRC-16 (poly 0x8005, bits fed LSB first). Returns bytes in wire order (low byte first).
@@ -78,8 +80,24 @@ impl<I: I2c> Atecc<I> {
         let _ = self.i2c.write(ADDR, &[0x01]).await;
     }
 
-    /// Send one command and read its response payload into `out` (empty `out` = status-only reply).
+    /// wake + one command + sleep. `out` empty = status-only reply.
     async fn exec(
+        &mut self,
+        op: u8,
+        p1: u8,
+        p2: u16,
+        data: &[u8],
+        out: &mut [u8],
+        max_ms: u32,
+    ) -> Result<(), Error> {
+        self.wake().await?;
+        let r = self.send(op, p1, p2, data, out, max_ms).await;
+        self.sleep().await;
+        r
+    }
+
+    /// One command with NO wake/sleep: the caller owns the wake session.
+    async fn send(
         &mut self,
         op: u8,
         p1: u8,
@@ -101,11 +119,7 @@ impl<I: I2c> Atecc<I> {
         pkt[6..6 + data.len()].copy_from_slice(data);
         let crc = crc16(&pkt[1..count - 1]);
         pkt[count - 1..count + 1].copy_from_slice(&crc);
-
-        self.wake().await?;
-        let r = self.run(&pkt[..count + 1], out, max_ms).await;
-        self.sleep().await;
-        r
+        self.run(&pkt[..count + 1], out, max_ms).await
     }
 
     async fn run(&mut self, pkt: &[u8], out: &mut [u8], max_ms: u32) -> Result<(), Error> {
@@ -168,11 +182,15 @@ impl<I: I2c> Atecc<I> {
 
     /// ECDSA over an already-hashed 32-byte digest. Returns raw r||s.
     pub async fn sign_digest(&mut self, slot: u8, digest: &[u8; 32]) -> Result<[u8; 64], Error> {
-        // Load the digest into TempKey (pass-through), then sign it with an external-sign key.
-        self.exec(OP_NONCE, 0x03, 0, digest, &mut [], 60).await?;
         let mut o = [0u8; 64];
-        self.exec(OP_SIGN, 0x80, slot as u16, &[], &mut o, 150).await?;
-        Ok(o)
+        self.wake().await?;
+        // Nonce and Sign MUST share one wake session: Sleep wipes TempKey.
+        let r = match self.send(OP_NONCE, 0x03, 0, digest, &mut [], 60).await {
+            Ok(()) => self.send(OP_SIGN, 0x80, slot as u16, &[], &mut o, 150).await,
+            Err(e) => Err(e),
+        };
+        self.sleep().await;
+        r.map(|_| o)
     }
 
     pub async fn read_config(&mut self) -> Result<[u8; 128], Error> {
@@ -210,15 +228,19 @@ impl<I: I2c> Atecc<I> {
 
 #[cfg(feature = "provision")]
 pub mod provision {
-    //! One-time, irreversible chip setup. Only compiled with `--features provision`.
+    //! One-time chip setup. Only compiled with `--features provision`.
+    //!
+    //! Stage 1 (`provision`): validate the chip, write slot/key config (reversible while the
+    //! config zone is unlocked), read everything back and dump it to the log. Nothing irreversible.
+    //! Stage 2 (`provision-lock`): lock config zone, lock data zone, verify both, self-test.
+    //! A chip that is already fully locked is never touched.
     use super::*;
+    use crate::keys::MAX_CREDS;
     use sha2::{Digest, Sha256};
 
-    /// Number of ECC private-key slots used for credentials (slots 0..SLOTS).
-    const SLOTS: usize = crate::keys::MAX_CREDS;
     // SlotConfig 0x2083: ExtSig + IntSig allowed, secret, GenKey allowed after lock.
     const SLOT_CFG: [u8; 2] = [0x83, 0x20];
-    // KeyConfig 0x0033: private P-256 key, public key can be derived, lockable.
+    // KeyConfig 0x0033: private P-256 key, public key derivable, lockable.
     const KEY_CFG: [u8; 2] = [0x33, 0x00];
 
     pub async fn run<I: I2c>(at: &mut Atecc<I>) {
@@ -227,58 +249,109 @@ pub mod provision {
         }
     }
 
+    /// Copy of `cfg` with only the credential-slot words replaced.
+    fn template(cfg: &[u8; 128]) -> [u8; 128] {
+        let mut want = *cfg;
+        for s in 0..MAX_CREDS {
+            want[20 + 2 * s..22 + 2 * s].copy_from_slice(&SLOT_CFG);
+            want[96 + 2 * s..98 + 2 * s].copy_from_slice(&KEY_CFG);
+        }
+        want
+    }
+
+    /// Everything except the lock bytes (86, 87) and the immutable head (0..16) must equal `want`.
+    fn same(a: &[u8; 128], want: &[u8; 128]) -> bool {
+        a[16..86] == want[16..86] && a[88..] == want[88..]
+    }
+
     async fn run_inner<I: I2c>(at: &mut Atecc<I>) -> Result<(), Error> {
-        let (cfg_locked, data_locked) = at.lock_state().await?;
+        let (mut cfg_locked, mut data_locked) = at.lock_state().await?;
         defmt::info!("provision: config locked={} data locked={}", cfg_locked, data_locked);
+        if cfg_locked && data_locked {
+            defmt::info!("provision: chip already provisioned, nothing to do");
+            return Ok(());
+        }
+        let lock = cfg!(feature = "provision-lock");
+
+        // Identity: ATECC608 (DevRev byte 2 = 0x60), serial prefix 01 23 .. EE, expected I2C address,
+        // no slot individually locked.
+        let rev = at.info().await?;
+        let cfg = at.read_config().await?;
+        if rev[2] != 0x60
+            || cfg[0] != 0x01
+            || cfg[1] != 0x23
+            || cfg[8] != 0xEE
+            || cfg[16] != ADDR << 1
+            || cfg[88] != 0xFF
+            || cfg[89] != 0xFF
+        {
+            defmt::error!("provision: unexpected chip identity/config, refusing. rev={=[u8]:x}", &rev[..]);
+            return Err(Error::Config);
+        }
+        let want = template(&cfg);
 
         if !cfg_locked {
-            let cfg = at.read_config().await?;
-            let mut want = cfg;
-            for s in 0..SLOTS {
-                want[20 + 2 * s..22 + 2 * s].copy_from_slice(&SLOT_CFG);
-                want[96 + 2 * s..98 + 2 * s].copy_from_slice(&KEY_CFG);
-            }
-            let words = (20..52).step_by(4).chain((96..96 + 2 * SLOTS).step_by(4));
-            for off in words {
+            for off in (20..52).step_by(4).chain((96..96 + 2 * MAX_CREDS).step_by(4)) {
                 if cfg[off..off + 4] != want[off..off + 4] {
                     let w: [u8; 4] = want[off..off + 4].try_into().unwrap();
                     at.write_config_word(off, w).await?;
                 }
             }
-            let back = at.read_config().await?;
-            if back[20..52] != want[20..52] || back[96..96 + 2 * SLOTS] != want[96..96 + 2 * SLOTS] {
-                defmt::error!("provision: config read-back mismatch, NOT locking");
-                return Err(Error::Crc);
-            }
-            at.lock_config(crc16(&back)).await?;
-            defmt::info!("provision: config zone locked");
+        }
+        // Verify the full zone (whether we just wrote it or it was already locked/configured).
+        let back = at.read_config().await?;
+        defmt::info!("config[0..64]   = {=[u8]:x}", &back[..64]);
+        defmt::info!("config[64..128] = {=[u8]:x}", &back[64..]);
+        if !same(&back, &want) {
+            defmt::error!("provision: config read-back mismatch, NOT locking");
+            return Err(Error::Config);
+        }
+        if !lock {
+            defmt::warn!("provision: config written+verified. Review the dump, then rebuild with --features provision-lock to LOCK (irreversible).");
+            return Ok(());
         }
 
+        let mut did_lock = false;
+        if !cfg_locked {
+            at.lock_config(crc16(&back)).await?;
+            (cfg_locked, data_locked) = at.lock_state().await?;
+            if !cfg_locked {
+                return Err(Error::Config);
+            }
+            did_lock = true;
+            defmt::info!("provision: config zone locked");
+        }
         if !data_locked {
             at.lock_data().await?;
+            (_, data_locked) = at.lock_state().await?;
+            if !data_locked {
+                return Err(Error::Config);
+            }
+            did_lock = true;
             defmt::info!("provision: data zone locked");
         }
 
-        // Self-test: make a key, sign, verify in software.
-        use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-        let pk = at.gen_key(0).await?;
-        let msg = b"pico-fido-rs selftest";
-        let digest: [u8; 32] = Sha256::digest(msg).into();
-        let sig = at.sign_digest(0, &digest).await?;
-        let mut sec1 = [0u8; 65];
-        sec1[0] = 4;
-        sec1[1..].copy_from_slice(&pk);
-        let ok = VerifyingKey::from_sec1_bytes(&sec1)
-            .ok()
-            .zip(Signature::from_slice(&sig).ok())
-            .map(|(vk, s)| vk.verify(msg, &s).is_ok())
-            .unwrap_or(false);
-        if ok {
+        // Self-test, only on a chip this run just locked (so slot 0 cannot hold a live credential).
+        if did_lock {
+            use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+            let pk = at.gen_key(0).await?;
+            let msg = b"pico-fido-rs selftest";
+            let digest: [u8; 32] = Sha256::digest(msg).into();
+            let sig = at.sign_digest(0, &digest).await?;
+            let mut sec1 = [0u8; 65];
+            sec1[0] = 4;
+            sec1[1..].copy_from_slice(&pk);
+            let ok = VerifyingKey::from_sec1_bytes(&sec1)
+                .ok()
+                .zip(Signature::from_slice(&sig).ok())
+                .map(|(vk, s)| vk.verify(msg, &s).is_ok())
+                .unwrap_or(false);
+            if !ok {
+                defmt::error!("provision: selftest signature did not verify");
+                return Err(Error::Config);
+            }
             defmt::info!("provision: ATECC selftest OK - chip is ready");
-            Ok(())
-        } else {
-            defmt::error!("provision: selftest signature did not verify");
-            Err(Error::Crc)
         }
+        Ok(())
     }
 }

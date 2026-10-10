@@ -1,11 +1,17 @@
-//! Credential table in the last 4K flash sector. Table index == ATECC key slot.
-//! The private keys themselves live only inside the ATECC; this table maps credential IDs and
-//! relying parties to slots and keeps user info for discoverable (resident) credentials.
+//! Credential table, stored twice (A/B) in the last two 4K flash sectors. Table index == ATECC slot.
+//! The private keys live only inside the ATECC; this table maps credential IDs / relying parties to
+//! slots and keeps user info for discoverable credentials.
+//!
+//! Each copy carries a sequence number and a SHA-256 over its contents. `save()` always writes the
+//! *inactive* copy, so a power cut during a write leaves the previous copy intact and `load()` picks
+//! the newest valid one. The hash detects corruption/torn writes; it does NOT authenticate against
+//! someone who can rewrite flash (they can recompute it).
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::peripherals::FLASH;
+use sha2::{Digest, Sha256};
 
 use super::FLASH_SIZE;
 
@@ -17,11 +23,12 @@ const MAX_UID: usize = 64;
 const MAX_NAME: usize = 32;
 
 const SECTOR: u32 = 4096;
-const OFFSET: u32 = FLASH_SIZE as u32 - SECTOR; // keep memory.x FLASH 4K shorter than the chip
-const MAGIC: [u8; 4] = *b"FK02";
+/// Two sectors at the end of flash; keep memory.x FLASH 8K shorter than the chip.
+const OFF: [u32; 2] = [FLASH_SIZE as u32 - 2 * SECTOR, FLASH_SIZE as u32 - SECTOR];
+const MAGIC: [u8; 4] = *b"FK03";
 const USED: u8 = 0xA5;
-const ENTRY: usize = 184;
-const TABLE_LEN: usize = 4 + MAX_CREDS * ENTRY;
+const ENTRY: usize = 188;
+const TABLE_LEN: usize = 8 + MAX_CREDS * ENTRY + 32; // magic+seq, entries, sha256
 
 #[derive(Clone)]
 pub struct Cred {
@@ -31,6 +38,8 @@ pub struct Cred {
     pub uid: Vec<u8>,
     pub name: String,
     pub display: String,
+    /// Creation order (higher = newer); used to list discoverable credentials newest first.
+    pub ts: u32,
 }
 
 pub fn trunc(s: &str, max: usize) -> String {
@@ -52,6 +61,7 @@ fn encode(c: &Cred, b: &mut [u8]) {
     b[116..116 + c.name.len()].copy_from_slice(c.name.as_bytes());
     b[148] = c.display.len() as u8;
     b[149..149 + c.display.len()].copy_from_slice(c.display.as_bytes());
+    b[181..185].copy_from_slice(&c.ts.to_le_bytes());
 }
 
 fn decode(b: &[u8]) -> Option<Cred> {
@@ -69,42 +79,81 @@ fn decode(b: &[u8]) -> Option<Cred> {
         uid: b[51..51 + ul].to_vec(),
         name: String::from_utf8(b[116..116 + nl].to_vec()).ok()?,
         display: String::from_utf8(b[149..149 + dl].to_vec()).ok()?,
+        ts: u32::from_le_bytes(b[181..185].try_into().ok()?),
     })
+}
+
+fn build(seq: u32, slots: &[Option<Cred>; MAX_CREDS]) -> Vec<u8> {
+    let mut buf = vec![0xFFu8; TABLE_LEN];
+    buf[..4].copy_from_slice(&MAGIC);
+    buf[4..8].copy_from_slice(&seq.to_le_bytes());
+    for (i, s) in slots.iter().enumerate() {
+        if let Some(c) = s {
+            let e = &mut buf[8 + i * ENTRY..8 + (i + 1) * ENTRY];
+            e.fill(0);
+            encode(c, e);
+        }
+    }
+    let h = Sha256::digest(&buf[..TABLE_LEN - 32]);
+    buf[TABLE_LEN - 32..].copy_from_slice(&h);
+    buf
+}
+
+fn parse(buf: &[u8]) -> Option<(u32, [Option<Cred>; MAX_CREDS])> {
+    if buf[..4] != MAGIC || buf[TABLE_LEN - 32..] != Sha256::digest(&buf[..TABLE_LEN - 32])[..] {
+        return None;
+    }
+    let seq = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+    let mut slots: [Option<Cred>; MAX_CREDS] = Default::default();
+    for (i, s) in slots.iter_mut().enumerate() {
+        *s = decode(&buf[8 + i * ENTRY..8 + (i + 1) * ENTRY]);
+    }
+    Some((seq, slots))
 }
 
 pub struct Store {
     pub slots: [Option<Cred>; MAX_CREDS],
     flash: Fl,
+    seq: u32,
+    active: usize,
 }
 
 impl Store {
     pub fn load(mut flash: Fl) -> Self {
-        let mut slots: [Option<Cred>; MAX_CREDS] = Default::default();
-        let mut buf = vec![0u8; TABLE_LEN];
-        if flash.blocking_read(OFFSET, &mut buf).is_ok() && buf[..4] == MAGIC {
-            for (i, s) in slots.iter_mut().enumerate() {
-                *s = decode(&buf[4 + i * ENTRY..4 + (i + 1) * ENTRY]);
+        let mut best: Option<(u32, usize, [Option<Cred>; MAX_CREDS])> = None;
+        for (i, &off) in OFF.iter().enumerate() {
+            let mut buf = vec![0u8; TABLE_LEN];
+            if flash.blocking_read(off, &mut buf).is_ok() {
+                if let Some((seq, s)) = parse(&buf) {
+                    if best.as_ref().map_or(true, |b| seq > b.0) {
+                        best = Some((seq, i, s));
+                    }
+                }
             }
         }
-        Store { slots, flash }
+        let (seq, active, slots) = best.unwrap_or((0, 1, Default::default()));
+        Store { slots, flash, seq, active }
     }
 
     pub fn free_slot(&self) -> Option<usize> {
         self.slots.iter().position(|s| s.is_none())
     }
 
-    /// Persist the whole table. Returns false if the flash operation failed.
+    pub fn next_ts(&self) -> u32 {
+        self.slots.iter().flatten().map(|c| c.ts).max().map_or(1, |m| m.wrapping_add(1))
+    }
+
+    /// Writes the inactive copy, then switches to it. A power cut leaves the old copy valid.
     pub fn save(&mut self) -> bool {
-        let mut buf = vec![0xFFu8; TABLE_LEN];
-        buf[..4].copy_from_slice(&MAGIC);
-        for (i, s) in self.slots.iter().enumerate() {
-            if let Some(c) = s {
-                let e = &mut buf[4 + i * ENTRY..4 + (i + 1) * ENTRY];
-                e.fill(0);
-                encode(c, e);
-            }
+        let target = 1 - self.active;
+        let seq = self.seq.wrapping_add(1);
+        let buf = build(seq, &self.slots);
+        let ok = self.flash.blocking_erase(OFF[target], OFF[target] + SECTOR).is_ok()
+            && self.flash.blocking_write(OFF[target], &buf).is_ok();
+        if ok {
+            self.seq = seq;
+            self.active = target;
         }
-        self.flash.blocking_erase(OFFSET, OFFSET + SECTOR).is_ok()
-            && self.flash.blocking_write(OFFSET, &buf).is_ok()
+        ok
     }
 }

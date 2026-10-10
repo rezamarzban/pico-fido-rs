@@ -33,7 +33,7 @@ mod usb;
 use ctap::Ctap;
 use usb::{create_usb_tasks, ctap_task, HID_CHANNEL_LEN};
 
-// The credential table lives in the last 4K sector of this much flash (see memory.x).
+// The two credential-table copies live in the last 8K of this much flash (see memory.x).
 pub const FLASH_SIZE: usize = 2 * 1024 * 1024;
 
 bind_interrupts!(struct I2cIrqs {
