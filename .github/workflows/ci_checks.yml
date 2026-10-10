@@ -33,6 +33,17 @@ jobs:
       - run: cargo install flip-link
       - run: cargo build --all
       - run: cargo build --all --release
+  host-tests:
+    name: Host tests (protocol logic + end-to-end with python-fido2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install fido2
+      - run: sh host-test/run.sh
   linting:
     name: Linting
     runs-on: ubuntu-latest

@@ -1,4 +1,5 @@
 //! CTAPHID framing: reassembles 64-byte packets into messages and back. No I/O, no async.
+//! Time is passed in by the caller (`now_ms`), so the state machine is fully testable.
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -10,15 +11,17 @@ pub const PING: u8 = 0x01;
 #[allow(dead_code)]
 pub const MSG: u8 = 0x03;
 pub const INIT: u8 = 0x06;
-pub const WINK: u8 = 0x08;
 pub const CBOR: u8 = 0x10;
 pub const CANCEL: u8 = 0x11;
 pub const KEEPALIVE: u8 = 0x3B;
 pub const ERROR: u8 = 0x3F;
 
 const BROADCAST: u32 = 0xFFFF_FFFF;
-/// CBOR supported, no CTAP1/U2F (NMSG)
+/// CBOR supported, no CTAP1/U2F (NMSG), no WINK
 const CAPS: u8 = 0x04 | 0x08;
+/// A started message must be completed within this time (CTAPHID spec: 0.5 s between packets).
+pub const MSG_TIMEOUT_MS: u64 = 500;
+const MAX_CHANNELS: usize = 8;
 
 pub enum Rx {
     None,
@@ -36,12 +39,15 @@ struct Asm {
     len: usize,
     buf: Vec<u8>,
     seq: u8,
+    last_ms: u64,
 }
 
 pub struct Hid {
     next_cid: u32,
+    channels: Vec<u32>, // allocated channel IDs, oldest first
     asm: Option<Asm>,
     active: Option<u32>,
+    aborted: bool,
 }
 
 fn err(cid: u32, code: u8) -> Rx {
@@ -50,14 +56,56 @@ fn err(cid: u32, code: u8) -> Rx {
 
 impl Hid {
     pub fn new() -> Self {
-        Hid { next_cid: 0, asm: None, active: None }
+        Hid {
+            next_cid: 0,
+            channels: Vec::new(),
+            asm: None,
+            active: None,
+            aborted: false,
+        }
     }
 
     pub fn end(&mut self) {
         self.active = None;
     }
 
-    pub fn rx(&mut self, p: &Pkt) -> Rx {
+    /// True once if the running transaction was aborted by a same-channel INIT.
+    /// The caller must drop the pending request and send no response for it.
+    pub fn take_abort(&mut self) -> bool {
+        core::mem::take(&mut self.aborted)
+    }
+
+    fn known(&self, cid: u32) -> bool {
+        self.channels.contains(&cid)
+    }
+
+    fn alloc(&mut self) -> u32 {
+        loop {
+            self.next_cid = self.next_cid.wrapping_add(1);
+            let c = self.next_cid;
+            if c != 0 && c != BROADCAST && !self.known(c) {
+                if self.channels.len() == MAX_CHANNELS {
+                    // evict the oldest channel that is not the active one
+                    let i = self
+                        .channels
+                        .iter()
+                        .position(|&x| Some(x) != self.active)
+                        .unwrap_or(0);
+                    self.channels.remove(i);
+                }
+                self.channels.push(c);
+                return c;
+            }
+        }
+    }
+
+    pub fn rx(&mut self, p: &Pkt, now_ms: u64) -> Rx {
+        // drop a stalled, incomplete message so it cannot block other clients
+        let mut expired = None;
+        if matches!(&self.asm, Some(a) if now_ms.saturating_sub(a.last_ms) > MSG_TIMEOUT_MS) {
+            expired = self.asm.take().map(|a| a.cid);
+        }
+
         let cid = u32::from_be_bytes([p[0], p[1], p[2], p[3]]);
         if cid == 0 {
             return err(cid, 0x0B);
@@ -68,11 +116,17 @@ impl Hid {
             if cmd == INIT {
                 return self.init(cid, len, p);
             }
-            if cid == BROADCAST {
+            if cid == BROADCAST || !self.known(cid) {
                 return err(cid, 0x0B);
             }
             if let Some(a) = self.active {
-                return if a == cid && cmd == CANCEL { Rx::Cancel } else if a == cid { Rx::None } else { err(cid, 0x06) };
+                return if a == cid && cmd == CANCEL {
+                    Rx::Cancel
+                } else if a == cid {
+                    Rx::None
+                } else {
+                    err(cid, 0x06)
+                };
             }
             if let Some(a) = &self.asm {
                 if a.cid != cid {
@@ -84,11 +138,18 @@ impl Hid {
                 return err(cid, 0x03);
             }
             let n = len.min(57);
-            let a = Asm { cid, cmd, len, buf: p[7..7 + n].to_vec(), seq: 0 };
+            let a = Asm {
+                cid,
+                cmd,
+                len,
+                buf: p[7..7 + n].to_vec(),
+                seq: 0,
+                last_ms: now_ms,
+            };
             return self.progress(a);
         }
         // continuation packet
-        if self.active.is_some() {
+        if self.active.is_some() || !self.known(cid) {
             return Rx::None;
         }
         match self.asm.take() {
@@ -97,6 +158,7 @@ impl Hid {
                     return err(cid, 0x04);
                 }
                 a.seq += 1;
+                a.last_ms = now_ms;
                 let n = (a.len - a.buf.len()).min(59);
                 a.buf.extend_from_slice(&p[5..5 + n]);
                 self.progress(a)
@@ -105,6 +167,7 @@ impl Hid {
                 self.asm = Some(a);
                 err(cid, 0x06)
             }
+            None if expired == Some(cid) => err(cid, 0x05), // ERR_MSG_TIMEOUT
             None => Rx::None,
         }
     }
@@ -119,8 +182,8 @@ impl Hid {
                 self.active = Some(a.cid);
                 Rx::Cbor(a.cid, a.buf)
             }
-            PING | WINK => Rx::Reply(a.cid, a.cmd, a.buf),
-            _ => err(a.cid, 0x01), // MSG (U2F) and anything unknown
+            PING => Rx::Reply(a.cid, a.cmd, a.buf),
+            _ => err(a.cid, 0x01), // MSG (U2F), WINK, LOCK and anything unknown
         }
     }
 
@@ -128,14 +191,20 @@ impl Hid {
         if len != 8 {
             return err(cid, 0x03);
         }
-        if matches!(&self.asm, Some(a) if a.cid == cid) {
-            self.asm = None;
-        }
         let new = if cid == BROADCAST {
-            self.next_cid += 1;
-            self.next_cid
-        } else {
+            self.alloc()
+        } else if self.known(cid) {
+            // resync on an existing channel: abort whatever it was doing
+            if matches!(&self.asm, Some(a) if a.cid == cid) {
+                self.asm = None;
+            }
+            if self.active == Some(cid) {
+                self.active = None;
+                self.aborted = true;
+            }
             cid
+        } else {
+            return err(cid, 0x0B);
         };
         let mut d = Vec::with_capacity(17);
         d.extend_from_slice(&p[7..15]);

@@ -68,17 +68,30 @@ impl<'a> R<'a> {
         self.p = end;
         Ok(s)
     }
+    /// Reads one item head. Rejects indefinite lengths and non-minimal encodings (CTAP2 canonical CBOR).
     fn head(&mut self) -> Result<(u8, u64), u8> {
         let b = self.take(1)?[0];
         let ai = b & 31;
-        let v = match ai {
-            0..=23 => ai as u64,
-            24 => self.take(1)?[0] as u64,
-            25 => u16::from_be_bytes(self.take(2)?.try_into().unwrap()) as u64,
-            26 => u32::from_be_bytes(self.take(4)?.try_into().unwrap()) as u64,
-            27 => u64::from_be_bytes(self.take(8)?.try_into().unwrap()),
-            _ => return Err(INVALID_CBOR), // indefinite lengths not allowed in CTAP2
+        let (v, min) = match ai {
+            0..=23 => (ai as u64, 0),
+            24 => (self.take(1)?[0] as u64, 24),
+            25 => (
+                u16::from_be_bytes(self.take(2)?.try_into().unwrap()) as u64,
+                0x100,
+            ),
+            26 => (
+                u32::from_be_bytes(self.take(4)?.try_into().unwrap()) as u64,
+                0x1_0000,
+            ),
+            27 => (
+                u64::from_be_bytes(self.take(8)?.try_into().unwrap()),
+                0x1_0000_0000,
+            ),
+            _ => return Err(INVALID_CBOR),
         };
+        if v < min {
+            return Err(INVALID_CBOR);
+        }
         Ok((b >> 5, v))
     }
     fn typed(&mut self, major: u8) -> Result<u64, u8> {
@@ -122,7 +135,7 @@ impl<'a> R<'a> {
         self.skip_depth(0)
     }
     fn skip_depth(&mut self, depth: u8) -> Result<(), u8> {
-        if depth > 8 {
+        if depth > MAX_DEPTH {
             return Err(INVALID_CBOR);
         }
         let (major, v) = self.head()?;
@@ -135,9 +148,76 @@ impl<'a> R<'a> {
                 self.skip_depth(depth + 1)?;
                 self.skip_depth(depth + 1)
             })?,
-            6 => self.skip_depth(depth + 1)?,
+            6 => return Err(INVALID_CBOR), // tags are not allowed
+            7 if !(20..=22).contains(&v) => return Err(INVALID_CBOR), // no floats / other simple values
             _ => {}
         }
         Ok(())
     }
+
+    fn at_end(&self) -> bool {
+        self.p == self.b.len()
+    }
+}
+
+/// Maximum container nesting allowed in a CTAP2 request.
+const MAX_DEPTH: u8 = 4;
+
+/// Checks a whole CTAP2 request body once, centrally, before any command parses it:
+/// exactly one top-level map, minimal encodings, no tags/floats/indefinite lengths,
+/// valid UTF-8 text, no duplicate map keys, nesting <= 4, no trailing bytes.
+pub fn validate(body: &[u8]) -> Result<(), u8> {
+    let mut r = R::new(body);
+    if body.first().map(|b| b >> 5) != Some(5) {
+        return Err(if body.is_empty() {
+            INVALID_CBOR
+        } else {
+            UNEXPECTED_TYPE
+        });
+    }
+    walk(&mut r, 0)?;
+    if r.at_end() {
+        Ok(())
+    } else {
+        Err(INVALID_CBOR)
+    }
+}
+
+fn walk(r: &mut R, depth: u8) -> Result<(), u8> {
+    let (major, v) = r.head()?;
+    match major {
+        0 | 1 => {}
+        2 => {
+            r.take(usize::try_from(v).map_err(|_| INVALID_CBOR)?)?;
+        }
+        3 => {
+            let n = usize::try_from(v).map_err(|_| INVALID_CBOR)?;
+            core::str::from_utf8(r.take(n)?).map_err(|_| INVALID_CBOR)?;
+        }
+        4 | 5 => {
+            if depth >= MAX_DEPTH {
+                return Err(INVALID_CBOR);
+            }
+            if major == 4 {
+                for _ in 0..v {
+                    walk(r, depth + 1)?;
+                }
+            } else {
+                let mut keys: Vec<&[u8]> = Vec::new();
+                for _ in 0..v {
+                    let start = r.p;
+                    walk(r, depth + 1)?;
+                    let key = &r.b[start..r.p];
+                    if keys.contains(&key) {
+                        return Err(INVALID_CBOR); // duplicate key
+                    }
+                    keys.push(key);
+                    walk(r, depth + 1)?;
+                }
+            }
+        }
+        7 if (20..=22).contains(&v) => {}
+        _ => return Err(INVALID_CBOR), // tags (6), floats, other simple values
+    }
+    Ok(())
 }
