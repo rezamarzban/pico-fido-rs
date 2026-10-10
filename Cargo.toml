@@ -8,7 +8,7 @@ authors = ["sawyer bristol <sawyerbristol@gmail.com>"]
 default = ["rp2040_board", "flash_2m", "usb_serial"] # official non w board, 2 MiB flash
 rp2040_board = []
 # Flash size of the board: enable EXACTLY ONE (build.rs writes memory.x from it; store.rs uses
-# the last 8 KiB). Do not use --all-features.
+# the last 12 KiB). Do not use --all-features.
 flash_2m = []
 flash_4m = []
 flash_8m = []
@@ -65,7 +65,12 @@ pio = "0.2.1"
 rand = { version = "0.8.5", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
-p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh"] }
+# PIN / ClientPIN: AES-256-CBC for the PIN protocol, Argon2id to wrap the master key
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false }
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 heapless = "0.8.0"
 portable-atomic = { version = "1.7.0", features = ["critical-section"] }
 embedded-alloc = "0.5.1"

@@ -9,7 +9,8 @@ use embassy_usb::class::hid::{HidReader, HidWriter};
 
 use crate::ctap::{err, Ctap, Resp};
 use crate::ctaphid::{self, Hid, Rx};
-use crate::keys::{self, Fl};
+use crate::keys::{self, Fl, FlashVault};
+use crate::usb::WIPE;
 use crate::{LedState, LED_SIGNAL};
 
 pub type Reader = HidReader<'static, Driver<'static, USB>, 64>;
@@ -97,16 +98,34 @@ pub async fn ctap_task(
     mut wr: Writer,
     mut ctap: Ctap,
     mut button: BOOTSEL,
-    mut flash: Fl,
+    flash: Fl,
 ) {
+    let mut vault = FlashVault(flash);
     let mut hid = Hid::new();
     let mut buf = [0u8; 64];
     let mut rng = |b: &mut [u8]| keys::fill_random(b);
     LED_SIGNAL.signal(LedState::Active);
     loop {
-        rd.ready().await;
-        if !matches!(rd.read(&mut buf).await, Ok(64)) {
-            continue;
+        // While idle, wake up once a second so an expired PIN session is wiped from RAM, and wipe
+        // it at once when the USB bus is reset or suspended.
+        let ev = {
+            let read = async {
+                rd.ready().await;
+                rd.read(&mut buf).await
+            };
+            select(read, select(WIPE.wait(), Timer::after_secs(1))).await
+        };
+        match ev {
+            Either::First(Ok(64)) => {}
+            Either::First(_) => continue,
+            Either::Second(Either::First(())) => {
+                ctap.lock();
+                continue;
+            }
+            Either::Second(Either::Second(())) => {
+                ctap.tick(now_ms());
+                continue;
+            }
         }
         match hid.rx(&buf, now_ms()) {
             Rx::None | Rx::Cancel => {}
@@ -116,7 +135,13 @@ pub async fn ctap_task(
                 // The reset window is judged on when the request ARRIVED, not on when the
                 // user finally pressed the button, so both calls use this timestamp.
                 let arrived = now_ms();
-                let mut r = ctap.handle(&req, false, arrived, &mut rng);
+                if req.first() == Some(&0x06) {
+                    // ClientPIN can spend a while in Argon2: tell the host we are alive.
+                    send(&mut wr, cid, ctaphid::KEEPALIVE, &[1]).await;
+                }
+                let t0 = Instant::now();
+                let mut r = ctap.handle(&req, false, arrived, &mut rng, &mut vault);
+                info!("ctap command took {} ms", t0.elapsed().as_millis());
                 if let Resp::NeedUp = r {
                     LED_SIGNAL.signal(LedState::Confirm);
                     match wait_touch(cid, &mut rd, &mut wr, &mut hid, &mut button).await {
@@ -124,7 +149,7 @@ pub async fn ctap_task(
                             LED_SIGNAL.signal(LedState::Processing);
                             send(&mut wr, cid, ctaphid::KEEPALIVE, &[1]).await; // 1 = processing
                             let t = Instant::now();
-                            r = ctap.handle(&req, true, arrived, &mut rng);
+                            r = ctap.handle(&req, true, arrived, &mut rng, &mut vault);
                             // P-256 runs without yielding; this shows how long the host waits.
                             info!("crypto took {} ms", t.elapsed().as_millis());
                         }
@@ -139,17 +164,6 @@ pub async fn ctap_task(
                     Resp::Ok(v) => v,
                     Resp::Err(c) => vec![c],
                     Resp::NeedUp => vec![err::OTHER],
-                    Resp::Reset(key) => {
-                        // Flash is the source of truth: after success OR failure the running key
-                        // is set to exactly what the next boot will load (or none if unknowable).
-                        let o = keys::replace(&mut flash, &key);
-                        ctap.set_key(o.active);
-                        if o.ok {
-                            vec![0]
-                        } else {
-                            vec![err::OTHER]
-                        }
-                    }
                 };
                 send(&mut wr, cid, ctaphid::CBOR, &out).await;
                 hid.end();
