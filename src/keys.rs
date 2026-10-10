@@ -1,4 +1,5 @@
-//! Flash glue for the master key (record logic is in store.rs) and the random generator.
+//! Flash glue for the master-key record and PIN retry counter (logic is in store.rs) and the
+//! random generator.
 use core::cell::{Cell, RefCell};
 use defmt::{error, info, warn};
 use embassy_rp::clocks::RoscRng;
@@ -11,16 +12,20 @@ use sha2::{Digest, Sha256};
 use static_cell::StaticCell;
 
 use crate::health::Health;
-use crate::store::{self, Loaded, Replaced, Sectors, REC_LEN};
+use crate::store::{self, Loaded, Record, Replaced, Sectors, Vault, REC_LEN, TRIES_PAGES};
 use crate::FLASH_SIZE;
 
 pub type Fl = Flash<'static, FLASH, Blocking, FLASH_SIZE>;
 
 const SECTOR: u32 = 4096;
-/// Two sectors at the very end of flash; keep memory.x FLASH 8K shorter than the chip.
+/// The last three sectors of flash: [retry counter][key slot 0][key slot 1]. build.rs keeps the
+/// linker FLASH region 12K shorter than the chip.
 fn offset(slot: usize) -> u32 {
     FLASH_SIZE as u32 - 2 * SECTOR + slot as u32 * SECTOR
 }
+const TRIES_OFFSET: u32 = FLASH_SIZE as u32 - 3 * SECTOR;
+/// One flag byte per 256-byte page (a page is programmed at most once between erases).
+const PAGE: u32 = 256;
 
 struct Dev<'a>(&'a mut Fl);
 
@@ -34,6 +39,22 @@ impl Sectors for Dev<'_> {
     }
     fn write(&mut self, slot: usize, rec: &[u8; REC_LEN]) -> Result<(), Error> {
         self.0.blocking_write(offset(slot), rec)
+    }
+    fn tries_read(&mut self, out: &mut [u8; TRIES_PAGES]) -> Result<(), Error> {
+        for (i, b) in out.iter_mut().enumerate() {
+            self.0.blocking_read(
+                TRIES_OFFSET + i as u32 * PAGE,
+                core::slice::from_mut(b),
+            )?;
+        }
+        Ok(())
+    }
+    fn tries_mark(&mut self, page: usize, val: u8) -> Result<(), Error> {
+        self.0
+            .blocking_write(TRIES_OFFSET + page as u32 * PAGE, &[val])
+    }
+    fn tries_clear(&mut self) -> Result<(), Error> {
+        self.0.blocking_erase(TRIES_OFFSET, TRIES_OFFSET + SECTOR)
     }
 }
 
@@ -73,29 +94,32 @@ pub fn fill_random(out: &mut [u8]) {
     }
 }
 
-/// Result of a key replacement: what the CTAP layer must answer and which key it must now use.
-pub struct Outcome {
-    /// The new key is durable (the next boot will load it).
-    pub ok: bool,
-    /// The key the running firmware must use from now on. It always matches what the next boot
-    /// loads, or is `None` (refuse to operate) when that cannot be determined.
-    pub active: Option<[u8; 32]>,
-}
-
-/// Loads the master key. First boot (blank flash) creates one. A read error or a damaged,
-/// non-blank record returns `None`: the device then refuses to work until an explicit reset,
-/// instead of silently replacing the key.
-pub fn load(flash: &mut Fl) -> Option<[u8; 32]> {
+/// Loads the stored record. First boot (blank flash) creates a plain random key. A read error or
+/// a damaged, non-blank record returns `None`: the device then refuses to work until an explicit
+/// reset, instead of silently replacing the key. A record with a PIN comes back still wrapped:
+/// the key is only unwrapped by a successful getPinToken.
+pub fn load(flash: &mut Fl) -> Option<Record> {
     match store::load(&mut Dev(flash)) {
-        Ok(Loaded::Key(k, _)) => Some(k),
+        Ok(Loaded::Rec(r, p)) => {
+            info!(
+                "flash: key record seq {}, PIN {}",
+                p.seq,
+                if r.wrapped { "set" } else { "not set" }
+            );
+            Some(r)
+        }
         Ok(Loaded::Blank) => {
             let mut k = [0u8; 32];
             fill_random(&mut k);
-            let o = replace(flash, &k);
-            if !o.ok {
-                error!("flash: could not initialise key storage");
+            let rec = Record::plain(k);
+            match log_replace(store::replace_record(&mut Dev(flash), &rec)) {
+                Replaced::New(_) => Some(rec),
+                Replaced::Kept(r) => Some(r),
+                _ => {
+                    error!("flash: could not initialise key storage");
+                    None
+                }
             }
-            o.active
         }
         Ok(Loaded::Corrupt) => {
             error!("flash: key record damaged - refusing to re-key, do a CTAP reset (touch, within 10 s of plug-in) to start over");
@@ -108,41 +132,40 @@ pub fn load(flash: &mut Fl) -> Option<[u8; 32]> {
     }
 }
 
-/// Persist a replacement key. The flash is always re-read after a failure, so the returned
-/// `active` key is exactly what the next boot will load (or `None` if that is unknowable).
-pub fn replace(flash: &mut Fl, key: &[u8; 32]) -> Outcome {
-    match store::replace(&mut Dev(flash), key) {
+fn log_replace(r: Replaced) -> Replaced {
+    match &r {
         Replaced::New(saved) => {
             if !saved.old_wiped {
-                warn!("flash: old key slot could not be wiped (new key still takes precedence)");
+                warn!("flash: old key slot could not be wiped (new record still takes precedence)");
             }
-            info!("flash: new key committed, seq {}", saved.pos.seq);
-            Outcome {
-                ok: true,
-                active: Some(*key),
-            }
+            info!("flash: record committed, seq {}", saved.pos.seq);
         }
-        Replaced::Kept(k) => {
-            warn!("flash: saving key failed, previous key kept");
-            Outcome {
-                ok: false,
-                active: Some(k),
-            }
-        }
-        Replaced::NoKey => {
-            error!("flash: saving key failed and flash holds no valid key");
-            Outcome {
-                ok: false,
-                active: None,
-            }
-        }
-        Replaced::Unknown => {
-            error!("flash: saving key failed and flash state is unreadable");
-            Outcome {
-                ok: false,
-                active: None,
-            }
-        }
+        Replaced::Kept(_) => warn!("flash: saving failed, previous record kept"),
+        Replaced::NoKey => error!("flash: saving failed and flash holds no valid record"),
+        Replaced::Unknown => error!("flash: saving failed and flash state is unreadable"),
+    }
+    r
+}
+
+/// The persistent state used by the CTAP layer. After any failed `replace` the flash is re-read
+/// (store.rs), so the returned `Replaced` always matches what the next boot will load.
+pub struct FlashVault(pub Fl);
+
+impl Vault for FlashVault {
+    fn replace(&mut self, rec: &Record) -> Replaced {
+        log_replace(store::replace_record(&mut Dev(&mut self.0), rec))
+    }
+    fn tries_used(&mut self) -> Result<u8, ()> {
+        store::count_tries(&mut Dev(&mut self.0)).map_err(|_| error!("flash: retry counter unreadable"))
+    }
+    fn begin_try(&mut self) -> Result<usize, ()> {
+        store::begin_try(&mut Dev(&mut self.0)).map_err(|_| error!("flash: retry counter not writable"))
+    }
+    fn finish_try(&mut self, page: usize) -> Result<(), ()> {
+        store::finish_try(&mut Dev(&mut self.0), page).map_err(|_| warn!("flash: could not refund PIN attempt"))
+    }
+    fn clear_tries(&mut self) -> Result<(), ()> {
+        store::reset_tries(&mut Dev(&mut self.0)).map_err(|_| warn!("flash: could not clear retry counter"))
     }
 }
 
