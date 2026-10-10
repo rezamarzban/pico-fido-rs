@@ -9,6 +9,8 @@ default = ["rp2040_board"] # official non w board
 rp2040_board = []
 # One-time, IRREVERSIBLE ATECC608 setup (writes + locks config/data zones). See README.
 provision = []
+# provision + irreversibly LOCK config/data zones.
+provision-lock = ["provision"]
 
 [dependencies]
 cortex-m = { version = "0.7.7", features = ["inline-asm"] }
