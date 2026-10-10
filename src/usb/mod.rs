@@ -6,9 +6,9 @@ use embassy_usb::class::hid::{HidReaderWriter, State};
 use embassy_usb::{Builder, Config, Handler, UsbDevice};
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use defmt::*;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use defmt::*;
 use static_cell::StaticCell;
 
 pub mod ctap;

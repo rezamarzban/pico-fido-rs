@@ -38,7 +38,8 @@ const FLASH_MB: usize = (cfg!(feature = "flash_2m") as usize) * 2
     + (cfg!(feature = "flash_4m") as usize) * 4
     + (cfg!(feature = "flash_8m") as usize) * 8
     + (cfg!(feature = "flash_16m") as usize) * 16;
-const _: () = assert!(
+// core::assert!: `use defmt::*` above would otherwise pick defmt's non-const assert!.
+const _: () = core::assert!(
     matches!(FLASH_MB, 2 | 4 | 8 | 16),
     "enable exactly one of the flash_2m / flash_4m / flash_8m / flash_16m features"
 );
@@ -87,7 +88,7 @@ pub enum LedState {
     Confirm, // Waiting for user to confirm
     #[default]
     Idle, // Pico goes to sleep
-    Active, // Awake and waiting for a command
+    Active,  // Awake and waiting for a command
     Processing, // Busy and cannot receive new commands
 }
 

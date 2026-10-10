@@ -13,6 +13,7 @@ lib.ctap_new.argtypes = [ctypes.c_char_p]
 lib.ctap_reboot.argtypes = [ctypes.c_void_p]
 lib.ctap_tick.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
 lib.ctap_lock.argtypes = [ctypes.c_void_p]
+lib.ctap_fault.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
 lib.ctap_tries_used.argtypes = [ctypes.c_void_p]; lib.ctap_tries_used.restype = ctypes.c_int
 lib.ctap_handle.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_size_t]
 
@@ -48,6 +49,7 @@ kp = [{"type": "public-key", "alg": -7}]
 # ---------- happy path -------------------------------------------------------------------------
 dev = Dev(os.urandom(32)); ctap = Ctap2(dev)
 info = ctap.get_info(); print("getInfo:", info.versions, info.options, info.max_msg_size, info.max_cred_id_length)
+assert getattr(info, "min_pin_length", 10) == 10, "minPINLength is advertised"
 att = ctap.make_credential(cdh, rp, user, kp)
 ad = att.auth_data; cd = ad.credential_data
 assert att.fmt == "none" and ad.rp_id_hash == hashlib.sha256(b"example.com").digest() and ad.flags == 0x41
@@ -168,6 +170,12 @@ for Proto in (PinProtocolV2, PinProtocolV1):
 
 # lockout: 3 wrong PINs need a power cycle, 8 block the PIN for good, reset is the way out
 dev = Dev(os.urandom(32)); ctap = Ctap2(dev); cp = ClientPin(ctap, PinProtocolV2()); cp.set_pin(PIN)
+# the platform's COSE key agreement key must say EC2 / P-256 (checked before any attempt is used)
+ka = dict(ctap.client_pin(2, 2)[1])
+bad = dict(ka); bad[-1] = 2; expect(0x02, lambda: ctap.client_pin(2, 5, key_agreement=bad, pin_hash_enc=bytes(32)))
+bad = dict(ka); bad[3] = -7; expect(0x02, lambda: ctap.client_pin(2, 5, key_agreement=bad, pin_hash_enc=bytes(32)))
+bad = dict(ka); del bad[-1]; expect(0x14, lambda: ctap.client_pin(2, 5, key_agreement=bad, pin_hash_enc=bytes(32)))
+assert lib.ctap_tries_used(dev.c) == 0, "malformed key agreement keys must not use up attempts"
 expect(0x31, lambda: cp.get_pin_token("wrong pin number 1")); expect(0x31, lambda: cp.get_pin_token("wrong pin number 2"))
 expect(0x34, lambda: cp.get_pin_token("wrong pin number 3"))
 expect(0x34, lambda: cp.get_pin_token(PIN))                                        # refused until power cycle
@@ -180,7 +188,17 @@ lib.ctap_reboot(dev.c); expect(0x32, lambda: cp.get_pin_token(PIN)); assert cp.g
 dev.now = 5_000; assert dev.status(b"\x07") == 0                                    # factory reset
 assert ctap.get_info().options["clientPin"] is False and lib.ctap_tries_used(dev.c) == 0
 cp.set_pin(PIN); cp.get_pin_token(PIN)
+# storage faults are reported, never hidden (the new state is still the durable one)
+dev = Dev(os.urandom(32)); ctap = Ctap2(dev); cp = ClientPin(ctap, PinProtocolV2())
+lib.ctap_fault(dev.c, 2, 0); expect(0x7F, lambda: cp.set_pin(PIN))                  # old plaintext slot could not be wiped
+assert ctap.get_info().options["clientPin"] is True; lib.ctap_fault(dev.c, 2, 1); cp.get_pin_token(PIN)
+lib.ctap_fault(dev.c, 4, 1); expect(0x7F, lambda: cp.get_pin_token(PIN))             # correct PIN, attempt cannot be recorded
+assert lib.ctap_tries_used(dev.c) == 1; lib.ctap_fault(dev.c, 4, 0); cp.get_pin_token(PIN); assert lib.ctap_tries_used(dev.c) == 0
+lib.ctap_fault(dev.c, 3, 1); dev.now = 5_000; assert dev.status(b"\x07") == 0x7F    # retry counter cannot be cleared
+lib.ctap_fault(dev.c, 3, 0); assert dev.status(b"\x07") == 0
+print("storage fault reporting: ok")
 # PIN survives a power cycle, and a short PIN is refused
+dev = Dev(os.urandom(32)); ctap = Ctap2(dev); cp = ClientPin(ctap, PinProtocolV2()); cp.set_pin(PIN)
 lib.ctap_reboot(dev.c); assert ctap.get_info().options["clientPin"] is True; cp.get_pin_token(PIN)
 d2 = Dev(os.urandom(32)); c2 = Ctap2(d2); expect(0x37, lambda: ClientPin(c2, PinProtocolV2()).set_pin("short"))
 print("PIN lockout / reset / persistence: ok")

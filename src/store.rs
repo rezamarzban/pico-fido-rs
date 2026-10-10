@@ -224,20 +224,44 @@ fn write_verified<S: Sectors>(
     Ok(())
 }
 
-/// Destroys whatever is in `slot`. Erase is tried twice; if the sector will not erase, the record
-/// is overwritten with zeros (programming can only clear bits, so this works without an erase)
-/// and checked to no longer be valid. Returns whether the slot no longer holds a valid record.
+/// Reads `slot` back and checks that it no longer holds a valid record. (Software read-back
+/// shows what the flash returns; it is not proof of physical erasure.)
+fn slot_is_dead<S: Sectors>(s: &mut S, slot: usize) -> bool {
+    let mut back = [0u8; REC_LEN];
+    s.read(slot, &mut back).is_ok() && decode(&back).is_none()
+}
+
+/// Destroys whatever is in `slot`. Erase is tried twice and every "successful" erase is read back;
+/// if the sector will not erase, the record is overwritten with zeros (programming can only clear
+/// bits, so this works without an erase) and checked again. Returns whether the slot was verified
+/// to no longer hold a valid record.
 fn wipe<S: Sectors>(s: &mut S, slot: usize) -> bool {
     for _ in 0..2 {
-        if s.erase(slot).is_ok() {
+        if s.erase(slot).is_ok() && slot_is_dead(s, slot) {
             return true;
         }
     }
     if s.write(slot, &[0u8; REC_LEN]).is_err() {
         return false;
     }
-    let mut back = [0u8; REC_LEN];
-    s.read(slot, &mut back).is_ok() && decode(&back).is_none()
+    slot_is_dead(s, slot)
+}
+
+/// Destroys an older, still valid record that an earlier update could not wipe (see
+/// `Saved::old_wiped`). Call at boot. `Ok(true)` = nothing stale remains, `Ok(false)` = a stale
+/// record is still readable. The newest record is never touched.
+pub fn purge_stale<S: Sectors>(s: &mut S) -> Result<bool, SaveError> {
+    let (best, _) = scan(s).map_err(|_| SaveError::Io)?;
+    let Some((_, p)) = best else {
+        return Ok(true);
+    };
+    let other = p.slot ^ 1;
+    let mut r = [0u8; REC_LEN];
+    s.read(other, &mut r).map_err(|_| SaveError::Io)?;
+    if decode(&r).is_none() {
+        return Ok(true);
+    }
+    Ok(wipe(s, other))
 }
 
 /// Stores `rec` as the newest record. The target slot and sequence number are always derived
