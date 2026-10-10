@@ -6,6 +6,7 @@
 //! No PIN, sign counter is always 0, attestation is "none".
 use alloc::string::String;
 use alloc::vec::Vec;
+use embassy_time::{Duration, Instant};
 use p256::ecdsa::Signature;
 use sha2::{Digest, Sha256};
 
@@ -61,16 +62,27 @@ fn hw<T>(r: Result<T, atecc::Error>) -> Result<T, Stop> {
     })
 }
 
+/// State for authenticatorGetNextAssertion.
+struct Pending {
+    idxs: Vec<usize>,
+    rp: [u8; 32],
+    hash: [u8; 32],
+    want_up: bool,
+    since: Instant,
+}
+
 pub struct Ctap {
     at: Atecc<Bus>,
     store: Store,
     /// ATECC answered and both its config and data zones are locked (see README: provisioning).
     ready: bool,
+    boot: Instant,
+    pending: Option<Pending>,
 }
 
 impl Ctap {
     pub fn new(at: Atecc<Bus>, store: Store, ready: bool) -> Self {
-        Ctap { at, store, ready }
+        Ctap { at, store, ready, boot: Instant::now(), pending: None }
     }
 
     /// `req` = CTAP command byte + CBOR. `up` = user pressed the button for this request.
@@ -79,6 +91,9 @@ impl Ctap {
         let Some((&cmd, body)) = req.split_first() else {
             return Resp::Err(err::INVALID_LENGTH);
         };
+        if cmd != 0x08 {
+            self.pending = None; // any other command ends a getNextAssertion sequence
+        }
         let r = match cmd {
             0x01 => self.make_credential(body, up).await,
             0x02 => self.get_assertion(body, up).await,
@@ -91,7 +106,7 @@ impl Ctap {
                     Err(Stop::NeedUp)
                 }
             }
-            0x08 => Err(Stop::Err(err::NOT_ALLOWED)),
+            0x08 => self.next_assertion().await,
             _ => Err(Stop::Err(err::INVALID_COMMAND)),
         };
         match r {
@@ -114,7 +129,11 @@ impl Ctap {
         self.store
             .slots
             .iter()
-            .position(|c| c.as_ref().map_or(false, |c| c.id[..] == *id && c.rp == *rp))
+            .enumerate()
+            .find(|(i, c)| {
+                id[1] as usize == *i && c.as_ref().map_or(false, |c| c.id[..] == *id && c.rp == *rp)
+            })
+            .map(|(i, _)| i)
     }
 
     async fn make_credential(&mut self, body: &[u8], up: bool) -> Res {
@@ -219,16 +238,16 @@ impl Ctap {
             return Err(err::CREDENTIAL_EXCLUDED.into());
         }
 
-        // Pick a slot: overwrite the same (rp, user) discoverable credential, else any free slot.
-        let reuse = match (rk, user_id) {
+        // Always generate into a FREE slot: an existing credential (including one this request
+        // replaces) stays valid until the new table is committed to flash. A power cut before the
+        // commit only leaves an unused key in a free slot.
+        let slot = self.store.free_slot().ok_or(err::KEY_STORE_FULL)?;
+        let replaced = match (rk, user_id) {
             (true, Some(u)) => self.store.slots.iter().position(|c| {
                 c.as_ref().map_or(false, |c| c.rk && c.rp == rp && c.uid.as_slice() == u)
             }),
             _ => None,
         };
-        let slot = reuse
-            .or_else(|| self.store.free_slot())
-            .ok_or(err::KEY_STORE_FULL)?;
         let pk = hw(self.at.gen_key(slot as u8).await)?;
 
         let mut id = [0u8; ID_LEN];
@@ -238,6 +257,8 @@ impl Ctap {
         id[1] = slot as u8;
         id[2..].copy_from_slice(&rnd[..ID_LEN - 2]);
 
+        let ts = self.store.next_ts();
+        let old = replaced.map(|i| (i, self.store.slots[i].take()));
         self.store.slots[slot] = Some(Cred {
             rk,
             id,
@@ -245,9 +266,13 @@ impl Ctap {
             uid: if rk { user_id.unwrap_or(&[]).to_vec() } else { Vec::new() },
             name: if rk { trunc(user_name, 32) } else { String::new() },
             display: if rk { trunc(user_disp, 32) } else { String::new() },
+            ts,
         });
         if !self.store.save() {
             self.store.slots[slot] = None;
+            if let Some((i, c)) = old {
+                self.store.slots[i] = c;
+            }
             return Err(err::OTHER.into());
         }
 
@@ -334,31 +359,70 @@ impl Ctap {
         if !self.ready {
             return Err(err::OTHER.into());
         }
+        let hash: [u8; 32] = hash.try_into().map_err(|_| err::INVALID_PARAMETER)?;
         let rp: [u8; 32] = Sha256::digest(rp_id.as_bytes()).into();
-        let found = if allow.is_empty() {
-            // discoverable credential login: newest matching resident credential
-            self.store
-                .slots
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.as_ref().map_or(false, |c| c.rk && c.rp == rp))
-                .map(|(i, _)| i)
-                .last()
+        let by_allow = !allow.is_empty();
+        let cands: Vec<usize> = if by_allow {
+            allow.iter().find_map(|id| self.find(id, &rp)).into_iter().collect()
         } else {
-            allow.iter().find_map(|id| self.find(id, &rp))
+            // discoverable login: all resident credentials of this RP, newest first
+            let mut v: Vec<usize> = (0..MAX_CREDS)
+                .filter(|&i| self.store.slots[i].as_ref().map_or(false, |c| c.rk && c.rp == rp))
+                .collect();
+            let ts = |i: usize| self.store.slots[i].as_ref().map_or(0, |c| c.ts);
+            v.sort_by(|&a, &b| ts(b).cmp(&ts(a)));
+            v
         };
-        let idx = found.ok_or(err::NO_CREDENTIALS)?;
+        let first = *cands.first().ok_or(err::NO_CREDENTIALS)?;
         if want_up && !touched {
             return Err(Stop::NeedUp);
         }
+        let n = cands.len();
+        self.pending = if n > 1 {
+            Some(Pending { idxs: cands[1..].to_vec(), rp, hash, want_up, since: Instant::now() })
+        } else {
+            None
+        };
+        self.assertion(first, &rp, &hash, want_up, !by_allow, if n > 1 { Some(n) } else { None })
+            .await
+    }
+
+    async fn next_assertion(&mut self) -> Res {
+        let p = self.pending.take().ok_or(err::NOT_ALLOWED)?;
+        if p.since.elapsed() > Duration::from_secs(30) {
+            return Err(err::NOT_ALLOWED.into());
+        }
+        let idx = p.idxs[0];
+        if p.idxs.len() > 1 {
+            self.pending = Some(Pending {
+                idxs: p.idxs[1..].to_vec(),
+                rp: p.rp,
+                hash: p.hash,
+                want_up: p.want_up,
+                since: p.since,
+            });
+        }
+        self.assertion(idx, &p.rp, &p.hash, p.want_up, true, None).await
+    }
+
+    /// Sign with the key in slot `idx` and build the assertion response.
+    async fn assertion(
+        &mut self,
+        idx: usize,
+        rp: &[u8; 32],
+        hash: &[u8; 32],
+        want_up: bool,
+        with_user: bool,
+        n: Option<usize>,
+    ) -> Res {
         let (cid, user) = {
             let c = self.store.slots[idx].as_ref().ok_or(err::NO_CREDENTIALS)?;
-            let user = if allow.is_empty() { Some((c.uid.clone(), c.name.clone(), c.display.clone())) } else { None };
+            let user = if with_user { Some((c.uid.clone(), c.name.clone(), c.display.clone())) } else { None };
             (c.id, user)
         };
 
         let mut ad = Vec::with_capacity(37);
-        ad.extend_from_slice(&rp);
+        ad.extend_from_slice(rp);
         ad.push(if want_up { 0x01 } else { 0x00 });
         ad.extend_from_slice(&[0, 0, 0, 0]);
         let mut h = Sha256::new();
@@ -369,7 +433,7 @@ impl Ctap {
         let sig = Signature::from_slice(&raw).map_err(|_| Stop::Err(err::OTHER))?;
 
         let mut w = W::new();
-        w.map(if user.is_some() { 4 } else { 3 });
+        w.map(3 + user.is_some() as u64 + n.is_some() as u64);
         w.uint(1);
         w.map(2);
         w.text("id");
@@ -394,21 +458,35 @@ impl Ctap {
                 w.text(&disp);
             }
         }
+        if let Some(n) = n {
+            w.uint(5);
+            w.uint(n as u64);
+        }
         Ok(w.0)
     }
 
     async fn reset(&mut self, up: bool) -> Res {
         if !up {
+            // CTAP: reset is only accepted within 10 s after power-up.
+            if self.boot.elapsed() > Duration::from_secs(10) {
+                return Err(err::NOT_ALLOWED.into());
+            }
             return Err(Stop::NeedUp);
         }
+        let mut failed = false;
         for s in 0..MAX_CREDS {
             if self.store.slots[s].is_some() {
                 // Overwrite the old key inside the chip so it can never sign again.
-                let _ = self.at.gen_key(s as u8).await;
-                self.store.slots[s] = None;
+                match self.at.gen_key(s as u8).await {
+                    Ok(_) => self.store.slots[s] = None,
+                    Err(e) => {
+                        defmt::error!("reset: gen_key({}) failed: {}", s, e);
+                        failed = true; // keep the entry: key may still exist
+                    }
+                }
             }
         }
-        if !self.store.save() {
+        if !self.store.save() || failed {
             return Err(err::OTHER.into());
         }
         Ok(Vec::new())
@@ -434,6 +512,6 @@ fn get_info() -> Vec<u8> {
     w.uint(5);
     w.uint(MAX_MSG as u64);
     w.uint(8);
-    w.uint(64);
+    w.uint(ID_LEN as u64);
     w.0
 }
