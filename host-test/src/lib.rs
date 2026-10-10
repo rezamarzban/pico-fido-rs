@@ -1,27 +1,8 @@
 extern crate alloc;
 #[path = "../../src/cbor.rs"] pub mod cbor;
-#[path = "../../src/ctap.rs"] pub mod ctap;
+/// Only the constant ctaphid.rs needs; the real ctap.rs now requires the ATECC hardware.
+pub mod ctap { pub const MAX_MSG: usize = 1200; }
 #[path = "../../src/ctaphid.rs"] pub mod ctaphid;
-use ctap::*;
-use rand::RngCore;
-
-#[no_mangle] pub extern "C" fn ctap_new(master: *const u8) -> *mut Ctap {
-    let mut m = [0u8; 32]; m.copy_from_slice(unsafe { std::slice::from_raw_parts(master, 32) });
-    Box::into_raw(Box::new(Ctap::new(m)))
-}
-/// returns len>=1, or -1 for NeedUp
-#[no_mangle] pub extern "C" fn ctap_handle(c: *mut Ctap, req: *const u8, n: usize, up: i32, out: *mut u8, cap: usize) -> i32 {
-    let c = unsafe { &mut *c };
-    let req = unsafe { std::slice::from_raw_parts(req, n) };
-    let mut rng = |b: &mut [u8]| rand::thread_rng().fill_bytes(b);
-    let r = c.handle(req, up != 0, &mut rng);
-    let o = unsafe { std::slice::from_raw_parts_mut(out, cap) };
-    match r {
-        Resp::NeedUp => -1,
-        Resp::Err(e) => { o[0] = e; 1 }
-        Resp::Ok(v) => { o[..v.len()].copy_from_slice(&v); v.len() as i32 }
-    }
-}
 
 #[cfg(test)]
 mod tests {

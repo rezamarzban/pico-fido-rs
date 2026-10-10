@@ -9,7 +9,10 @@ extern crate alloc;
 use core::mem::MaybeUninit;
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_rp::bind_interrupts;
 use embassy_rp::flash::{Blocking, Flash};
+use embassy_rp::i2c::{self, I2c};
+use embassy_rp::peripherals::I2C0;
 use embassy_rp::gpio::{Level, Output};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -21,6 +24,7 @@ use static_cell::StaticCell;
 use usbd_hid::descriptor::KeyboardUsage;
 use {defmt_rtt as _, panic_probe as _};
 
+mod atecc;
 mod cbor;
 mod ctap;
 mod ctaphid;
@@ -29,8 +33,15 @@ mod usb;
 use ctap::Ctap;
 use usb::{create_usb_tasks, ctap_task, HID_CHANNEL_LEN};
 
-// The master key lives in the last 4K sector of this much flash (see memory.x).
+// The credential table lives in the last 4K sector of this much flash (see memory.x).
 pub const FLASH_SIZE: usize = 2 * 1024 * 1024;
+
+bind_interrupts!(struct I2cIrqs {
+    I2C0_IRQ => i2c::InterruptHandler<I2C0>;
+});
+
+/// ATECC608 wiring: I2C0, SDA = GP4 (pin 6), SCL = GP5 (pin 7), 3V3 and GND.
+const I2C_HZ: u32 = 100_000;
 
 const HEAP_SIZE: usize = 32 * 1024;
 static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
@@ -41,8 +52,30 @@ async fn main(spawner: Spawner) {
     info!("Starting");
     let p = embassy_rp::init(Default::default());
 
-    let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
-    let ctap = Ctap::new(keys::load_or_create(&mut flash));
+    let flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
+
+    let mut i2c_cfg = i2c::Config::default();
+    i2c_cfg.frequency = I2C_HZ;
+    let bus = I2c::new_async(p.I2C0, p.PIN_5, p.PIN_4, I2cIrqs, i2c_cfg);
+    let mut at = atecc::Atecc::new(bus);
+
+    #[cfg(feature = "provision")]
+    atecc::provision::run(&mut at).await;
+
+    let ready = match at.lock_state().await {
+        Ok((cfg, data)) => {
+            info!("ATECC: config locked={}, data locked={}", cfg, data);
+            if !(cfg && data) {
+                warn!("ATECC not provisioned: build once with --features provision (see README)");
+            }
+            cfg && data
+        }
+        Err(e) => {
+            error!("ATECC not responding: {}", e);
+            false
+        }
+    };
+    let ctap = Ctap::new(at, keys::Store::load(flash), ready);
 
     // Get board specific pin
     let led_pin = {
@@ -62,7 +95,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(hid_writer).unwrap();
     spawner.spawn(hid_reader).unwrap();
     spawner
-        .spawn(ctap_task(ctap_rd, ctap_wr, ctap, p.BOOTSEL, flash))
+        .spawn(ctap_task(ctap_rd, ctap_wr, ctap, p.BOOTSEL))
         .unwrap();
 }
 
