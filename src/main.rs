@@ -24,12 +24,14 @@ mod ctap;
 mod ctaphid;
 mod health;
 mod keys;
+mod pin;
 mod store;
 mod usb;
+mod wrap;
 use ctap::Ctap;
 use usb::{create_usb_tasks, ctap_task};
 
-// Two 4K sectors at the end of the flash hold the master key (see store.rs). The flash size is a
+// Three 4K sectors at the end of the flash hold the key slots and the PIN retry counter (store.rs). The flash size is a
 // deliberate board setting: enable exactly one `flash_*` Cargo feature. build.rs derives the
 // linker script (memory.x) from the same feature, so code and linker layout always agree.
 const FLASH_MB: usize = (cfg!(feature = "flash_2m") as usize) * 2
@@ -42,7 +44,8 @@ const _: () = assert!(
 );
 pub const FLASH_SIZE: usize = FLASH_MB * 1024 * 1024;
 
-const HEAP_SIZE: usize = 32 * 1024;
+// 160 KiB: Argon2 (wrap.rs) allocates up to MAX_M_KIB (128 KiB) while a PIN is being checked.
+const HEAP_SIZE: usize = 160 * 1024;
 static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
 
 #[embassy_executor::main]
@@ -52,8 +55,8 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
-    let master = keys::load(&mut flash);
-    let ctap = Ctap::new(master);
+    let rec = keys::load(&mut flash);
+    let ctap = Ctap::new(rec);
     // A persistent serial number lets hosts recognise this exact device across connections
     // (privacy trade-off): build without the `usb_serial` feature to omit it.
     let serial = if cfg!(feature = "usb_serial") {

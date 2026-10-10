@@ -10,6 +10,10 @@ path = [f for f in glob.glob("target/**/debug/libhost.*", recursive=True) if f.e
 lib = ctypes.CDLL(path)
 lib.ctap_new.restype = ctypes.c_void_p
 lib.ctap_new.argtypes = [ctypes.c_char_p]
+lib.ctap_reboot.argtypes = [ctypes.c_void_p]
+lib.ctap_tick.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+lib.ctap_lock.argtypes = [ctypes.c_void_p]
+lib.ctap_tries_used.argtypes = [ctypes.c_void_p]; lib.ctap_tries_used.restype = ctypes.c_int
 lib.ctap_handle.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_size_t]
 
 class Dev(CtapDevice):
@@ -110,7 +114,8 @@ assert dev.status(b"\x01\xa1\x80\x00") == 0x11, "array map key"
 assert dev.status(b"\x01\xa1\x01\x81\x81\x81\x81\x00") == 0x12, "nesting depth 5"
 assert dev.status(b"\x01\x80") == 0x11 and dev.status(b"\x01") == 0x12 and dev.status(b"") == 0x03
 assert dev.status(b"\x04\x00") == 0x03 and dev.status(b"\x07\x00") == 0x03 and dev.status(b"\x0b\xa0") == 0x03
-assert dev.status(b"\x06") == 0x01 and dev.status(b"\x08") == 0x30
+assert dev.status(b"\x09") == 0x01 and dev.status(b"\x08") == 0x30
+assert dev.status(b"\x06") == 0x12, "clientPIN without a body"
 print("request validation: ok")
 
 # ---------- reset window + fault mode ----------------------------------------------------------
@@ -123,6 +128,62 @@ assert fc.get_info().versions == ["FIDO_2_0"]
 assert f.status(mc()) == 0x7F and f.status(ga()) == 0x7F, "fault mode must refuse, never re-key"
 assert f.status(b"\x07") == 0
 fc.make_credential(cdh, rp, user, kp); print("fault mode: refuses until explicit reset, then works")
+
+# ---------- PIN (ClientPIN, python-fido2 as the platform) --------------------------------------
+from fido2.ctap2.pin import ClientPin, PinProtocolV1, PinProtocolV2
+PIN = "correct horse battery"
+LIFETIME = 120_000
+for Proto in (PinProtocolV2, PinProtocolV1):
+    dev = Dev(os.urandom(32)); ctap = Ctap2(dev); dev.now = 1000
+    info = ctap.get_info(); assert info.options["clientPin"] is False and list(info.pin_uv_protocols) == [2, 1]
+    att = ctap.make_credential(cdh, rp, user, kp); cred = {"type": "public-key", "id": bytes(att.auth_data.credential_data.credential_id)}
+    cp = ClientPin(ctap, Proto())
+    cp.set_pin(PIN)
+    assert ctap.get_info().options["clientPin"] is True
+    expect(0x36, lambda: ctap.make_credential(cdh, rp, user, kp))                       # PIN required now
+    expect(0x36, lambda: ctap.get_assertion("example.com", cdh, [cred]))
+    expect(0x31, lambda: cp.get_pin_token("wrong wrong wrong"))
+    assert cp.get_pin_retries()[0] == 7 and lib.ctap_tries_used(dev.c) == 1
+    token = cp.get_pin_token(PIN); assert cp.get_pin_retries()[0] == 8
+    param = cp.protocol.authenticate(token, cdh); ver = cp.protocol.VERSION
+    a = ctap.make_credential(cdh, rp, user, kp, pin_uv_param=param, pin_uv_protocol=ver)
+    assert a.auth_data.flags == 0x45, "UV flag set after PIN"
+    g = ctap.get_assertion("example.com", cdh, [cred], pin_uv_param=param, pin_uv_protocol=ver)   # credential from BEFORE the PIN
+    assert g.auth_data.flags == 0x05
+    bad = bytearray(param); bad[0] ^= 1
+    expect(0x33, lambda: ctap.make_credential(cdh, rp, user, kp, pin_uv_param=bytes(bad), pin_uv_protocol=ver))
+    # the key leaves RAM when the session ends
+    lib.ctap_tick(dev.c, dev.now + LIFETIME)
+    expect(0x33, lambda: ctap.make_credential(cdh, rp, user, kp, pin_uv_param=param, pin_uv_protocol=ver))
+    token = cp.get_pin_token(PIN); param = cp.protocol.authenticate(token, cdh)
+    lib.ctap_lock(dev.c)                                                              # USB reset / suspend
+    expect(0x33, lambda: ctap.make_credential(cdh, rp, user, kp, pin_uv_param=param, pin_uv_protocol=ver))
+    # change PIN
+    NEW = "another long passphrase"
+    expect(0x31, lambda: cp.change_pin("wrong wrong wrong", NEW))
+    cp.change_pin(PIN, NEW); expect(0x31, lambda: cp.get_pin_token(PIN))
+    token = cp.get_pin_token(NEW); param = cp.protocol.authenticate(token, cdh)
+    ctap.get_assertion("example.com", cdh, [cred], pin_uv_param=param, pin_uv_protocol=ver)       # still the same master key
+    print("PIN protocol v%d: set / token / UV / expiry / change: ok" % ver)
+
+# lockout: 3 wrong PINs need a power cycle, 8 block the PIN for good, reset is the way out
+dev = Dev(os.urandom(32)); ctap = Ctap2(dev); cp = ClientPin(ctap, PinProtocolV2()); cp.set_pin(PIN)
+expect(0x31, lambda: cp.get_pin_token("wrong pin number 1")); expect(0x31, lambda: cp.get_pin_token("wrong pin number 2"))
+expect(0x34, lambda: cp.get_pin_token("wrong pin number 3"))
+expect(0x34, lambda: cp.get_pin_token(PIN))                                        # refused until power cycle
+assert lib.ctap_tries_used(dev.c) == 3
+lib.ctap_reboot(dev.c); assert cp.get_pin_retries()[0] == 5
+for i in range(2): expect(0x31, lambda: cp.get_pin_token("wrong pin number x"))
+expect(0x34, lambda: cp.get_pin_token("wrong pin number x")); lib.ctap_reboot(dev.c)
+expect(0x31, lambda: cp.get_pin_token("wrong pin number y")); expect(0x32, lambda: cp.get_pin_token("wrong pin number y"))
+lib.ctap_reboot(dev.c); expect(0x32, lambda: cp.get_pin_token(PIN)); assert cp.get_pin_retries()[0] == 0
+dev.now = 5_000; assert dev.status(b"\x07") == 0                                    # factory reset
+assert ctap.get_info().options["clientPin"] is False and lib.ctap_tries_used(dev.c) == 0
+cp.set_pin(PIN); cp.get_pin_token(PIN)
+# PIN survives a power cycle, and a short PIN is refused
+lib.ctap_reboot(dev.c); assert ctap.get_info().options["clientPin"] is True; cp.get_pin_token(PIN)
+d2 = Dev(os.urandom(32)); c2 = Ctap2(d2); expect(0x37, lambda: ClientPin(c2, PinProtocolV2()).set_pin("short"))
+print("PIN lockout / reset / persistence: ok")
 
 # ---------- FFI robustness ---------------------------------------------------------------------
 out = ctypes.create_string_buffer(8)

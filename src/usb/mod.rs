@@ -6,10 +6,16 @@ use embassy_usb::class::hid::{HidReaderWriter, State};
 use embassy_usb::{Builder, Config, Handler, UsbDevice};
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use defmt::*;
 use static_cell::StaticCell;
 
 pub mod ctap;
+
+/// Raised on USB reset / suspend / disable: the CTAP task then ends the PIN session and wipes the
+/// unwrapped master key from RAM.
+pub static WIPE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub use ctap::{ctap_task, Reader as CtapReader, Writer as CtapWriter, FIDO_REPORT_DESC};
 
 bind_interrupts!(struct Irqs {
@@ -102,6 +108,9 @@ impl UsbHandler {
 impl Handler for UsbHandler {
     fn enabled(&mut self, enabled: bool) {
         self.configured.store(false, Ordering::Relaxed);
+        if !enabled {
+            WIPE.signal(());
+        }
         if enabled {
             info!("Device enabled");
         } else {
@@ -111,7 +120,14 @@ impl Handler for UsbHandler {
 
     fn reset(&mut self) {
         self.configured.store(false, Ordering::Relaxed);
+        WIPE.signal(());
         info!("Bus reset, the Vbus current limit is 100mA");
+    }
+
+    fn suspended(&mut self, suspended: bool) {
+        if suspended {
+            WIPE.signal(());
+        }
     }
 
     fn addressed(&mut self, addr: u8) {
