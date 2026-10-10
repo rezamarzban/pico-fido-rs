@@ -4,6 +4,9 @@
 //! and the ES256 private key is re-derived from `HMAC(master, rp, nonce)` on every use.
 //! The only persistent secret is the 32-byte `master` key (see store.rs / keys.rs).
 //! No resident keys, no PIN, sign counter is always 0, attestation is "none".
+//!
+//! Policy (SECURITY.md): every signature needs a fresh button press. The authenticator enforces
+//! this itself: the `up` option of getAssertion is validated but can never switch the touch off.
 use alloc::vec::Vec;
 use hmac::{Hmac, Mac};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -20,6 +23,7 @@ pub mod err {
     pub const INVALID_COMMAND: u8 = 0x01;
     pub const INVALID_PARAMETER: u8 = 0x02;
     pub const INVALID_LENGTH: u8 = 0x03;
+    pub const CBOR_UNEXPECTED_TYPE: u8 = 0x11;
     pub const MISSING_PARAMETER: u8 = 0x14;
     pub const CREDENTIAL_EXCLUDED: u8 = 0x19;
     pub const UNSUPPORTED_ALGORITHM: u8 = 0x26;
@@ -40,8 +44,9 @@ pub enum Resp {
     Err(u8),
     /// Request is valid but needs a button press: wait for it, then call `handle` again with `up = true`.
     NeedUp,
-    /// Reset was approved. Persist this new master key, and only if that succeeds call
-    /// `install_key` and answer success (status 0x00); otherwise answer `err::OTHER`.
+    /// Reset was approved. Persist this new master key with `keys::replace`, call `set_key` with
+    /// the key it reports as active, and answer success (0x00) only if it reports `ok`;
+    /// otherwise answer `err::OTHER`.
     Reset([u8; 32]),
 }
 
@@ -67,13 +72,16 @@ impl Ctap {
     pub fn new(master: Option<[u8; 32]>) -> Self {
         Ctap { master }
     }
-    pub fn install_key(&mut self, key: [u8; 32]) {
-        self.master = Some(key);
+    /// Sets the active master key (`None` = refuse to operate). The caller must only pass the key
+    /// that the next boot will load from flash (see keys::replace).
+    pub fn set_key(&mut self, key: Option<[u8; 32]>) {
+        self.master = key;
     }
 
     /// `req` = CTAP command byte + CBOR. `up` = user pressed the button for this request.
-    /// `now_ms` = time since power-up. Re-entrant: call first with `up = false`; on `NeedUp`
-    /// call again with `true`.
+    /// `now_ms` = time since power-up *at which the request arrived*. Re-entrant: call first with
+    /// `up = false`; on `NeedUp` call again with `true` and the SAME `now_ms`, so that waiting
+    /// for the button never makes a request that arrived in time look late (reset window).
     pub fn handle(
         &mut self,
         req: &[u8],
@@ -187,7 +195,7 @@ impl Ctap {
                             }
                         }
                         if alg.is_none() || ty.is_none() {
-                            return Err(err::MISSING_PARAMETER.into());
+                            return Err(err::CBOR_UNEXPECTED_TYPE.into());
                         }
                         alg_ok |= alg == Some(-7) && ty == Some("public-key");
                     }
@@ -220,7 +228,7 @@ impl Ctap {
         if !have_user || !have_params {
             return Err(err::MISSING_PARAMETER.into());
         }
-        let user_id = user_id.ok_or(err::MISSING_PARAMETER)?;
+        let user_id = user_id.ok_or(err::CBOR_UNEXPECTED_TYPE)?;
         if hash.len() != 32 || user_id.is_empty() || user_id.len() > 64 {
             return Err(err::INVALID_PARAMETER.into());
         }
@@ -294,7 +302,7 @@ impl Ctap {
     fn get_assertion(&mut self, body: &[u8], touched: bool) -> Res {
         let mut r = R::new(body);
         let (mut rp_id, mut hash) = (None, None);
-        let (mut want_up, mut uv, mut pin) = (true, false, false);
+        let (mut uv, mut pin) = (false, false);
         let mut allow: Vec<&[u8]> = Vec::new();
 
         for _ in 0..r.map()? {
@@ -311,7 +319,10 @@ impl Ctap {
                 5 => {
                     for _ in 0..r.map()? {
                         match r.text()? {
-                            "up" => want_up = r.bool()?,
+                            // validated, but deliberately not honoured: signing always needs a touch
+                            "up" => {
+                                r.bool()?;
+                            }
                             "uv" => uv = r.bool()?,
                             _ => r.skip()?,
                         }
@@ -341,13 +352,13 @@ impl Ctap {
             .iter()
             .find_map(|id| Self::check_cred(master, &rp, id).map(|k| (*id, k)))
             .ok_or(err::NO_CREDENTIALS)?;
-        if want_up && !touched {
+        if !touched {
             return Err(Stop::NeedUp);
         }
 
         let mut ad = Vec::with_capacity(37);
         ad.extend_from_slice(&rp);
-        ad.push(if want_up { 0x01 } else { 0x00 });
+        ad.push(0x01); // UP: the button was pressed for this signature
         ad.extend_from_slice(&[0, 0, 0, 0]);
         let mut msg = ad.clone();
         msg.extend_from_slice(hash);
@@ -381,7 +392,8 @@ impl Ctap {
     }
 }
 
-/// Parses a PublicKeyCredentialDescriptor. Both `type` and `id` are required.
+/// Parses a PublicKeyCredentialDescriptor. Both `type` and `id` are required
+/// (a missing member is reported as CBOR_UNEXPECTED_TYPE, as CTAP2 recommends for nested structures).
 /// Returns the id only for type "public-key" (other types are ignored, per spec).
 fn descriptor<'a>(r: &mut R<'a>) -> Result<Option<&'a [u8]>, u8> {
     let (mut id, mut ty) = (None, None);
@@ -394,7 +406,7 @@ fn descriptor<'a>(r: &mut R<'a>) -> Result<Option<&'a [u8]>, u8> {
     }
     match (id, ty) {
         (Some(id), Some(ty)) => Ok(if ty == "public-key" { Some(id) } else { None }),
-        _ => Err(err::MISSING_PARAMETER),
+        _ => Err(err::CBOR_UNEXPECTED_TYPE),
     }
 }
 

@@ -7,37 +7,26 @@ env:
 
 jobs:
   building:
-    name: Building
-    continue-on-error: ${{ matrix.experimental || false }}
+    # The firmware uses a nightly-only feature (src/main.rs), so it is built with the nightly
+    # toolchain only. There is deliberately no stable firmware build.
+    name: Firmware build (nightly)
     strategy:
       matrix:
-        # All generated code should be running on stable now
-        rust: [nightly, stable]
-        include:
-          # Nightly is only for reference and allowed to fail
-          - rust: nightly
-            experimental: true
-        os:
-          # Check compilation works on common OSes
-          # (i.e. no path issues)
-          - ubuntu-latest
-          - macOS-latest
-          - windows-latest
+        os: [ubuntu-latest, macOS-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: ${{ matrix.rust }}
-          target: thumbv6m-none-eabi
-      - run: cargo install flip-link
-      - run: cargo build --all
-      - run: cargo build --all --release
+          targets: thumbv6m-none-eabi
+          components: rust-src, llvm-tools
+      - run: cargo build
+      - run: cargo build --release
   host-tests:
     name: Host tests (protocol logic + end-to-end with python-fido2)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -48,23 +37,20 @@ jobs:
     name: Linting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          submodules: true
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-          target: thumbv6m-none-eabi
-      - run: cargo clippy --all-features -- --deny=warnings
+          targets: thumbv6m-none-eabi
+          components: rust-src, llvm-tools, clippy
+      # no --all-features: the flash_* features are mutually exclusive
+      - run: cargo clippy -- --deny=warnings
   formatting:
     name: Formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          submodules: true
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-          target: thumbv6m-none-eabi
+          targets: thumbv6m-none-eabi
+          components: rust-src, llvm-tools, rustfmt
       - run: cargo fmt -- --check
