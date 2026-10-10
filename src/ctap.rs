@@ -2,17 +2,19 @@
 //!
 //! Credentials are *not stored*: the credential ID is `nonce(32) || HMAC(master, rp, nonce)(32)`
 //! and the ES256 private key is re-derived from `HMAC(master, rp, nonce)` on every use.
-//! The only persistent secret is the 32-byte `master` key (see keys.rs).
+//! The only persistent secret is the 32-byte `master` key (see store.rs / keys.rs).
 //! No resident keys, no PIN, sign counter is always 0, attestation is "none".
 use alloc::vec::Vec;
 use hmac::{Hmac, Mac};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use sha2::{Digest, Sha256};
 
-use crate::cbor::{R, W};
+use crate::cbor::{self, R, W};
 
 pub const AAGUID: [u8; 16] = [0; 16];
 pub const MAX_MSG: usize = 1200;
+/// Reset is only accepted this long after power-up (CTAP 2.2 rule for authenticators without a display).
+pub const RESET_WINDOW_MS: u64 = 10_000;
 
 pub mod err {
     pub const INVALID_COMMAND: u8 = 0x01;
@@ -38,11 +40,15 @@ pub enum Resp {
     Err(u8),
     /// Request is valid but needs a button press: wait for it, then call `handle` again with `up = true`.
     NeedUp,
+    /// Reset was approved. Persist this new master key, and only if that succeeds call
+    /// `install_key` and answer success (status 0x00); otherwise answer `err::OTHER`.
+    Reset([u8; 32]),
 }
 
 enum Stop {
     Err(u8),
     NeedUp,
+    Reset([u8; 32]),
 }
 impl From<u8> for Stop {
     fn from(c: u8) -> Self {
@@ -52,30 +58,43 @@ impl From<u8> for Stop {
 type Res = Result<Vec<u8>, Stop>;
 
 pub struct Ctap {
-    master: [u8; 32],
-    /// Set when `master` changed (reset) and must be written to flash.
-    pub dirty: bool,
+    /// `None` = key storage unreadable/corrupt: the device refuses to work (never re-keys silently)
+    /// until the user performs an explicit reset.
+    master: Option<[u8; 32]>,
 }
 
 impl Ctap {
-    pub fn new(master: [u8; 32]) -> Self {
-        Ctap { master, dirty: false }
+    pub fn new(master: Option<[u8; 32]>) -> Self {
+        Ctap { master }
     }
-    pub fn master(&self) -> &[u8; 32] {
-        &self.master
+    pub fn install_key(&mut self, key: [u8; 32]) {
+        self.master = Some(key);
     }
 
     /// `req` = CTAP command byte + CBOR. `up` = user pressed the button for this request.
-    /// Pure and re-entrant: call first with `up = false`; on `NeedUp` call again with `true`.
-    pub fn handle(&mut self, req: &[u8], up: bool, rng: &mut dyn FnMut(&mut [u8])) -> Resp {
+    /// `now_ms` = time since power-up. Re-entrant: call first with `up = false`; on `NeedUp`
+    /// call again with `true`.
+    pub fn handle(
+        &mut self,
+        req: &[u8],
+        up: bool,
+        now_ms: u64,
+        rng: &mut dyn FnMut(&mut [u8]),
+    ) -> Resp {
         let Some((&cmd, body)) = req.split_first() else {
             return Resp::Err(err::INVALID_LENGTH);
         };
         let r = match cmd {
-            0x01 => self.make_credential(body, up, rng),
-            0x02 => self.get_assertion(body, up),
+            0x01 | 0x02 => cbor::validate(body).map_err(Stop::Err).and_then(|_| {
+                if cmd == 1 {
+                    self.make_credential(body, up, rng)
+                } else {
+                    self.get_assertion(body, up)
+                }
+            }),
+            0x04 | 0x07 | 0x0B if !body.is_empty() => Err(Stop::Err(err::INVALID_LENGTH)),
             0x04 => Ok(get_info()),
-            0x07 => self.reset(up, rng),
+            0x07 => self.reset(up, now_ms, rng),
             0x0B => {
                 if up {
                     Ok(Vec::new())
@@ -95,34 +114,42 @@ impl Ctap {
             }
             Err(Stop::Err(c)) => Resp::Err(c),
             Err(Stop::NeedUp) => Resp::NeedUp,
+            Err(Stop::Reset(k)) => Resp::Reset(k),
         }
     }
 
-    fn mac(&self, tag: u8, rp: &[u8; 32], nonce: &[u8]) -> Hmac<Sha256> {
-        let mut m = <Hmac<Sha256> as Mac>::new_from_slice(&self.master).unwrap();
+    fn key(&self) -> Result<&[u8; 32], Stop> {
+        self.master.as_ref().ok_or(Stop::Err(err::OTHER))
+    }
+
+    fn mac(master: &[u8; 32], tag: u8, rp: &[u8; 32], nonce: &[u8]) -> Hmac<Sha256> {
+        let mut m = <Hmac<Sha256> as Mac>::new_from_slice(master).unwrap();
         m.update(&[tag]);
         m.update(rp);
         m.update(nonce);
         m
     }
 
-    fn derive(&self, rp: &[u8; 32], nonce: &[u8]) -> Option<SigningKey> {
-        let k = self.mac(b'k', rp, nonce).finalize().into_bytes();
+    fn derive(master: &[u8; 32], rp: &[u8; 32], nonce: &[u8]) -> Option<SigningKey> {
+        let k = Self::mac(master, b'k', rp, nonce).finalize().into_bytes();
         SigningKey::from_bytes(&k).ok()
     }
 
     /// Returns the signing key if `id` is a credential created by this device for this RP.
-    fn check_cred(&self, rp: &[u8; 32], id: &[u8]) -> Option<SigningKey> {
+    fn check_cred(master: &[u8; 32], rp: &[u8; 32], id: &[u8]) -> Option<SigningKey> {
         if id.len() != 64 {
             return None;
         }
-        self.mac(b'i', rp, &id[..32]).verify_slice(&id[32..]).ok()?;
-        self.derive(rp, &id[..32])
+        Self::mac(master, b'i', rp, &id[..32])
+            .verify_slice(&id[32..])
+            .ok()?;
+        Self::derive(master, rp, &id[..32])
     }
 
     fn make_credential(&mut self, body: &[u8], up: bool, rng: &mut dyn FnMut(&mut [u8])) -> Res {
         let mut r = R::new(body);
-        let (mut hash, mut rp_id) = (None, None);
+        let (mut hash, mut rp_id, mut user_id) = (None, None, None);
+        let (mut have_user, mut have_params) = (false, false);
         let (mut alg_ok, mut rk, mut uv, mut pin) = (false, false, false, false);
         let mut exclude: Vec<&[u8]> = Vec::new();
 
@@ -138,7 +165,18 @@ impl Ctap {
                         }
                     }
                 }
+                3 => {
+                    have_user = true;
+                    for _ in 0..r.map()? {
+                        if r.text()? == "id" {
+                            user_id = Some(r.bytes()?);
+                        } else {
+                            r.skip()?;
+                        }
+                    }
+                }
                 4 => {
+                    have_params = true;
                     for _ in 0..r.array()? {
                         let (mut alg, mut ty) = (None, None);
                         for _ in 0..r.map()? {
@@ -148,17 +186,16 @@ impl Ctap {
                                 _ => r.skip()?,
                             }
                         }
+                        if alg.is_none() || ty.is_none() {
+                            return Err(err::MISSING_PARAMETER.into());
+                        }
                         alg_ok |= alg == Some(-7) && ty == Some("public-key");
                     }
                 }
                 5 => {
                     for _ in 0..r.array()? {
-                        for _ in 0..r.map()? {
-                            if r.text()? == "id" {
-                                exclude.push(r.bytes()?);
-                            } else {
-                                r.skip()?;
-                            }
+                        if let Some(id) = descriptor(&mut r)? {
+                            exclude.push(id);
                         }
                     }
                 }
@@ -180,7 +217,11 @@ impl Ctap {
         }
         let hash = hash.ok_or(err::MISSING_PARAMETER)?;
         let rp_id = rp_id.ok_or(err::MISSING_PARAMETER)?;
-        if hash.len() != 32 {
+        if !have_user || !have_params {
+            return Err(err::MISSING_PARAMETER.into());
+        }
+        let user_id = user_id.ok_or(err::MISSING_PARAMETER)?;
+        if hash.len() != 32 || user_id.is_empty() || user_id.len() > 64 {
             return Err(err::INVALID_PARAMETER.into());
         }
         if pin {
@@ -192,8 +233,11 @@ impl Ctap {
         if !alg_ok {
             return Err(err::UNSUPPORTED_ALGORITHM.into());
         }
+        let master = self.key()?;
         let rp: [u8; 32] = Sha256::digest(rp_id.as_bytes()).into();
-        let excluded = exclude.iter().any(|id| self.check_cred(&rp, id).is_some());
+        let excluded = exclude
+            .iter()
+            .any(|id| Self::check_cred(master, &rp, id).is_some());
         if !up {
             return Err(Stop::NeedUp);
         }
@@ -205,11 +249,13 @@ impl Ctap {
         let mut id = [0u8; 64];
         let sk = loop {
             rng(&mut id[..32]);
-            if let Some(sk) = self.derive(&rp, &id[..32]) {
+            if let Some(sk) = Self::derive(master, &rp, &id[..32]) {
                 break sk;
             }
         };
-        let tag = self.mac(b'i', &rp, &id[..32]).finalize().into_bytes();
+        let tag = Self::mac(master, b'i', &rp, &id[..32])
+            .finalize()
+            .into_bytes();
         id[32..].copy_from_slice(&tag);
 
         let mut ad = Vec::with_capacity(256);
@@ -257,12 +303,8 @@ impl Ctap {
                 2 => hash = Some(r.bytes()?),
                 3 => {
                     for _ in 0..r.array()? {
-                        for _ in 0..r.map()? {
-                            if r.text()? == "id" {
-                                allow.push(r.bytes()?);
-                            } else {
-                                r.skip()?;
-                            }
+                        if let Some(id) = descriptor(&mut r)? {
+                            allow.push(id);
                         }
                     }
                 }
@@ -293,10 +335,11 @@ impl Ctap {
         if uv {
             return Err(err::UNSUPPORTED_OPTION.into());
         }
+        let master = self.key()?;
         let rp: [u8; 32] = Sha256::digest(rp_id.as_bytes()).into();
         let (id, sk) = allow
             .iter()
-            .find_map(|id| self.check_cred(&rp, id).map(|k| (*id, k)))
+            .find_map(|id| Self::check_cred(master, &rp, id).map(|k| (*id, k)))
             .ok_or(err::NO_CREDENTIALS)?;
         if want_up && !touched {
             return Err(Stop::NeedUp);
@@ -325,13 +368,33 @@ impl Ctap {
         Ok(w.0)
     }
 
-    fn reset(&mut self, up: bool, rng: &mut dyn FnMut(&mut [u8])) -> Res {
+    fn reset(&mut self, up: bool, now_ms: u64, rng: &mut dyn FnMut(&mut [u8])) -> Res {
+        if now_ms > RESET_WINDOW_MS {
+            return Err(err::NOT_ALLOWED.into()); // replug the key and try again
+        }
         if !up {
             return Err(Stop::NeedUp);
         }
-        rng(&mut self.master);
-        self.dirty = true;
-        Ok(Vec::new())
+        let mut k = [0u8; 32];
+        rng(&mut k);
+        Err(Stop::Reset(k))
+    }
+}
+
+/// Parses a PublicKeyCredentialDescriptor. Both `type` and `id` are required.
+/// Returns the id only for type "public-key" (other types are ignored, per spec).
+fn descriptor<'a>(r: &mut R<'a>) -> Result<Option<&'a [u8]>, u8> {
+    let (mut id, mut ty) = (None, None);
+    for _ in 0..r.map()? {
+        match r.text()? {
+            "id" => id = Some(r.bytes()?),
+            "type" => ty = Some(r.text()?),
+            _ => r.skip()?,
+        }
+    }
+    match (id, ty) {
+        (Some(id), Some(ty)) => Ok(if ty == "public-key" { Some(id) } else { None }),
+        _ => Err(err::MISSING_PARAMETER),
     }
 }
 

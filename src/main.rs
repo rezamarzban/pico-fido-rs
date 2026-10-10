@@ -12,24 +12,21 @@ use embassy_executor::Spawner;
 use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::gpio::{Level, Output};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use embedded_alloc::Heap;
-use static_cell::StaticCell;
-use usbd_hid::descriptor::KeyboardUsage;
 use {defmt_rtt as _, panic_probe as _};
 
 mod cbor;
 mod ctap;
 mod ctaphid;
 mod keys;
+mod store;
 mod usb;
 use ctap::Ctap;
-use usb::{create_usb_tasks, ctap_task, HID_CHANNEL_LEN};
+use usb::{create_usb_tasks, ctap_task};
 
-// The master key lives in the last 4K sector of this much flash (see memory.x).
+// Two 4K sectors at the end of this much flash hold the master key (see memory.x, store.rs).
 pub const FLASH_SIZE: usize = 2 * 1024 * 1024;
 
 const HEAP_SIZE: usize = 32 * 1024;
@@ -42,7 +39,9 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
-    let ctap = Ctap::new(keys::load_or_create(&mut flash));
+    let (master, pos) = keys::load(&mut flash);
+    let ctap = Ctap::new(master);
+    let serial = keys::serial(&mut flash);
 
     // Get board specific pin
     let led_pin = {
@@ -50,19 +49,12 @@ async fn main(spawner: Spawner) {
         Output::new(p.PIN_25, Level::Low)
     };
 
-    static HID_KEYBOARD_CHANNEL: StaticCell<Channel<NoopRawMutex, KeyboardUsage, HID_CHANNEL_LEN>> =
-        StaticCell::new();
-    let keyboard_ch =
-        HID_KEYBOARD_CHANNEL.init(Channel::<NoopRawMutex, KeyboardUsage, HID_CHANNEL_LEN>::new());
-    let (usb_task, hid_writer, hid_reader, ctap_rd, ctap_wr) =
-        create_usb_tasks(p.USB, keyboard_ch.receiver());
+    let (usb_task, ctap_rd, ctap_wr) = create_usb_tasks(p.USB, serial);
 
     spawner.spawn(blinker(led_pin)).unwrap();
     spawner.spawn(usb_task).unwrap();
-    spawner.spawn(hid_writer).unwrap();
-    spawner.spawn(hid_reader).unwrap();
     spawner
-        .spawn(ctap_task(ctap_rd, ctap_wr, ctap, p.BOOTSEL, flash))
+        .spawn(ctap_task(ctap_rd, ctap_wr, ctap, p.BOOTSEL, flash, pos))
         .unwrap();
 }
 

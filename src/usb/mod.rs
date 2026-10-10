@@ -2,20 +2,15 @@ use embassy_executor::SpawnToken;
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
 use embassy_rp::{bind_interrupts, usb::InterruptHandler};
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_sync::channel::Receiver;
 use embassy_usb::class::hid::{HidReaderWriter, State};
 use embassy_usb::{Builder, Config, Handler, UsbDevice};
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use defmt::*;
 use static_cell::StaticCell;
-use usbd_hid::descriptor::{KeyboardReport, KeyboardUsage, SerializedDescriptor};
 
 pub mod ctap;
 pub use ctap::{ctap_task, Reader as CtapReader, Writer as CtapWriter, FIDO_REPORT_DESC};
-pub mod hid;
-pub use hid::{hid_reader, hid_writer, HID_CHANNEL_LEN};
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
@@ -28,28 +23,17 @@ async fn run_usb(mut usb: UsbDevice<'static, Driver<'static, USB>>) {
 
 pub fn create_usb_tasks(
     usb: USB,
-    keyboard_recv: Receiver<'static, NoopRawMutex, KeyboardUsage, HID_CHANNEL_LEN>,
-) -> (
-    SpawnToken<impl Sized>,
-    SpawnToken<impl Sized>,
-    SpawnToken<impl Sized>,
-    CtapReader,
-    CtapWriter,
-) {
+    serial: &'static str,
+) -> (SpawnToken<impl Sized>, CtapReader, CtapWriter) {
     let driver = Driver::new(usb, Irqs);
 
     // These are what is reconized by ctap apps like yubikey
     // and may need to be changed to be reconized
     // Create embassy-usb Config - VID, PID
     let mut config = Config::new(0xc0de, 0xcafe);
-    // Configures usb as a composite device (uses more than one protocol)
-    config.composite_with_iads = true;
-    config.device_class = 0xEF; // composite class (multiple usb protocols)
-    config.device_sub_class = 0x02;
-    config.device_protocol = 0x01;
     config.manufacturer = Some("LegtCamper");
     config.product = Some("Pico Fido");
-    config.serial_number = Some("12345678");
+    config.serial_number = Some(serial);
     config.max_power = 100;
     config.max_packet_size_0 = 64;
 
@@ -75,18 +59,6 @@ pub fn create_usb_tasks(
 
     // Create the usb classes
 
-    let (hid_receiver, hid_sender) = {
-        let config = embassy_usb::class::hid::Config {
-            report_descriptor: KeyboardReport::desc(),
-            request_handler: None,
-            poll_ms: 60,
-            max_packet_size: 64,
-        };
-        static STATE: StaticCell<State> = StaticCell::new();
-        HidReaderWriter::<_, 1, 8>::new(&mut builder, STATE.init(State::new()), config)
-    }
-    .split();
-
     let (ctap_receiver, ctap_sender) = {
         let config = embassy_usb::class::hid::Config {
             report_descriptor: FIDO_REPORT_DESC,
@@ -103,13 +75,7 @@ pub fn create_usb_tasks(
     let usb = builder.build();
 
     // return usb tasks
-    (
-        run_usb(usb),
-        hid_writer(hid_sender, keyboard_recv),
-        hid_reader(hid_receiver),
-        ctap_receiver,
-        ctap_sender,
-    )
+    (run_usb(usb), ctap_receiver, ctap_sender)
 }
 
 struct UsbHandler {
