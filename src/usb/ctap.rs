@@ -44,6 +44,8 @@ enum Wait {
     Fail(u8),
     /// Host re-initialised the channel: drop the request, send nothing for it.
     Aborted,
+    /// USB reset / suspend / disable while waiting: the PIN session is over, drop the command.
+    Wiped,
 }
 
 /// Wait for a *fresh* press of BOOTSEL. A button that is already held when the request
@@ -61,6 +63,9 @@ async fn wait_touch(
     let mut armed = false; // seen the button released since the request arrived
     let mut pressed_since: Option<Instant> = None;
     while Instant::now() < deadline {
+        if WIPE.signaled() {
+            return Wait::Wiped;
+        }
         if button.is_pressed() {
             if armed {
                 let t = *pressed_since.get_or_insert(Instant::now());
@@ -132,26 +137,38 @@ pub async fn ctap_task(
             Rx::Reply(cid, cmd, d) => send(&mut wr, cid, cmd, &d).await,
             Rx::Cbor(cid, req) => {
                 LED_SIGNAL.signal(LedState::Processing);
-                // The reset window is judged on when the request ARRIVED, not on when the
-                // user finally pressed the button, so both calls use this timestamp.
+                // The reset window is judged on when the request ARRIVED, not on when the user
+                // finally pressed the button. PIN session expiry uses the CURRENT time instead.
                 let arrived = now_ms();
                 if req.first() == Some(&0x06) {
                     // ClientPIN can spend a while in Argon2: tell the host we are alive.
                     send(&mut wr, cid, ctaphid::KEEPALIVE, &[1]).await;
                 }
                 let t0 = Instant::now();
-                let mut r = ctap.handle(&req, false, arrived, &mut rng, &mut vault);
+                let mut r = ctap.handle_at(&req, false, arrived, now_ms(), &mut rng, &mut vault);
                 info!("ctap command took {} ms", t0.elapsed().as_millis());
                 if let Resp::NeedUp = r {
                     LED_SIGNAL.signal(LedState::Confirm);
                     match wait_touch(cid, &mut rd, &mut wr, &mut hid, &mut button).await {
+                        Wait::Touch if WIPE.signaled() => {
+                            // The bus was reset/suspended while the button was pressed: the
+                            // session is over, so this command must not continue.
+                            WIPE.reset();
+                            ctap.lock();
+                            r = Resp::Err(err::OTHER);
+                        }
                         Wait::Touch => {
                             LED_SIGNAL.signal(LedState::Processing);
                             send(&mut wr, cid, ctaphid::KEEPALIVE, &[1]).await; // 1 = processing
                             let t = Instant::now();
-                            r = ctap.handle(&req, true, arrived, &mut rng, &mut vault);
+                            r = ctap.handle_at(&req, true, arrived, now_ms(), &mut rng, &mut vault);
                             // P-256 runs without yielding; this shows how long the host waits.
                             info!("crypto took {} ms", t.elapsed().as_millis());
+                        }
+                        Wait::Wiped => {
+                            WIPE.reset();
+                            ctap.lock();
+                            r = Resp::Err(err::OTHER);
                         }
                         Wait::Fail(code) => r = Resp::Err(code),
                         Wait::Aborted => {
@@ -159,6 +176,12 @@ pub async fn ctap_task(
                             continue;
                         }
                     }
+                }
+                // A reset/suspend during the (blocking) crypto above ends the session before the
+                // response goes out.
+                if WIPE.signaled() {
+                    WIPE.reset();
+                    ctap.lock();
                 }
                 let out: Vec<u8> = match r {
                     Resp::Ok(v) => v,

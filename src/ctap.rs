@@ -117,6 +117,29 @@ struct P<'a> {
     hash_enc: Option<&'a [u8]>,
 }
 
+/// Outcome of persisting a new record.
+enum Commit {
+    /// The new record is durable and every older record was verified destroyed.
+    Done,
+    /// The new record is durable and is what the next boot loads, but an older record (possibly the
+    /// plaintext key, or the key wrapped under the old PIN) could not be wiped and may still be
+    /// readable in flash. The firmware state already equals the new record.
+    OldRemains,
+    /// Nothing changed (or the state is unknown and the key is refused): see `commit`.
+    Failed,
+}
+
+/// The CTAP answer for a commit plus the retry-counter work that has to go with it. Anything but a
+/// complete success is reported as an error so that nobody is told "PIN set" / "reset done" while
+/// old key material may still be readable or the retry counter is not in the required state.
+/// The running state is adopted either way, so it always matches the flash.
+fn commit_result(c: Commit, tries_ok: bool) -> Res {
+    match c {
+        Commit::Done if tries_ok => Ok(Vec::new()),
+        _ => Err(err::OTHER.into()),
+    }
+}
+
 fn key_from(rec: Option<Record>) -> Key {
     match rec {
         None => Key::Broken,
@@ -154,6 +177,9 @@ impl Ctap {
 
     /// Ends a PIN session now: wipes the unwrapped key and the token (USB reset, suspend, expiry).
     pub fn lock(&mut self) {
+        // The ephemeral ClientPIN key-agreement key ends with the session as well
+        // (`SecretKey` zeroizes itself on drop).
+        self.agree = None;
         let rec = match &self.key {
             Key::Unlocked(_, r) => Some(r.clone()),
             _ => None,
@@ -172,35 +198,59 @@ impl Ctap {
     }
 
     /// Persists `rec` and makes the running state equal to what the next boot will load.
-    /// Returns whether `rec` is now the durable state.
-    fn commit(&mut self, vault: &mut dyn Vault, rec: &Record) -> bool {
+    fn commit(&mut self, vault: &mut dyn Vault, rec: &Record) -> Commit {
         self.agree = None;
         match vault.replace(rec) {
-            Replaced::New(_) => {
+            Replaced::New(saved) => {
                 self.set_key(key_from(Some(rec.clone())));
-                true
+                if saved.old_wiped {
+                    Commit::Done
+                } else {
+                    Commit::OldRemains
+                }
             }
             Replaced::Kept(k) => {
                 self.set_key(key_from(Some(k)));
-                false
+                Commit::Failed
             }
             Replaced::NoKey | Replaced::Unknown => {
                 self.set_key(Key::Broken);
-                false
+                Commit::Failed
             }
         }
     }
 
-    /// `req` = CTAP command byte + CBOR. `up` = user pressed the button for this request.
-    /// `now_ms` = time since power-up *at which the request arrived*. Re-entrant: call first with
-    /// `up = false`; on `NeedUp` call again with `true` and the SAME `now_ms`, so that waiting
-    /// for the button never makes a request that arrived in time look late (reset window).
-    /// Nothing that cannot be repeated (PIN attempts, flash writes) happens before the button
-    /// press has been requested for commands that need it.
+    /// Same as [`handle_at`](Self::handle_at) for a request that is processed the moment it
+    /// arrives (`arrived_ms == now_ms`).
+    #[allow(dead_code)]
     pub fn handle(
         &mut self,
         req: &[u8],
         up: bool,
+        now_ms: u64,
+        rng: &mut dyn FnMut(&mut [u8]),
+        vault: &mut dyn Vault,
+    ) -> Resp {
+        self.handle_at(req, up, now_ms, now_ms, rng, vault)
+    }
+
+    /// `req` = CTAP command byte + CBOR. `up` = user pressed the button for this request.
+    ///
+    /// Two clocks, both in ms since power-up, which must not be mixed up:
+    /// * `arrived_ms` = when the request ARRIVED. Only the 10 s reset window is judged on it, so a
+    ///   delayed button press never makes a request that arrived in time look late.
+    /// * `now_ms` = the CURRENT time. PIN token / session expiry is judged on it, so a request that
+    ///   waited for the button past the end of the session is refused instead of being authorised
+    ///   by a stale timestamp.
+    ///
+    /// Re-entrant: call first with `up = false`; on `NeedUp` call again with `true` and the SAME
+    /// `arrived_ms` (but the current `now_ms`). Nothing that cannot be repeated (PIN attempts, flash
+    /// writes) happens before the button press has been requested for commands that need it.
+    pub fn handle_at(
+        &mut self,
+        req: &[u8],
+        up: bool,
+        arrived_ms: u64,
         now_ms: u64,
         rng: &mut dyn FnMut(&mut [u8]),
         vault: &mut dyn Vault,
@@ -210,14 +260,16 @@ impl Ctap {
             return Resp::Err(err::INVALID_LENGTH);
         };
         let r = match cmd {
-            0x01 | 0x02 | 0x06 => cbor::validate(body).map_err(Stop::Err).and_then(|_| match cmd {
-                1 => self.make_credential(body, up, now_ms, rng),
-                2 => self.get_assertion(body, up, now_ms),
-                _ => self.client_pin(body, up, now_ms, rng, vault),
-            }),
+            0x01 | 0x02 | 0x06 => cbor::validate(body)
+                .map_err(Stop::Err)
+                .and_then(|_| match cmd {
+                    1 => self.make_credential(body, up, now_ms, rng),
+                    2 => self.get_assertion(body, up, now_ms),
+                    _ => self.client_pin(body, up, now_ms, rng, vault),
+                }),
             0x04 | 0x07 | 0x0B if !body.is_empty() => Err(Stop::Err(err::INVALID_LENGTH)),
             0x04 => Ok(self.get_info()),
-            0x07 => self.reset(up, now_ms, rng, vault),
+            0x07 => self.reset(up, arrived_ms, rng, vault),
             0x0B => {
                 if up {
                     Ok(Vec::new())
@@ -300,7 +352,9 @@ impl Ctap {
                     None => return Err(err::MISSING_PARAMETER.into()),
                 };
                 match &self.token {
-                    Some(t) if now_ms < t.expires && pin::verify_token(v, &t.bytes, &[hash], param) => {
+                    Some(t)
+                        if now_ms < t.expires && pin::verify_token(v, &t.bytes, &[hash], param) =>
+                    {
                         Ok(true)
                     }
                     _ => Err(err::PIN_AUTH_INVALID.into()),
@@ -563,11 +617,11 @@ impl Ctap {
     fn reset(
         &mut self,
         up: bool,
-        now_ms: u64,
+        arrived_ms: u64,
         rng: &mut dyn FnMut(&mut [u8]),
         vault: &mut dyn Vault,
     ) -> Res {
-        if now_ms > RESET_WINDOW_MS {
+        if arrived_ms > RESET_WINDOW_MS {
             return Err(err::NOT_ALLOWED.into()); // replug the key and try again
         }
         if !up {
@@ -577,14 +631,10 @@ impl Ctap {
         rng(&mut k);
         let rec = Record::plain(k);
         k.zeroize();
-        let ok = self.commit(vault, &rec);
+        let c = self.commit(vault, &rec);
         self.boot_fails = 0;
-        if ok {
-            let _ = vault.clear_tries();
-            Ok(Vec::new())
-        } else {
-            Err(err::OTHER.into())
-        }
+        let tries_ok = !matches!(c, Commit::Failed) && vault.clear_tries().is_ok();
+        commit_result(c, tries_ok)
     }
 
     // ---- authenticatorClientPIN -----------------------------------------------------------------
@@ -737,8 +787,13 @@ impl Ctap {
             h.zeroize();
         }
         match master {
-            Some(m) => {
-                let _ = vault.finish_try(page);
+            Some(mut m) => {
+                if vault.finish_try(page).is_err() {
+                    // The PIN is right but the attempt could not be recorded as correct. Fail
+                    // closed: no key and no token (the attempt stays counted as a failure).
+                    m.zeroize();
+                    return Err(err::OTHER.into());
+                }
                 self.boot_fails = 0;
                 Ok(m)
             }
@@ -790,12 +845,9 @@ impl Ctap {
         };
         hash.zeroize();
         let rec = rec.ok_or(err::OTHER)?;
-        if self.commit(vault, &rec) {
-            let _ = vault.clear_tries();
-            Ok(Vec::new())
-        } else {
-            Err(err::OTHER.into())
-        }
+        let c = self.commit(vault, &rec);
+        let tries_ok = !matches!(c, Commit::Failed) && vault.clear_tries().is_ok();
+        commit_result(c, tries_ok)
     }
 
     fn change_pin(
@@ -830,11 +882,9 @@ impl Ctap {
         master.zeroize();
         new_hash.zeroize();
         let rec = rec.ok_or(err::OTHER)?;
-        if self.commit(vault, &rec) {
-            Ok(Vec::new())
-        } else {
-            Err(err::OTHER.into())
-        }
+        // verify_pin already reset the retry counter
+        let c = self.commit(vault, &rec);
+        commit_result(c, true)
     }
 
     fn get_token(
@@ -888,8 +938,12 @@ fn descriptor<'a>(r: &mut R<'a>) -> Result<Option<&'a [u8]>, u8> {
 
 impl Ctap {
     fn get_info(&self) -> Vec<u8> {
+        // `versions` stays FIDO_2_0 on purpose: declaring FIDO_2_1 would promise 2.1 features
+        // (credential management, permissions, ...) that are not implemented. PIN protocol 2 and
+        // minPINLength (a 2.1 field, harmless for 2.0 clients) are advertised so that clients can
+        // pick the protocol and show the PIN policy before trying to set a PIN.
         let mut w = W::new();
-        w.map(6);
+        w.map(7);
         w.uint(1);
         w.arr(1);
         w.text("FIDO_2_0");
@@ -913,6 +967,8 @@ impl Ctap {
         w.uint(1);
         w.uint(8);
         w.uint(64);
+        w.uint(13); // minPINLength
+        w.uint(MIN_PIN_LEN as u64);
         w.0
     }
 }

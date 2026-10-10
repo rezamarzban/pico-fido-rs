@@ -3,8 +3,10 @@
 This is a small, software-only FIDO2 key for the RP2040. Read this before relying on it.
 
 ## What it protects against
-* Phishing and credential theft over the network: credentials are bound to the website (RP ID) and signed with ES256.
-* A stolen/lost device that is never opened: nothing is exposed over USB except signatures.
+* Phishing and credential theft over the network: credentials are bound to the website (RP ID) and signed with ES256. This assumes an uncompromised browser/OS and a relying party that checks the RP ID; it does not help against malware on the host.
+* A stolen/lost device that is never opened: the USB interface does not export the master key. It answers ordinary
+  CTAP requests and signs only after a fresh BOOTSEL press (and, once a PIN is set, a valid PIN token).
+  **Without a PIN, whoever holds the device and a credential ID can use it to sign in.**
 * Each action (register / sign / reset) needs a **fresh** press of the BOOTSEL button; a button that is already
   held down when a request arrives is ignored until it has been released and pressed again. This is enforced by
   the authenticator itself: a getAssertion with `options.up = false` still requires (and reports) a touch.
@@ -14,11 +16,11 @@ This is a small, software-only FIDO2 key for the RP2040. Read this before relyin
   flash (see `src/store.rs`). The RP2040 has no secure storage, no flash encryption and no OTP key area, and the
   USB bootloader or SWD can read the whole flash. With the master key and a credential ID, the private key
   can be re-derived. **Set a PIN** (see below) to raise the cost of this attack; it does not remove it.
-  A secure element (e.g. ATECC608, OPTIGA) that signs internally is the only real fix.
+  A secure element (e.g. ATECC608, OPTIGA) that signs internally would keep the key out of flash, but is not a complete fix: the ATECC608 used in the `atecc-*` branches, for example, has no user-presence check, so anyone with access to its bus can still request signatures.
 * **Anyone who can read the flash, when a PIN is set: offline PIN guessing.** The wrapped key can be attacked at
   Argon2id speed on a fast PC; the retry counter only limits attempts made through the USB interface. With
   `m = 96 KiB` (RAM-limited, see `src/wrap.rs`) the memory hardness is low, so security rests on the
-  **PIN entropy**: use a long passphrase (the firmware enforces at least 10 characters; 5 random words or more is
+  **PIN entropy**: use a long passphrase (the firmware enforces at least 10 Unicode code points; 5 random words or more is
   much better). The Argon2 parameters were not measured on hardware.
 * **Anyone who can read RAM while a PIN session is open** (debugger / SWD): the unwrapped key is in RAM for up to
   2 minutes after a successful PIN entry. The RP2040 has no debug lockout.
@@ -31,6 +33,7 @@ This is a small, software-only FIDO2 key for the RP2040. Read this before relyin
   not measure entropy. Hashing cannot create entropy that is not there; the key is only as unpredictable as the
   ROSC. Not evaluated against NIST SP 800-90B. Do not use for high-value accounts without reviewing this.
 * **Side channels / fault injection.** No countermeasures.
+* **Hardware testing.** Tested by the maintainer on a Pico (Linux only, no detailed record). See `README.md`, "Verification status". Simulated flash and host tests are not a physical test.
 
 ## Behaviour worth knowing
 * Credentials are stateless (no resident keys, sign counter always 0, attestation "none").
@@ -46,6 +49,15 @@ This is a small, software-only FIDO2 key for the RP2040. Read this before relyin
   afterwards, so cutting power does not give free guesses. 8 failures block the PIN (`PIN_BLOCKED`); 3 in a row
   since power-up require a power cycle (`PIN_AUTH_BLOCKED`). A blocked or forgotten PIN is recovered only by a
   CTAP reset (touch, within 10 s of plug-in), which destroys all credentials. A correct PIN needs no flash erase.
+* **Failed wipes are reported.** After setPIN, changePIN or reset the new state is always the one the next boot
+  will load. If the *old* key record could not be wiped (or the wipe could not be read back), the command answers
+  with an error (`OTHER`) although the new state is active and durable; retrying is safe, and the old record is
+  wiped again at every boot (`purge_stale`). Until then old key material may remain readable in flash.
+* **A USB reset, suspend or disable ends the PIN session** and cancels a command that is waiting for the button
+  (error `OTHER`), also on a key without a PIN. The ephemeral key-agreement key is discarded whenever the session
+  ends (lock, expiry, USB events, any PIN write). A client that holds a key-agreement object across such an event
+  must fetch a new one.
+* A client's COSE key-agreement object must carry `kty` = 2 and `crv` = 1 (and `alg` = -25 if present).
 * If the wrapped record is damaged there is no way to recover the key (by design); reset is the way out.
 * Minimum PIN length is 10 Unicode code points (`MIN_PIN_LEN`), enforced by the authenticator
   (`PIN_POLICY_VIOLATION`).

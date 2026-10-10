@@ -13,21 +13,23 @@ use store::{Pos, Record, Replaced, Saved, Vault};
 
 /// In-RAM stand-in for the flash (the FFI and the CTAP-level tests use it).
 /// `mode`: 0 = replace works, 1 = replace fails and the previous record stays, 2 = replace fails
-/// and the flash state is unknowable.
-pub struct RamVault { pub rec: Option<Record>, pub used: u8, pub mode: u8 }
-impl RamVault { pub fn new(rec: Option<Record>) -> Self { RamVault { rec, used: 0, mode: 0 } } }
+/// and the flash state is unknowable. `old_wiped`: what a successful replace reports about the
+/// older slot (false = the old record could not be wiped). `fail_clear` / `fail_finish`: the retry
+/// counter cannot be cleared / cannot mark an attempt as correct.
+pub struct RamVault { pub rec: Option<Record>, pub used: u8, pub mode: u8, pub old_wiped: bool, pub fail_clear: bool, pub fail_finish: bool }
+impl RamVault { pub fn new(rec: Option<Record>) -> Self { RamVault { rec, used: 0, mode: 0, old_wiped: true, fail_clear: false, fail_finish: false } } }
 impl Vault for RamVault {
     fn replace(&mut self, rec: &Record) -> Replaced {
         match self.mode {
             1 => match &self.rec { Some(r) => Replaced::Kept(r.clone()), None => Replaced::NoKey },
             2 => Replaced::Unknown,
-            _ => { self.rec = Some(rec.clone()); Replaced::New(Saved { pos: Pos { seq: 1, slot: 0 }, old_wiped: true }) }
+            _ => { self.rec = Some(rec.clone()); Replaced::New(Saved { pos: Pos { seq: 1, slot: 0 }, old_wiped: self.old_wiped }) }
         }
     }
     fn tries_used(&mut self) -> Result<u8, ()> { Ok(self.used) }
     fn begin_try(&mut self) -> Result<usize, ()> { if self.used >= 8 { Err(()) } else { self.used += 1; Ok(0) } }
-    fn finish_try(&mut self, _page: usize) -> Result<(), ()> { self.used = 0; Ok(()) }
-    fn clear_tries(&mut self) -> Result<(), ()> { self.used = 0; Ok(()) }
+    fn finish_try(&mut self, _page: usize) -> Result<(), ()> { if self.fail_finish { return Err(()) } self.used = 0; Ok(()) }
+    fn clear_tries(&mut self) -> Result<(), ()> { if self.fail_clear { return Err(()) } self.used = 0; Ok(()) }
 }
 
 pub struct Handle { ctap: Ctap, vault: RamVault }
@@ -48,6 +50,14 @@ pub struct Handle { ctap: Ctap, vault: RamVault }
 }
 #[no_mangle] pub extern "C" fn ctap_tick(h: *mut Handle, now_ms: u64) { if !h.is_null() { unsafe { &mut *h }.ctap.tick(now_ms) } }
 #[no_mangle] pub extern "C" fn ctap_lock(h: *mut Handle) { if !h.is_null() { unsafe { &mut *h }.ctap.lock() } }
+/// Fault injection for the end-to-end script. kind: 1 = replace mode (0 ok, 1 keeps previous record,
+/// 2 unknown state), 2 = old slot wiped (0/1), 3 = clearing the retry counter fails (0/1),
+/// 4 = marking an attempt as correct fails (0/1).
+#[no_mangle] pub extern "C" fn ctap_fault(h: *mut Handle, kind: i32, val: i32) {
+    if h.is_null() { return; }
+    let v = &mut unsafe { &mut *h }.vault;
+    match kind { 1 => v.mode = val as u8, 2 => v.old_wiped = val != 0, 3 => v.fail_clear = val != 0, 4 => v.fail_finish = val != 0, _ => {} }
+}
 /// Failed PIN attempts persisted since the last correct PIN.
 #[no_mangle] pub extern "C" fn ctap_tries_used(h: *mut Handle) -> i32 { if h.is_null() { -1 } else { unsafe { &*h }.vault.used as i32 } }
 
@@ -305,10 +315,12 @@ mod store_tests {
         erase_fail_from: Option<usize>,   // from this op on, erase fails and leaves the sector UNTOUCHED
         stuck: [bool; 2],                 // erase and write on this slot fail, contents UNTOUCHED
         tries_dead: bool,                 // counter sector cannot be written
+        erase_lies: bool,                 // erase reports success but erases nothing
+        write_dead: [bool; 2],            // write fails on this slot, erase still works
     }
     #[derive(Debug)] struct Fault;
     impl Mock {
-        fn new() -> Self { Mock { s: [vec![0xFF; REC_LEN], vec![0xFF; REC_LEN]], t: [0xFF; TRIES_PAGES], ops: 0, crash_at: None, read_err: false, read_err_once_at: None, reads: 0, erase_fail_from: None, stuck: [false; 2], tries_dead: false } }
+        fn new() -> Self { Mock { s: [vec![0xFF; REC_LEN], vec![0xFF; REC_LEN]], t: [0xFF; TRIES_PAGES], ops: 0, crash_at: None, read_err: false, read_err_once_at: None, reads: 0, erase_fail_from: None, stuck: [false; 2], tries_dead: false, erase_lies: false, write_dead: [false; 2] } }
         fn tick(&mut self) -> bool { self.ops += 1; Some(self.ops) == self.crash_at }
     }
     impl Sectors for Mock {
@@ -323,11 +335,12 @@ mod store_tests {
             if self.stuck[slot] { return Err(Fault) }
             if crash { self.s[slot][..20].fill(0); return Err(Fault) }             // power cut mid-erase leaves junk
             if matches!(self.erase_fail_from, Some(n) if self.ops >= n) { return Err(Fault) } // erase refused, old data intact
+            if self.erase_lies { return Ok(()) }                                    // success reported, nothing erased
             self.s[slot].fill(0xFF); Ok(())
         }
         fn write(&mut self, slot: usize, rec: &[u8; REC_LEN]) -> Result<(), Fault> {
             let crash = self.tick();
-            if self.stuck[slot] { return Err(Fault) }
+            if self.stuck[slot] || self.write_dead[slot] { return Err(Fault) }
             if crash { self.s[slot][..30].copy_from_slice(&rec[..30]); return Err(Fault) } // power cut mid-write: partial record
             for (d, n) in self.s[slot].iter_mut().zip(rec.iter()) { *d &= *n }       // flash programming can only clear bits
             Ok(())
@@ -467,6 +480,49 @@ mod store_tests {
         let _ = pos_of(&mut m);
     }
 
+    // ---- wipe verification and stale-record cleanup ----------------------------------------------
+
+    #[test] fn an_erase_that_lies_is_caught_by_the_read_back_and_repaired_by_overwriting() {
+        let mut m = Mock::new(); save(&mut m, &r(K1)).unwrap();
+        m.erase_lies = true;                                   // erase() says Ok but the old key stays
+        let s = match replace_record(&mut m, &r(K2)) { Replaced::New(s) => s, o => panic!("{o:?}") };
+        assert!(s.old_wiped, "zero-overwrite fallback destroys the record");
+        assert!(m.s[0].iter().all(|&b| b == 0), "old slot was overwritten, not trusted to be erased");
+        assert_eq!(active(&mut m), Some(K2));
+    }
+    #[test] fn a_wipe_that_cannot_be_verified_is_reported_as_not_wiped() {
+        let mut m = Mock::new(); save(&mut m, &r(K1)).unwrap();
+        m.erase_lies = true; m.write_dead[0] = true;           // neither erase nor overwrite works on the old slot
+        let s = match replace_record(&mut m, &r(K2)) { Replaced::New(s) => s, o => panic!("{o:?}") };
+        assert!(!s.old_wiped, "must not claim the old key is gone");
+        assert!(matches!(load(&mut m).unwrap(), Loaded::Rec(ref g, _) if g.body == K2), "new record still wins");
+    }
+    #[test] fn purge_stale_destroys_a_leftover_old_record() {
+        let mut m = Mock::new(); save(&mut m, &r(K1)).unwrap();
+        m.stuck[0] = true;                                      // the old slot cannot be wiped during the update
+        assert!(matches!(save(&mut m, &r(K2)), Ok(ref s) if !s.old_wiped));
+        assert!(m.s[0].iter().any(|&b| b != 0xFF), "old key is still in flash");
+        assert_eq!(purge_stale(&mut m).unwrap(), false, "still cannot be wiped: reported, not hidden");
+        assert_eq!(active(&mut m), Some(K2));
+        m.stuck[0] = false;                                     // e.g. next boot, flash behaves again
+        assert_eq!(purge_stale(&mut m).unwrap(), true);
+        assert!(m.s[0].iter().all(|&b| b == 0xFF), "stale key is gone");
+        assert_eq!(active(&mut m), Some(K2));
+        let ops = m.ops; assert_eq!(purge_stale(&mut m).unwrap(), true); assert_eq!(m.ops, ops, "nothing stale: no flash wear");
+    }
+    #[test] fn purge_stale_never_touches_the_only_record_and_reports_read_errors() {
+        let mut m = Mock::new(); assert_eq!(purge_stale(&mut m).unwrap(), true);         // blank flash
+        save(&mut m, &r(K1)).unwrap(); let ops = m.ops;
+        assert_eq!(purge_stale(&mut m).unwrap(), true); assert_eq!(m.ops, ops); assert_eq!(active(&mut m), Some(K1));
+        m.read_err = true; assert!(purge_stale(&mut m).is_err());
+    }
+    #[test] fn a_failed_mark_after_a_correct_pin_is_visible_to_the_caller() {
+        let mut m = Mock::new(); let page = begin_try(&mut m).unwrap();
+        m.tries_dead = true;
+        assert!(finish_try(&mut m, page).is_err());
+        assert_eq!(count_tries(&mut m).unwrap(), 1, "the attempt stays counted as a failure");
+    }
+
     // ---- PIN retry counter ---------------------------------------------------------------------
 
     #[test] fn attempt_is_persisted_before_it_is_evaluated() {
@@ -544,6 +600,20 @@ mod health_tests {
         }
         assert!(!ok);
     }
+    /// One 512-byte window whose first byte (0xAA) occurs exactly `n` times (n odd, so that
+    /// `idx * n mod 512` visits every residue once), spread out so that no run gets long.
+    fn window_with_hits(n: usize) -> Vec<[u8; SAMPLE]> {
+        let bytes: Vec<u8> = (0..512usize).map(|i| if (i * n) % 512 < n { 0xAA } else { let v = ((i * 7 + 13) % 251) as u8; if v == 0xAA { 0xAB } else { v } }).collect();
+        assert_eq!(bytes.iter().filter(|&&b| b == 0xAA).count(), n);
+        bytes.chunks(SAMPLE).map(|c| { let mut a = [0u8; SAMPLE]; a.copy_from_slice(c); a }).collect()
+    }
+    #[test] fn adaptive_proportion_cutoff_is_311_for_one_bit_per_byte() {
+        // 310 occurrences in a window are still plausible for a 1 bit/byte source ...
+        let mut h = Health::new(); assert!(window_with_hits(309).iter().all(|s| h.feed(s)), "309 hits must pass");
+        // ... 311 are not (the old cutoff of 410 would have let this through)
+        let mut h = Health::new(); assert!(!window_with_hits(311).iter().all(|s| h.feed(s)), "311 hits must fail");
+        let mut h = Health::new(); assert!(!window_with_hits(411).iter().all(|s| h.feed(s)));
+    }
 }
 
 #[cfg(test)]
@@ -588,6 +658,33 @@ mod pin_tests {
         let mut r = super::cbor::R::new(&enc);
         assert_eq!(parse_cose(&mut r).unwrap(), a.public_key());
         assert!(super::cbor::validate(&enc).is_ok(), "COSE key is canonical CBOR");
+    }
+    /// COSE_Key with selectable metadata (None = label omitted), valid P-256 coordinates.
+    fn cose_with(kty: Option<i64>, alg: Option<i64>, crv: Option<i64>) -> Vec<u8> {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let mut rng = |b: &mut [u8]| { use rand::RngCore; rand::thread_rng().fill_bytes(b) };
+        let pt = new_secret(&mut rng).public_key().to_encoded_point(false);
+        let mut w = super::cbor::W::new();
+        w.map(2 + kty.is_some() as u64 + alg.is_some() as u64 + crv.is_some() as u64);
+        if let Some(v) = kty { w.uint(1); w.int(v); }
+        if let Some(v) = alg { w.uint(3); w.int(v); }
+        if let Some(v) = crv { w.int(-1); w.int(v); }
+        w.int(-2); w.bytes(pt.x().unwrap()); w.int(-3); w.bytes(pt.y().unwrap());
+        w.0
+    }
+    fn parse(b: &[u8]) -> Result<(), u8> { parse_cose(&mut super::cbor::R::new(b)).map(|_| ()) }
+    #[test] fn cose_metadata_must_describe_a_p256_key() {
+        assert_eq!(parse(&cose_with(Some(2), Some(-25), Some(1))), Ok(()));
+        assert_eq!(parse(&cose_with(Some(2), None, Some(1))), Ok(()), "alg may be omitted");
+        assert_eq!(parse(&cose_with(Some(1), Some(-25), Some(1))), Err(0x02), "OKP is not EC2");
+        assert_eq!(parse(&cose_with(Some(2), Some(-25), Some(2))), Err(0x02), "P-384 curve id with P-256 coordinates");
+        assert_eq!(parse(&cose_with(Some(2), Some(-7), Some(1))), Err(0x02), "wrong algorithm");
+        assert_eq!(parse(&cose_with(None, Some(-25), Some(1))), Err(0x14), "kty is required");
+        assert_eq!(parse(&cose_with(Some(2), Some(-25), None)), Err(0x14), "crv is required");
+        assert_eq!(parse(&cose_with(None, None, None)), Err(0x14));
+        // metadata of the wrong type
+        let mut w = super::cbor::W::new(); w.map(1); w.uint(1); w.text("EC2");
+        assert_eq!(parse(&w.0), Err(0x11));
     }
     #[test] fn invalid_peer_keys_are_rejected() {
         // x, y of the wrong length / not on the curve
@@ -673,8 +770,11 @@ mod ctap_tests {
     impl Plat {
         fn new(v: u8) -> Self { let mut r = rand::thread_rng(); Plat { v, sk: new_secret(&mut |b: &mut [u8]| r.fill_bytes(b)), sh: None } }
         fn cose(&self) -> Vec<u8> { cose_key(&self.sk.public_key()) }
-        fn agree(&mut self, c: &mut Ctap, v: &mut RamVault) {
-            let r = call(c, v, &pin_req(&[(1, enc_u(self.v as u64)), (2, enc_u(2))]), 1000);
+        fn agree(&mut self, c: &mut Ctap, v: &mut RamVault) { self.agree_at(c, v, 1000) }
+        /// getKeyAgreement at an explicit clock: a real platform asks for it right before getPinToken,
+        /// so the clock must not run backwards between the two (an expired session is wiped, with its key).
+        fn agree_at(&mut self, c: &mut Ctap, v: &mut RamVault, now: u64) {
+            let r = call(c, v, &pin_req(&[(1, enc_u(self.v as u64)), (2, enc_u(2))]), now);
             assert_eq!(r[0], 0, "getKeyAgreement");
             let mut rd = R::new(&r[1..]); rd.map().unwrap(); assert_eq!(rd.uint().unwrap(), 1);
             self.sh = Some(Shared::derive(self.v, &self.sk, &parse_cose(&mut rd).unwrap()));
@@ -690,7 +790,7 @@ mod ctap_tests {
             call(c, v, &pin_req(&[(1, enc_u(self.v as u64)), (2, enc_u(4)), (3, self.cose()), (4, enc_b(&auth)), (5, enc_b(&new_enc)), (6, enc_b(&hash_enc))]), 1000)[0]
         }
         fn token(&mut self, c: &mut Ctap, v: &mut RamVault, pin: &str, now: u64) -> Result<Vec<u8>, u8> {
-            self.agree(c, v); let sh = self.sh.as_ref().unwrap();
+            self.agree_at(c, v, now); let sh = self.sh.as_ref().unwrap();
             let hash_enc = enc(sh, &hash16(pin));
             let r = call(c, v, &pin_req(&[(1, enc_u(self.v as u64)), (2, enc_u(5)), (3, self.cose()), (6, enc_b(&hash_enc))]), now);
             if r[0] != 0 { return Err(r[0]); }
@@ -871,12 +971,97 @@ mod ctap_tests {
         v.mode = 1; assert_eq!(p.change_pin(&mut c, &mut v, PIN, "another long passphrase"), 0x7F);
         v.mode = 0; assert!(p.token(&mut c, &mut v, PIN, 1).is_ok(), "old PIN still valid");
     }
+    fn ha(c: &mut Ctap, v: &mut RamVault, req: &[u8], up: bool, arrived: u64, now: u64) -> Resp {
+        let mut r = rand::thread_rng(); let mut f = |b: &mut [u8]| r.fill_bytes(b);
+        c.handle_at(req, up, arrived, now, &mut f, v)
+    }
+
+    // ---- storage outcomes are reported, not hidden -------------------------------------------
+
+    #[test] fn pin_setup_with_a_surviving_old_key_is_reported_but_the_state_is_adopted() {
+        let (mut c, mut v) = setup(5); let mut p = Plat::new(2); v.old_wiped = false;
+        assert_eq!(p.set_pin(&mut c, &mut v, PIN), 0x7F, "must not claim the plaintext key is gone");
+        assert!(v.rec.as_ref().unwrap().wrapped, "the wrapped record IS the durable state");
+        assert!(!c.key_in_ram() && call(&mut c, &mut v, &mc_req(None), 1)[0] == 0x36, "so the device behaves as PIN-protected");
+        v.old_wiped = true; assert!(p.token(&mut c, &mut v, PIN, 1).is_ok());
+    }
+    #[test] fn reset_with_a_surviving_old_key_is_reported_but_the_new_key_is_active() {
+        let (mut c, mut v) = setup(5); v.old_wiped = false;
+        assert_eq!(call(&mut c, &mut v, &[7], 100)[0], 0x7F);
+        let rec = v.rec.clone().unwrap(); assert!(!rec.wrapped && rec.body != [5; 32], "a new random key was installed");
+        assert!(c.key_in_ram()); assert_eq!(parse_mc(&call(&mut c, &mut v, &mc_req(None), 100)).0, 0x41);
+    }
+    #[test] fn change_pin_with_a_surviving_old_record_is_reported_but_only_the_new_pin_works() {
+        let (mut c, mut v) = setup(5); let mut p = Plat::new(2); p.set_pin(&mut c, &mut v, PIN);
+        v.old_wiped = false; let new = "another long passphrase";
+        assert_eq!(p.change_pin(&mut c, &mut v, PIN, new), 0x7F);
+        v.old_wiped = true;
+        assert_eq!(p.token(&mut c, &mut v, PIN, 1).unwrap_err(), 0x31); assert!(p.token(&mut c, &mut v, new, 1).is_ok());
+    }
+    #[test] fn a_retry_counter_that_cannot_be_cleared_is_reported() {
+        let (mut c, mut v) = setup(5); let mut p = Plat::new(2); v.fail_clear = true;
+        assert_eq!(p.set_pin(&mut c, &mut v, PIN), 0x7F, "setPIN");
+        assert!(v.rec.as_ref().unwrap().wrapped, "the PIN is set (state adopted)");
+        v.fail_clear = false; assert_eq!(call(&mut c, &mut v, &[7], 100)[0], 0, "reset recovers");
+        v.fail_clear = true; assert_eq!(call(&mut c, &mut v, &[7], 100)[0], 0x7F, "reset");
+        assert!(!v.rec.as_ref().unwrap().wrapped && c.key_in_ram());
+    }
+    #[test] fn a_correct_pin_whose_attempt_cannot_be_recorded_gets_no_key_and_no_token() {
+        let (mut c, mut v) = setup(5); let mut p = Plat::new(2); p.set_pin(&mut c, &mut v, PIN);
+        v.fail_finish = true;
+        assert_eq!(p.token(&mut c, &mut v, PIN, 1).unwrap_err(), 0x7F);
+        assert!(!c.key_in_ram(), "fail closed"); assert_eq!(v.used, 1, "the attempt stays counted");
+        v.fail_finish = false; assert!(p.token(&mut c, &mut v, PIN, 1).is_ok()); assert_eq!(v.used, 0);
+    }
+
+    // ---- sessions and clocks -------------------------------------------------------------------
+
+    #[test] fn a_token_that_expires_while_the_button_is_awaited_is_refused() {
+        let (mut c, mut v) = setup(5); let mut p = Plat::new(2); p.set_pin(&mut c, &mut v, PIN);
+        // control: the second pass is still inside the session
+        let tok = p.token(&mut c, &mut v, PIN, 10_000).unwrap(); let req = mc_req(Some((2, mc_param(2, &tok))));
+        assert!(matches!(ha(&mut c, &mut v, &req, false, 10_100, 10_100), Resp::NeedUp));
+        assert!(matches!(ha(&mut c, &mut v, &req, true, 10_100, 10_000 + TOKEN_LIFETIME_MS - 1), Resp::Ok(_)));
+        // the request ARRIVED in time, but the button was pressed after the session ended
+        let tok = p.token(&mut c, &mut v, PIN, 200_000).unwrap(); let req = mc_req(Some((2, mc_param(2, &tok))));
+        assert!(matches!(ha(&mut c, &mut v, &req, false, 200_100, 200_100), Resp::NeedUp));
+        assert!(matches!(ha(&mut c, &mut v, &req, true, 200_100, 200_000 + TOKEN_LIFETIME_MS), Resp::Err(0x33)));
+        assert!(!c.key_in_ram(), "and the session was wiped");
+    }
+    #[test] fn the_reset_window_uses_arrival_time_even_if_the_button_comes_much_later() {
+        let (mut c, mut v) = setup(5);
+        assert!(matches!(ha(&mut c, &mut v, &[7], false, 9_000, 9_000), Resp::NeedUp));
+        assert!(matches!(ha(&mut c, &mut v, &[7], true, 9_000, 39_000), Resp::Ok(_)), "touched 30 s later, arrived in time");
+        let (mut c, mut v) = setup(5);
+        assert!(matches!(ha(&mut c, &mut v, &[7], false, 11_000, 11_000), Resp::Err(0x30)), "arrived too late");
+        assert!(matches!(ha(&mut c, &mut v, &[7], true, 11_000, 12_000), Resp::Err(0x30)));
+    }
+    #[test] fn lock_and_expiry_drop_the_key_agreement_key() {
+        let (mut c, mut v) = setup(5); let mut p = Plat::new(2); p.set_pin(&mut c, &mut v, PIN);
+        let ka = |c: &mut Ctap, v: &mut RamVault| call(c, v, &pin_req(&[(1, enc_u(2)), (2, enc_u(2))]), 1000);
+        let (k1, k2) = (ka(&mut c, &mut v), ka(&mut c, &mut v)); assert_eq!(k1, k2, "the key is reused within a session");
+        c.lock(); let k3 = ka(&mut c, &mut v); assert_ne!(k1, k3, "lock() must discard the private key");
+        p.token(&mut c, &mut v, PIN, 10_000).unwrap();
+        let k4 = ka(&mut c, &mut v); c.tick(10_000 + TOKEN_LIFETIME_MS); let k5 = ka(&mut c, &mut v);
+        assert_ne!(k4, k5, "expiry must discard it too");
+    }
+    #[test] fn getinfo_advertises_the_pin_policy() {
+        let (mut c, mut v) = setup(5);
+        let r = call(&mut c, &mut v, &[4], 1); let mut rd = R::new(&r[1..]); let n = rd.map().unwrap(); assert_eq!(n, 7);
+        let mut min = None; let mut versions = vec![];
+        for _ in 0..n { match rd.uint().unwrap() {
+            1 => { for _ in 0..rd.array().unwrap() { versions.push(rd.text().unwrap().to_string()); } }
+            13 => min = Some(rd.uint().unwrap()),
+            _ => rd.skip().unwrap(),
+        } }
+        assert_eq!(min, Some(MIN_PIN_LEN as u64)); assert_eq!(versions, vec!["FIDO_2_0".to_string()]);
+    }
     #[test] fn getinfo_reports_pin_state() {
         let (mut c, mut v) = setup(5); let mut p = Plat::new(2);
         let has_pin = |c: &mut Ctap, v: &mut RamVault| -> bool {
             let r = call(c, v, &[4], 1); let mut rd = R::new(&r[1..]); rd.map().unwrap();
             let mut found = None;
-            for _ in 0..6 { match rd.uint().unwrap() {
+            for _ in 0..7 { match rd.uint().unwrap() {
                 4 => { for _ in 0..rd.map().unwrap() { let k = rd.text().unwrap(); let b = rd.bool().unwrap(); if k == "clientPin" { found = Some(b); } } }
                 6 => { assert_eq!(rd.array().unwrap(), 2); assert_eq!((rd.uint().unwrap(), rd.uint().unwrap()), (2, 1)); }
                 _ => rd.skip().unwrap(),

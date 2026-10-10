@@ -42,10 +42,8 @@ impl Sectors for Dev<'_> {
     }
     fn tries_read(&mut self, out: &mut [u8; TRIES_PAGES]) -> Result<(), Error> {
         for (i, b) in out.iter_mut().enumerate() {
-            self.0.blocking_read(
-                TRIES_OFFSET + i as u32 * PAGE,
-                core::slice::from_mut(b),
-            )?;
+            self.0
+                .blocking_read(TRIES_OFFSET + i as u32 * PAGE, core::slice::from_mut(b))?;
         }
         Ok(())
     }
@@ -106,6 +104,14 @@ pub fn load(flash: &mut Fl) -> Option<Record> {
                 p.seq,
                 if r.wrapped { "set" } else { "not set" }
             );
+            // An earlier update may have left an older record behind (failed wipe): retry now.
+            match store::purge_stale(&mut Dev(flash)) {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!("flash: an older key record is still readable and could not be wiped")
+                }
+                Err(_) => warn!("flash: could not check for older key records"),
+            }
             Some(r)
         }
         Ok(Loaded::Blank) => {
@@ -156,16 +162,20 @@ impl Vault for FlashVault {
         log_replace(store::replace_record(&mut Dev(&mut self.0), rec))
     }
     fn tries_used(&mut self) -> Result<u8, ()> {
-        store::count_tries(&mut Dev(&mut self.0)).map_err(|_| error!("flash: retry counter unreadable"))
+        store::count_tries(&mut Dev(&mut self.0))
+            .map_err(|_| error!("flash: retry counter unreadable"))
     }
     fn begin_try(&mut self) -> Result<usize, ()> {
-        store::begin_try(&mut Dev(&mut self.0)).map_err(|_| error!("flash: retry counter not writable"))
+        store::begin_try(&mut Dev(&mut self.0))
+            .map_err(|_| error!("flash: retry counter not writable"))
     }
     fn finish_try(&mut self, page: usize) -> Result<(), ()> {
-        store::finish_try(&mut Dev(&mut self.0), page).map_err(|_| warn!("flash: could not refund PIN attempt"))
+        store::finish_try(&mut Dev(&mut self.0), page)
+            .map_err(|_| warn!("flash: could not refund PIN attempt"))
     }
     fn clear_tries(&mut self) -> Result<(), ()> {
-        store::reset_tries(&mut Dev(&mut self.0)).map_err(|_| warn!("flash: could not clear retry counter"))
+        store::reset_tries(&mut Dev(&mut self.0))
+            .map_err(|_| warn!("flash: could not clear retry counter"))
     }
 }
 
