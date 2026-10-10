@@ -19,9 +19,12 @@ impl W {
         } else if v <= 0xffff {
             self.0.push(m | 25);
             self.0.extend_from_slice(&(v as u16).to_be_bytes());
-        } else {
+        } else if v <= 0xffff_ffff {
             self.0.push(m | 26);
             self.0.extend_from_slice(&(v as u32).to_be_bytes());
+        } else {
+            self.0.push(m | 27);
+            self.0.extend_from_slice(&v.to_be_bytes());
         }
     }
     pub fn uint(&mut self, v: u64) {
@@ -68,10 +71,31 @@ impl<'a> R<'a> {
         self.p = end;
         Ok(s)
     }
-    /// Reads one item head. Rejects indefinite lengths and non-minimal encodings (CTAP2 canonical CBOR).
+    /// Reads one item head. Rejects indefinite lengths and non-minimal integer/length encodings
+    /// (CTAP2 canonical CBOR). Major type 7 is returned as `(7, n)` with `n` = the additional
+    /// information (20..=23 simple values, 25..=27 float16/32/64); a float's payload is consumed
+    /// but kept as-is, because CTAP2 canonical CBOR does not re-encode floating-point values.
     fn head(&mut self) -> Result<(u8, u64), u8> {
         let b = self.take(1)?[0];
         let ai = b & 31;
+        if b >> 5 == 7 {
+            return match ai {
+                20..=23 => Ok((7, ai as u64)),
+                25 => {
+                    self.take(2)?;
+                    Ok((7, 25))
+                }
+                26 => {
+                    self.take(4)?;
+                    Ok((7, 26))
+                }
+                27 => {
+                    self.take(8)?;
+                    Ok((7, 27))
+                }
+                _ => Err(INVALID_CBOR), // unassigned simple values, break, reserved
+            };
+        }
         let (v, min) = match ai {
             0..=23 => (ai as u64, 0),
             24 => (self.take(1)?[0] as u64, 24),
@@ -149,7 +173,6 @@ impl<'a> R<'a> {
                 self.skip_depth(depth + 1)
             })?,
             6 => return Err(INVALID_CBOR), // tags are not allowed
-            7 if !(20..=22).contains(&v) => return Err(INVALID_CBOR), // no floats / other simple values
             _ => {}
         }
         Ok(())
@@ -164,8 +187,11 @@ impl<'a> R<'a> {
 const MAX_DEPTH: u8 = 4;
 
 /// Checks a whole CTAP2 request body once, centrally, before any command parses it:
-/// exactly one top-level map, minimal encodings, no tags/floats/indefinite lengths,
-/// valid UTF-8 text, no duplicate map keys, nesting <= 4, no trailing bytes.
+/// exactly one top-level map, minimal integer/length encodings, no tags or indefinite lengths,
+/// valid UTF-8 text, map keys that are integers or text strings in canonical order (shorter
+/// encoding first, then bytewise; this also rules out duplicates), nesting <= 4, no trailing bytes.
+/// Floats and simple values are accepted (they can only appear in fields the commands skip, since
+/// the recognised fields are type-checked when parsed).
 pub fn validate(body: &[u8]) -> Result<(), u8> {
     let mut r = R::new(body);
     if body.first().map(|b| b >> 5) != Some(5) {
@@ -203,21 +229,34 @@ fn walk(r: &mut R, depth: u8) -> Result<(), u8> {
                     walk(r, depth + 1)?;
                 }
             } else {
-                let mut keys: Vec<&[u8]> = Vec::new();
+                let buf = r.b;
+                let mut prev: Option<&[u8]> = None;
                 for _ in 0..v {
                     let start = r.p;
-                    walk(r, depth + 1)?;
-                    let key = &r.b[start..r.p];
-                    if keys.contains(&key) {
-                        return Err(INVALID_CBOR); // duplicate key
+                    match buf.get(start).map(|b| b >> 5) {
+                        Some(0 | 1 | 3) => {} // integer or text string
+                        Some(_) => return Err(UNEXPECTED_TYPE),
+                        None => return Err(INVALID_CBOR),
                     }
-                    keys.push(key);
+                    walk(r, depth + 1)?;
+                    let key = &buf[start..r.p];
+                    if let Some(p) = prev {
+                        if !key_less(p, key) {
+                            return Err(INVALID_CBOR); // duplicate or out of canonical order
+                        }
+                    }
+                    prev = Some(key);
                     walk(r, depth + 1)?;
                 }
             }
         }
-        7 if (20..=22).contains(&v) => {}
-        _ => return Err(INVALID_CBOR), // tags (6), floats, other simple values
+        7 => {}
+        _ => return Err(INVALID_CBOR), // tags (6)
     }
     Ok(())
+}
+
+/// CTAP2 canonical key order: a shorter encoded key sorts first, equal lengths compare bytewise.
+fn key_less(a: &[u8], b: &[u8]) -> bool {
+    a.len() < b.len() || (a.len() == b.len() && a < b)
 }

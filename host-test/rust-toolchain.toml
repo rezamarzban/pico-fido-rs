@@ -1,0 +1,4 @@
+# Host tests run the protocol logic on the development machine and build on stable Rust
+# (overrides the nightly firmware toolchain of the parent directory).
+[toolchain]
+channel = "stable"

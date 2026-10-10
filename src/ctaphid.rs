@@ -79,19 +79,38 @@ impl Hid {
         self.channels.contains(&cid)
     }
 
+    /// Marks `cid` as most recently used (no-op for unknown channels).
+    fn touch(&mut self, cid: u32) {
+        if let Some(i) = self.channels.iter().position(|&x| x == cid) {
+            let c = self.channels.remove(i);
+            self.channels.push(c);
+        }
+    }
+
+    /// Channel exhaustion policy: when all `MAX_CHANNELS` are allocated, the least recently used
+    /// channel is evicted, but never the one with a running transaction or a partly received
+    /// message. (With 8 channels and at most two protected ones there is always a victim.)
+    /// A clean eviction also drops any state that belonged to the evicted channel.
     fn alloc(&mut self) -> u32 {
         loop {
             self.next_cid = self.next_cid.wrapping_add(1);
             let c = self.next_cid;
             if c != 0 && c != BROADCAST && !self.known(c) {
                 if self.channels.len() == MAX_CHANNELS {
-                    // evict the oldest channel that is not the active one
+                    let assembling = self.asm.as_ref().map(|a| a.cid);
                     let i = self
                         .channels
                         .iter()
-                        .position(|&x| Some(x) != self.active)
+                        .position(|&x| Some(x) != self.active && Some(x) != assembling)
                         .unwrap_or(0);
-                    self.channels.remove(i);
+                    let gone = self.channels.remove(i);
+                    if matches!(&self.asm, Some(a) if a.cid == gone) {
+                        self.asm = None;
+                    }
+                    if self.active == Some(gone) {
+                        self.active = None;
+                        self.aborted = true;
+                    }
                 }
                 self.channels.push(c);
                 return c;
@@ -110,23 +129,29 @@ impl Hid {
         if cid == 0 {
             return err(cid, 0x0B);
         }
+        self.touch(cid);
         if p[4] & 0x80 != 0 {
             let cmd = p[4] & 0x7F;
             let len = ((p[5] as usize) << 8) | p[6] as usize;
             if cmd == INIT {
                 return self.init(cid, len, p);
             }
+            if cmd == CANCEL {
+                // CANCEL carries no payload. It only means something for the channel that owns
+                // the running transaction; anywhere else it is silently ignored (never answered).
+                return if len != 0 {
+                    err(cid, 0x03)
+                } else if self.active == Some(cid) {
+                    Rx::Cancel
+                } else {
+                    Rx::None
+                };
+            }
             if cid == BROADCAST || !self.known(cid) {
                 return err(cid, 0x0B);
             }
             if let Some(a) = self.active {
-                return if a == cid && cmd == CANCEL {
-                    Rx::Cancel
-                } else if a == cid {
-                    Rx::None
-                } else {
-                    err(cid, 0x06)
-                };
+                return if a == cid { Rx::None } else { err(cid, 0x06) };
             }
             if let Some(a) = &self.asm {
                 if a.cid != cid {
@@ -134,7 +159,8 @@ impl Hid {
                 }
             }
             self.asm = None;
-            if len > MAX_MSG {
+            // length checks happen before any assembly state is created
+            if len > MAX_MSG || (cmd == CBOR && len == 0) {
                 return err(cid, 0x03);
             }
             let n = len.min(57);

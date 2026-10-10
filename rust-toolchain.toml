@@ -1,4 +1,6 @@
+# The firmware needs nightly (see #![feature(...)] in src/main.rs and embassy-executor "nightly").
+# For reproducible builds you can pin a dated nightly here, e.g. channel = "nightly-YYYY-MM-DD".
 [toolchain]
 channel = "nightly"
-components = ["rust-src", "rustfmt", "llvm-tools"]
+components = ["rust-src", "rustfmt", "clippy", "llvm-tools"]
 targets = ["thumbv6m-none-eabi"]
