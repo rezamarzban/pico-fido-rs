@@ -1,4 +1,7 @@
+# OpenSK (edition 2024, let-chains) needs a recent nightly: this is the one OpenSK itself pins.
+# NOTE: embassy-executor 0.6 / embassy-rp 0.2 were last built here with nightly-2025-03-05 (too old
+# for OpenSK). If this nightly breaks the Embassy crates, upgrade Embassy (0.7+ / embassy-rp 0.4+).
 [toolchain]
-channel = "nightly"
-components = ["rust-src", "rustfmt", "llvm-tools"]
+channel = "nightly-2026-06-03"
+components = ["rust-src", "rustfmt", "clippy", "llvm-tools"]
 targets = ["thumbv6m-none-eabi"]
