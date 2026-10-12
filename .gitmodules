@@ -1,5 +1,5 @@
 [submodule "third_party/OpenSK"]
 	path = third_party/OpenSK
 	url = https://github.com/google/OpenSK.git
-	# Pin a commit after adding: git -C third_party/OpenSK checkout <commit> && git add third_party/OpenSK
+	# The commit used is recorded in third_party/OPENSK_REV (and by the submodule pointer once you `git add` it).
 	shallow = true
