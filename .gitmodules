@@ -1,0 +1,5 @@
+[submodule "third_party/OpenSK"]
+	path = third_party/OpenSK
+	url = https://github.com/google/OpenSK.git
+	# Pin a commit after adding: git -C third_party/OpenSK checkout <commit> && git add third_party/OpenSK
+	shallow = true
