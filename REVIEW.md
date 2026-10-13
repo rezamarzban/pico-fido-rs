@@ -2,8 +2,10 @@
 
 This file records the review rounds of the project. **Rounds 1-4 concern the earlier custom CTAP implementation
 (`src/ctap.rs`, `src/cbor.rs`, `src/pin.rs`, `src/wrap.rs`, `src/store.rs`, `src/ctaphid.rs`), which was removed
-in the OpenSK migration.** They are kept for history only: that code, its host tests, and its Argon2 PIN wrapping
-no longer exist, and none of the fixes below apply to the current firmware.
+in the OpenSK migration.** They are kept for history only: that code and its host tests no longer exist, and none of the fixes below apply to
+the current firmware. This branch re-introduces files named `src/wrap.rs` and `src/store.rs` (plus `src/vault.rs`)
+for its PIN-wrapped vault; the findings, parameters (for example Argon2 96 KiB, t=24) and test counts in Rounds
+1-4 describe the earlier versions of those files, not the new ones.
 
 # OpenSK migration (current firmware)
 
@@ -33,7 +35,7 @@ result after the move (maintainer, hardware): works on Linux, Windows and Androi
 * [ ] Test matrix on hardware: PIN dialogs, discoverable credentials, U2F-only sites, reset, power loss during a flash
   write, long idle, two clients, repeated registrations, P-256 timing, RAM headroom.
 * [ ] Provision a U2F attestation key (OpenSK `tools/configure.py`) if U2F-only sites matter.
-* [x] Security: PIN-wrapped master seed + resident-credential encryption added (this branch). **Untested on hardware.**
+* [x] Security: PIN-wrapped master seed + resident-credential encryption added (this branch). Built and run on a Pico by the maintainer; no detailed test record.
 * [ ] Hardening tests on hardware: Argon2 time (tune `T_COST`), RAM headroom, setPIN/changePIN/verify, resident credentials across reboot, lock on USB reset, power loss during setPIN and reset, 8-try block, reset recovery of a damaged vault.
 * [ ] Re-validate `third_party/opensk-harden.patch` on every `OPENSK_REV` change.
 * [ ] Security: consider a secure element; offline guessing on a flash dump is only limited by Argon2 at 64 KiB.
@@ -49,7 +51,7 @@ result after the move (maintainer, hardware): works on Linux, Windows and Androi
 | 1.1 | Held button satisfies presence | Fixed. Must be released, then pressed and held 30 ms (`usb/ctap.rs`). |
 | 1.2 | Stalled CTAPHID message blocks others | Fixed. 500 ms message timeout, injected clock, tested. |
 | 1.3 | INIT does not abort active transaction | Fixed. Same-channel INIT aborts; the waiting task drops the request and sends nothing. Tested. |
-| 1.4 | Lenient CBOR | Fixed centrally in `cbor::validate`: minimal encodings only, no tags/floats/indefinite, no duplicate keys, nesting <= 4, no trailing bytes, UTF-8 checked. Commands without a body must have none. |
+| 1.4 | Lenient CBOR | Fixed centrally in `cbor::validate`: minimal encodings only, no tags/floats/indefinite (floats in unknown fields were accepted again in round 2, #6), no duplicate keys, nesting <= 4, no trailing bytes, UTF-8 checked. Commands without a body must have none. |
 | 1.5 | `user` / descriptors not validated | Fixed. `user.id` required (1..64 bytes), `pubKeyCredParams` required, descriptors need `type` and `id` (other types ignored). |
 | 2.1 | Master key in plain flash | Cannot be fixed on RP2040. Documented in SECURITY.md. |
 | 2.2 | RNG not justified | Hardened (more raw input, pool, stuck-source halt) and documented honestly. Still ROSC-based. |
@@ -67,7 +69,7 @@ result after the move (maintainer, hardware): works on Linux, Windows and Androi
 
 # Round 2: second review round (custom firmware)
 
-Written without a Rust toolchain; **compiled and tested since** (see the verification summary of the third round).
+Written without a Rust toolchain; **compiled and tested since** (see the verification summary under *Integration of round 4*).
 
 | # | Finding | Result |
 |---|---------|--------|
@@ -96,7 +98,7 @@ Written without a Rust toolchain; **compiled and tested since** (see the verific
 
 # Round 3: PIN round (custom firmware)
 
-Written without a Rust toolchain; **compiled and tested since** (see the verification summary of the third round).
+Written without a Rust toolchain; **compiled and tested since** (see the verification summary under *Integration of round 4*).
 
 | Area | Change |
 |------|--------|
@@ -108,7 +110,7 @@ Written without a Rust toolchain; **compiled and tested since** (see the verific
 | Tests | Retry-counter and compaction tests, wrap tamper tests, PIN crypto KATs, full flows for both protocols (set/change/token/expiry/lockout/reset/failed writes), python-fido2 end-to-end section. |
 
 Known limits: offline PIN guessing against a flash dump (Argon2 memory is RAM-limited), key in RAM during a session,
-no `pinUvAuthToken` permissions / RP-ID binding (CTAP 2.0 style `getPinToken` only). (`minPINLength` is reported by `getInfo` since the third round.)
+no `pinUvAuthToken` permissions / RP-ID binding (CTAP 2.0 style `getPinToken` only). (`minPINLength` is reported by `getInfo` since round 4.)
 
 # Round 4: firmware-fixes.patch + tests-fixes.patch (custom firmware)
 
@@ -149,3 +151,11 @@ reset/suspend while a command waits for the button cancels it; clients whose key
   rounds: P-256 / Argon2 timing on the Pico, RNG on a real ring oscillator, real flash failures, USB IDs.
 * Tests still missing for this round: wipe or counter failures, session expiry during a touch wait, COSE metadata
   cases (the patches did not add them).
+
+## RAM guard, USB cancellation and vault updates (se1 additions)
+Documented in `README.md` and `SECURITY.md`; this file had no verification record for them.
+* [ ] Record what was built and run for `src/ram_guard.rs`, `src/guard.rs`, `env::hid::cancel_all()` /
+  `Ctap::cancel_in_flight()` and the vault-update checks (`host-test/guard` is the only test the README names).
+* [ ] Measure the share-refresh cost (estimated at about 100 us per refresh; `REFRESH_MS`).
+* [ ] Test USB reset / suspend during a button wait and during a signature.
+* [ ] Test a failed wipe in setPIN / reset (the device refuses to work until a CTAP reset).

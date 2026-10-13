@@ -89,7 +89,11 @@ if [ ! -f "$OPENSK_LIB" ]; then
 fi
 [ -f "$OPENSK_LIB" ] || { echo "error: $OPENSK_LIB is missing after fetching OpenSK" >&2; exit 1; }
 # Hardening patch (PIN hook for the master-key vault); idempotent.
-if ! grep -q unlock_with_pin "$OPENSK_DIR/libraries/opensk/src/api/persist.rs"; then
+if ! grep -q cancel_in_flight "$OPENSK_DIR/libraries/opensk/src/lib.rs"; then
+  # An older version of this patch (PIN hook only) may already be applied: drop it first.
+  if grep -q unlock_with_pin "$OPENSK_DIR/libraries/opensk/src/api/persist.rs"; then
+    git -C "$OPENSK_DIR" checkout -q -- libraries || { echo "error: cannot reset the old patch in $OPENSK_DIR" >&2; exit 1; }
+  fi
   patch -p1 -d "$OPENSK_DIR" < third_party/opensk-harden.patch || { echo "error: opensk-harden.patch does not apply to this OpenSK revision" >&2; exit 1; }
 fi
 echo "OpenSK: $(git -C "$OPENSK_DIR" log -1 --format='%h %s' 2>/dev/null || echo 'unknown revision')"

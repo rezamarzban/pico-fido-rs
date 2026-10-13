@@ -1,8 +1,10 @@
 //! `Persist` wrapper that puts the secrets behind the PIN.
 //!
 //! * The 32-byte master seed lives in the vault (src/vault.rs), wrapped under the PIN with
-//!   Argon2id once a PIN is set. After a correct PIN it is expanded to the 128 bytes OpenSK's key
-//!   store uses and kept in RAM until `lock()` (USB reset / suspend) or power-off.
+//!   Argon2id once a PIN is set. After a correct PIN the seed is kept in RAM ONLY as XOR shares
+//!   (src/ram_guard.rs, src/guard.rs), refreshed every millisecond and around every key use, until
+//!   `lock_now()` (USB reset / suspend / unplug) or power-off. The 128 bytes OpenSK's key store
+//!   uses are derived from the seed on demand and wiped right after.
 //!   OpenSK's default key store (`key_store::Helper`) reads those bytes through
 //!   `key_store_bytes()`, which is overridden here: the master is never written to the
 //!   key-value store, and while locked every credential-ID operation fails.
@@ -14,23 +16,34 @@
 //! * The PIN retry counter is the vault's power-cut-safe counter, not OpenSK's.
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use portable_atomic::AtomicBool;
-use defmt::{error, warn};
+use defmt::error;
+use portable_atomic::{AtomicBool, Ordering};
 use hmac::{Hmac, Mac};
 use opensk::api::persist::{keys, Persist, PersistIter};
 use opensk::ctap::secret::Secret;
 use opensk::ctap::status_code::{Ctap2StatusCode, CtapResult};
 use sha2::Sha256;
-use zeroize::Zeroizing;
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::PicoPersist;
+use crate::guard;
 use crate::keys::fill_random;
 use crate::store::{Record, Replaced, Vault, TRIES_MAX};
 use crate::vault::FlashVault;
 use crate::wrap;
 
-/// Set by the USB handler (reset / disabled / suspend); the main loop then calls `lock()`.
-pub static LOCK_REQUEST: AtomicBool = AtomicBool::new(false);
+/// True while the vault record is PIN-wrapped, i.e. while forgetting the seed is a real lock.
+static WRAPPED: AtomicBool = AtomicBool::new(false);
+
+/// Forgets the seed immediately when a PIN protects it (no-op without a PIN). Callable from any
+/// context: the USB handler calls it on reset / suspend / disconnect, so an operation that is
+/// still running cannot start another key use.
+pub fn lock_now() {
+    if WRAPPED.load(Ordering::Relaxed) {
+        guard::clear_seed();
+    }
+}
 
 const NONCE: usize = 16;
 const TAG: usize = 32;
@@ -39,8 +52,6 @@ struct State {
     vault: FlashVault,
     /// `None`: the vault is unusable (damaged / unreadable) until a CTAP reset.
     rec: Option<Record>,
-    seed: Option<Zeroizing<[u8; 32]>>,
-    master: Option<Zeroizing<[u8; 128]>>,
     /// Retry-counter page of the PIN attempt in progress.
     pending: Option<usize>,
 }
@@ -66,10 +77,14 @@ fn sub_key(master: &[u8; 128], label: &[u8]) -> Zeroizing<[u8; 32]> {
 
 fn xor_stream(k_enc: &[u8; 32], nonce: &[u8], data: &mut [u8]) {
     for (i, chunk) in data.chunks_mut(32).enumerate() {
-        let ks = mac(k_enc, &[nonce, &(i as u32).to_le_bytes()]).finalize().into_bytes();
+        let mut ks: [u8; 32] = mac(k_enc, &[nonce, &(i as u32).to_le_bytes()])
+            .finalize()
+            .into_bytes()
+            .into();
         for (d, k) in chunk.iter_mut().zip(ks.iter()) {
             *d ^= k;
         }
+        ks.zeroize();
     }
 }
 
@@ -99,9 +114,10 @@ fn open(master: &[u8; 128], key: usize, blob: &[u8]) -> CtapResult<Vec<u8>> {
     let k_mac = sub_key(master, b"harden-cred-mac");
     let (nonce, rest) = blob.split_at(NONCE);
     let (ct, t) = rest.split_at(rest.len() - TAG);
-    tag(&k_mac, key, nonce, ct)
-        .verify_slice(t)
-        .map_err(|_| Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR)?;
+    let expect = tag(&k_mac, key, nonce, ct).finalize().into_bytes();
+    if !bool::from(expect.as_slice().ct_eq(t)) {
+        return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR);
+    }
     let mut plain = ct.to_vec();
     xor_stream(&k_enc, nonce, &mut plain);
     Ok(plain)
@@ -111,19 +127,41 @@ fn hw_fail() -> Ctap2StatusCode {
     Ctap2StatusCode::CTAP2_ERR_VENDOR_HARDWARE_FAILURE
 }
 
+/// Clears the retry counter or fails; one retry for a transient flash error. A failure must reach
+/// the caller: a counter that stays full would block the (new) PIN for good.
+fn clear_tries_checked(v: &mut FlashVault) -> CtapResult<()> {
+    for _ in 0..2 {
+        if v.clear_tries().is_ok() {
+            return Ok(());
+        }
+    }
+    error!("vault: retry counter could not be cleared");
+    Err(hw_fail())
+}
+
+/// A plain record keeps the seed in `body`; the seed lives in the guard, so the RAM copy of the
+/// record is scrubbed (a wrapped record only holds ciphertext and stays as is).
+fn scrubbed(mut rec: Record) -> Record {
+    if !rec.wrapped {
+        rec.body.zeroize();
+    }
+    rec
+}
+
 impl HardenPersist {
     pub fn new(raw: PicoPersist, vault: FlashVault, rec: Option<Record>) -> Self {
         let mut st = State {
             vault,
-            rec,
-            seed: None,
-            master: None,
+            rec: None,
             pending: None,
         };
-        // Without a PIN the seed is stored in clear, so it is available right away.
-        if let Some(r) = &st.rec {
-            if !r.wrapped {
-                st.set_seed(r.body);
+        if let Some(r) = rec {
+            WRAPPED.store(r.wrapped, Ordering::Relaxed);
+            // Without a PIN the seed is stored in clear, so it is available right away.
+            if !r.wrapped && !guard::store_seed(&r.body) {
+                error!("guard: could not store the seed");
+            } else {
+                st.rec = Some(scrubbed(r));
             }
         }
         HardenPersist {
@@ -134,28 +172,34 @@ impl HardenPersist {
 
     /// Forgets the master key (the next use needs the PIN again). No-op without a PIN.
     pub fn lock(&mut self) {
-        let st = self.st.get_mut();
-        if matches!(&st.rec, Some(r) if r.wrapped) {
-            st.seed = None;
-            st.master = None;
-        }
+        lock_now();
     }
 
+    /// Derives the 128-byte key-store master from the masked seed. The shares are refreshed
+    /// before and right after the reveal, and every plaintext temporary is wiped on drop.
     fn master(&self) -> CtapResult<Zeroizing<[u8; 128]>> {
-        let st = self.st.borrow();
-        if st.rec.is_none() {
+        if self.st.borrow().rec.is_none() {
             return Err(hw_fail());
         }
-        st.master
-            .clone()
-            .ok_or(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED)
+        let mut seed = Zeroizing::new([0u8; 32]);
+        if !guard::reveal_seed_into(&mut seed) {
+            return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
+        }
+        let mut m = Zeroizing::new([0u8; 128]);
+        wrap::expand_into(&seed, &mut m);
+        Ok(m)
     }
 }
 
 impl State {
-    fn set_seed(&mut self, seed: [u8; 32]) {
-        self.master = Some(Zeroizing::new(wrap::expand(&seed)));
-        self.seed = Some(Zeroizing::new(seed));
+    /// The state after a failed vault update whose outcome is unknown: no key is usable until a
+    /// CTAP reset (same as a damaged vault at boot).
+    fn fail_closed(&mut self) {
+        error!("vault: unknown flash state - locking until reset");
+        self.rec = None;
+        self.pending = None;
+        WRAPPED.store(false, Ordering::Relaxed);
+        guard::clear_seed();
     }
 }
 
@@ -205,7 +249,8 @@ impl Persist for HardenPersist {
 
     // ---- PIN ---------------------------------------------------------------------------------
 
-    /// Called by the patched `verify_pin_hash_enc`. Argon2 tag = verifier.
+    /// Called by the patched `verify_pin_hash_enc`. Argon2 tag = verifier (compared in constant
+    /// time in `wrap::unwrap`).
     fn unlock_with_pin(&mut self, pin_hash: &[u8; 16]) -> CtapResult<Option<bool>> {
         let st = self.st.get_mut();
         let rec = st.rec.clone().ok_or_else(hw_fail)?;
@@ -214,36 +259,66 @@ impl Persist for HardenPersist {
             // nobody can unlock this, a CTAP reset is needed.
             return Ok(Some(false));
         }
-        match wrap::unwrap(&rec, pin_hash) {
+        guard::refresh_now();
+        let ok = match wrap::unwrap(&rec, pin_hash) {
             Some(seed) => {
-                st.set_seed(seed);
-                Ok(Some(true))
+                if !guard::store_seed(&seed) {
+                    return Err(hw_fail());
+                }
+                true
             }
-            None => Ok(Some(false)),
-        }
+            None => false,
+        };
+        guard::refresh_now();
+        Ok(Some(ok))
     }
 
     fn set_pin(&mut self, pin_hash: &[u8; 16], pin_code_point_length: u8) -> CtapResult<()> {
         {
             let st = self.st.get_mut();
-            let seed = st
-                .seed
-                .clone()
-                .ok_or(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED)?;
-            let mut salt = [0u8; 16];
-            fill_random(&mut salt);
-            let rec = wrap::wrap(&seed, pin_hash, salt).ok_or_else(hw_fail)?;
+            if !guard::has_seed() {
+                return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
+            }
+            // 1. Counter first. The caller is authenticated (no PIN yet, or the old PIN was just
+            //    verified), so clearing it early gives nothing away, and a failure here changes
+            //    nothing at all.
+            clear_tries_checked(&mut st.vault)?;
+            // 2. Wrap the seed under the new PIN.
+            let rec = {
+                let mut seed = Zeroizing::new([0u8; 32]);
+                if !guard::reveal_seed_into(&mut seed) {
+                    return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
+                }
+                let mut salt = [0u8; 16];
+                fill_random(&mut salt);
+                wrap::wrap(&seed, pin_hash, salt).ok_or_else(hw_fail)?
+            };
+            guard::refresh_now();
+            // 3. Commit. Only a record that is durable AND whose predecessor was verified wiped
+            //    counts as success.
             match st.vault.replace(&rec) {
                 Replaced::New(saved) => {
-                    if !saved.old_wiped {
-                        warn!("set_pin: the previous record could not be wiped");
+                    st.rec = Some(rec);
+                    st.pending = None;
+                    WRAPPED.store(true, Ordering::Relaxed);
+                    if !saved.old_wiped && !matches!(st.vault.purge_stale(), Ok(true)) {
+                        // The new record wins on every boot, but the previous (plain or
+                        // old-PIN) record may still be readable: do NOT report success. The seed
+                        // stays usable in RAM, so setting the PIN again in this session retries
+                        // the erase (the next save targets exactly that slot); after a lock or
+                        // power cycle a CTAP reset is needed.
+                        error!("set_pin: previous record could not be wiped - PIN setup failed");
+                        return Err(hw_fail());
                     }
                 }
-                _ => return Err(hw_fail()),
+                // Nothing changed: the old record is still the newest one.
+                Replaced::Kept(_) => return Err(hw_fail()),
+                // The flash state is unknown or empty: stop using any key.
+                Replaced::NoKey | Replaced::Unknown => {
+                    st.fail_closed();
+                    return Err(hw_fail());
+                }
             }
-            st.rec = Some(rec);
-            st.pending = None;
-            let _ = st.vault.clear_tries();
         }
         // The stored PIN "hash" is zeros: the real check is the Argon2 tag in the vault.
         let mut props = [0u8; 17];
@@ -283,7 +358,7 @@ impl Persist for HardenPersist {
     // ---- factory reset -----------------------------------------------------------------------
 
     fn reset(&mut self) -> CtapResult<()> {
-        // Marker first: if power fails below, `init` repeats the whole reset on the next boot.
+        // Marker first: if anything fails below, `init` repeats the whole reset on the next boot.
         self.raw.insert(keys::RESET_COMPLETION, &[])?;
         let mut seed = Zeroizing::new([0u8; 32]);
         fill_random(&mut seed[..]);
@@ -291,16 +366,34 @@ impl Persist for HardenPersist {
         {
             let st = self.st.get_mut();
             match st.vault.replace(&rec) {
-                Replaced::New(_) => {}
-                _ => {
+                Replaced::New(saved) => {
+                    // The old seed must not stay readable after a factory reset either.
+                    let wiped = saved.old_wiped || matches!(st.vault.purge_stale(), Ok(true));
+                    st.rec = Some(scrubbed(rec));
+                    st.pending = None;
+                    WRAPPED.store(false, Ordering::Relaxed);
+                    if !guard::store_seed(&seed) {
+                        st.fail_closed();
+                        return Err(hw_fail());
+                    }
+                    if !wiped {
+                        error!("reset: previous record could not be wiped");
+                        return Err(hw_fail());
+                    }
+                    // The new seed is durable, so the old counter is meaningless: a counter that
+                    // cannot be cleared must fail the reset (marker stays, boot repeats it)
+                    // instead of leaving a fresh PIN blocked.
+                    clear_tries_checked(&mut st.vault)?;
+                }
+                Replaced::Kept(_) => {
                     error!("reset: vault could not be re-initialised");
                     return Err(hw_fail());
                 }
+                Replaced::NoKey | Replaced::Unknown => {
+                    st.fail_closed();
+                    return Err(hw_fail());
+                }
             }
-            let _ = st.vault.clear_tries();
-            st.rec = Some(rec);
-            st.pending = None;
-            st.set_seed(*seed);
         }
         // Removes every non-persistent key (credentials, PIN, counters ...) and the marker.
         Persist::reset(&mut self.raw)

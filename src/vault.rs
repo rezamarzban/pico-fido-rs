@@ -5,6 +5,7 @@
 use core::cell::RefCell;
 use defmt::{error, info, warn};
 use embassy_rp::flash::Error;
+use zeroize::Zeroizing;
 
 use crate::keys::{fill_random, Fl};
 use crate::store::{self, Loaded, Record, Replaced, Sectors, Vault, REC_LEN, TRIES_PAGES};
@@ -75,6 +76,9 @@ impl Vault for FlashVault {
     fn replace(&mut self, rec: &Record) -> Replaced {
         log_replace(store::replace_record(&mut Dev(self.0), rec))
     }
+    fn purge_stale(&mut self) -> Result<bool, ()> {
+        store::purge_stale(&mut Dev(self.0)).map_err(|_| error!("vault: stale-record wipe failed"))
+    }
     fn tries_used(&mut self) -> Result<u8, ()> {
         store::count_tries(&mut Dev(self.0)).map_err(|_| error!("vault: retry counter unreadable"))
     }
@@ -112,9 +116,9 @@ pub fn open(flash: &'static RefCell<Fl>) -> (FlashVault, Option<Record>) {
             Some(r)
         }
         Ok(Loaded::Blank) => {
-            let mut k = [0u8; 32];
-            fill_random(&mut k);
-            let rec = Record::plain(k);
+            let mut k = Zeroizing::new([0u8; 32]);
+            fill_random(&mut k[..]);
+            let rec = Record::plain(*k);
             match v.replace(&rec) {
                 Replaced::New(_) => Some(rec),
                 Replaced::Kept(r) => Some(r),
