@@ -25,9 +25,15 @@ use {defmt_rtt as _, panic_probe as _};
 mod env;
 mod health;
 mod keys;
+mod store;
 mod usb;
+mod vault;
+mod wrap;
 
-use env::{PicoEnv, PicoPersist, PicoUserPresence};
+use core::cell::RefCell;
+use core::sync::atomic::Ordering;
+use env::{HardenPersist, PicoEnv, PicoPersist, PicoUserPresence, LOCK_REQUEST};
+use static_cell::StaticCell;
 use opensk::api::connection::{HidConnection as _, UsbEndpoint};
 use opensk::env::Env as _;
 use opensk::{Ctap, Transport};
@@ -47,6 +53,10 @@ pub const FLASH_SIZE: usize = FLASH_MB * 1024 * 1024;
 /// Pages of 4 KiB at the end of flash for OpenSK's key-value store. build.rs keeps the same
 /// amount (80 KiB) out of the linker's FLASH region: change both together.
 pub const STORE_PAGES: usize = 20;
+
+/// The last 12 KiB of flash hold the vault: [PIN retry counter][seed slot 0][seed slot 1].
+/// build.rs keeps them (and the store above) out of the linker's FLASH region.
+pub const VAULT_BYTES: usize = 3 * 4096;
 
 // Heap for OpenSK (alloc): credentials, CBOR, the P-256 software crypto, message buffers.
 const HEAP_SIZE: usize = 128 * 1024;
@@ -124,7 +134,11 @@ fn main() -> ! {
         .unwrap();
 
     // OpenSK in thread mode. The flash moves into the key-value store, BOOTSEL into user presence.
-    let env = PicoEnv::new(PicoPersist::new(flash), PicoUserPresence::new(p.BOOTSEL));
+    static FLASH: StaticCell<RefCell<keys::Fl>> = StaticCell::new();
+    let flash: &'static RefCell<keys::Fl> = &*FLASH.init(RefCell::new(flash));
+    let (vault, rec) = vault::open(flash);
+    let persist = HardenPersist::new(PicoPersist::new(flash), vault, rec);
+    let env = PicoEnv::new(persist, PicoUserPresence::new(p.BOOTSEL));
     let mut ctap = Ctap::new(env);
     info!("OpenSK initialised");
     opensk_loop(&mut ctap)
@@ -153,6 +167,11 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
         };
         let mut packet = [0u8; 64];
         let received = env::hid::recv_packet(&mut packet, timeout);
+
+        // USB reset / suspend / unplug: forget the master key, the next use needs the PIN again.
+        if LOCK_REQUEST.swap(false, Ordering::Relaxed) {
+            ctap.env().persist().lock();
+        }
 
         // U2F has no begin/end calls: the loop polls the button while a U2F request waits for it.
         if u2f_armed && ctap.env().user_presence().poll_fresh_press() {

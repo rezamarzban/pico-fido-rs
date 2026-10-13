@@ -92,6 +92,7 @@ impl Handler for UsbHandler {
             info!("USB enabled");
         } else {
             info!("USB disabled");
+            crate::env::LOCK_REQUEST.store(true, Ordering::Relaxed);
             crate::env::hid::flush();
         }
     }
@@ -99,6 +100,7 @@ impl Handler for UsbHandler {
     fn reset(&mut self) {
         self.configured.store(false, Ordering::Relaxed);
         info!("USB reset");
+        crate::env::LOCK_REQUEST.store(true, Ordering::Relaxed);
         // The host starts over with a new CTAPHID_INIT: stale packets must not reach OpenSK.
         crate::env::hid::flush();
     }
@@ -113,6 +115,7 @@ impl Handler for UsbHandler {
             info!("USB configured");
         } else {
             info!("USB deconfigured");
+            crate::env::LOCK_REQUEST.store(true, Ordering::Relaxed);
             crate::env::hid::flush();
         }
     }
@@ -120,6 +123,7 @@ impl Handler for UsbHandler {
     fn suspended(&mut self, suspended: bool) {
         if suspended {
             info!("USB suspended");
+            crate::env::LOCK_REQUEST.store(true, Ordering::Relaxed);
             crate::env::hid::flush();
         }
     }

@@ -1,7 +1,7 @@
 # Using the flashed key
 
 **Before you start:** try the key first on a throwaway account such as https://webauthn.io, not on anything important.
-It was built from OpenSK and reported working by its maintainer; it is still experimental (see `SECURITY.md`).
+The maintainer reports this branch working on a Pico with Linux, Windows and Android browsers; the PIN-wrapping hardening has no detailed test record, and the whole key is still experimental (see `SECURITY.md`).
 
 ## 1. Check that the device is detected
 - Plug in the Pico. It shows up as a FIDO HID device (VID `c0de`, PID `cafe`, product "Pico Fido").
@@ -17,12 +17,14 @@ It was built from OpenSK and reported working by its maintainer; it is still exp
   options, PIN state).
 
 ## 2. Set a PIN
-- Without a PIN, anyone who touches the key can use it. **The PIN does not protect the key material inside the
-  device**: OpenSK stores it unencrypted in flash, so a determined attacker with physical access can read it.
+- Without a PIN, anyone who touches the key can use it, and its master seed sits unwrapped in flash. With a PIN set,
+  the seed in flash is wrapped with Argon2id, so someone who copies the flash has to guess the PIN offline: **use a
+  long passphrase** (see `SECURITY.md`). The PIN does not help against a debugger (SWD) reading RAM while the key
+  is unlocked.
 - Set the PIN with `fido2-token -S <device>`, `ykman fido access change-pin`, or the browser's security-key settings:
   - **Chrome / Edge:** Settings -> Privacy and security -> Security -> Manage security keys.
   - **Windows:** Settings -> Accounts -> Sign-in options -> Security key.
-- The PIN must be at least **10 characters** (use a long passphrase). If the key asks for a touch while you set it,
+- The PIN must be at least **10 characters** (counted as Unicode code points; use a long passphrase). If the key asks for a touch while you set it,
   press BOOTSEL. Write the PIN down: there is no recovery.
 
 ## 3. Register
@@ -43,14 +45,19 @@ LED: fast blink (200 ms on/off) = ready; very fast flicker = busy (or the browse
 almost solid = waiting for your button press.
 
 ## 5. Things to know
-- **Wrong PINs:** the usual CTAP rules apply: after 3 wrong PINs in a row, unplug and replug; after 8 in total the PIN
-  is blocked.
+- **PIN after every plug-in:** the key is locked on USB reset, suspend and unplug. Enter the PIN once (any site that asks
+  for it) before U2F or no-PIN-prompt logins work; until then they fail. The Argon2 cost is tuned for a target of roughly 0.5 to 1 s per PIN check (`src/wrap.rs`), but the real time
+  has not been systematically measured.
+- **First install:** erase the whole flash first (the layout changed), then flash the UF2.
+- **Wrong PINs:** the usual CTAP rules apply: after 3 wrong PINs in a row, unplug and replug; after 8 wrong PINs
+  without a correct one in between, the PIN is blocked. A correct PIN resets the counts. The retry counter is kept
+  in the vault and is written before each guess is checked, so cutting power does not give free guesses.
 - **Forgotten or blocked PIN:** the only way out is a reset, which **deletes all credentials**. Unplug, replug and run
   the reset (`fido2-token -R <device>` or the browser's "Reset" option) **immediately**: CTAP only accepts a reset
   shortly after power-up. Press the button when asked.
 - **Passkeys / U2F:** OpenSK supports discoverable credentials and U2F. Neither has been systematically tested on
   this device. U2F-only sites need an attestation key that this firmware does not ship (see `README.md`).
-- **Backup:** credentials depend on the keys stored inside this device (the 80 KiB store at the end of flash), so a
+- **Backup:** credentials depend on the keys stored inside this device (the 80 KiB store and the 12 KiB vault at the end of flash), so a
   second key cannot be a clone. Register **two** devices on every account. Flashing firmware that changes the flash
   layout, or erasing the flash, loses every credential.
 - **If a site does not recognise the key:** the USB IDs are prototype placeholders; test on webauthn.io first.

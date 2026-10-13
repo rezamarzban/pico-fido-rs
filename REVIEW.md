@@ -2,8 +2,10 @@
 
 This file records the review rounds of the project. **Rounds 1-4 concern the earlier custom CTAP implementation
 (`src/ctap.rs`, `src/cbor.rs`, `src/pin.rs`, `src/wrap.rs`, `src/store.rs`, `src/ctaphid.rs`), which was removed
-in the OpenSK migration.** They are kept for history only: that code, its host tests, and its Argon2 PIN wrapping
-no longer exist, and none of the fixes below apply to the current firmware.
+in the OpenSK migration.** They are kept for history only: that code and its host tests no longer exist, and none of the fixes below apply to
+the current firmware. This branch re-introduces files named `src/wrap.rs` and `src/store.rs` (plus `src/vault.rs`)
+for its PIN-wrapped vault; the findings, parameters (for example Argon2 96 KiB, t=24) and test counts in Rounds
+1-4 describe the earlier versions of those files, not the new ones.
 
 # OpenSK migration (current firmware)
 
@@ -12,9 +14,9 @@ no longer exist, and none of the fixes below apply to the current firmware.
 | CTAP2 / CBOR / CTAPHID / ClientPIN | own code, ~3000 lines | OpenSK library (pinned commit in `third_party/OPENSK_REV`) |
 | U2F (CTAP1) | none | `ctap1` feature (attestation key must be provisioned) |
 | Credentials | stateless, derived from one master key, ES256 only | OpenSK credential model (store-backed, discoverable credentials possible) |
-| PIN protection of key at rest | Argon2id wrapping of the master key | **none**: OpenSK keeps PIN hash and keys in clear in flash |
-| Flash use | 12 KiB (two key slots + retry counter) | 80 KiB `wasefire-store` (`src/env/flash_store.rs`) |
-| Heap | 160 KiB (Argon2) | 128 KiB (OpenSK) |
+| PIN protection of key at rest | Argon2id wrapping of the master key | Argon2id wrapping of a 32-byte seed in the vault (`src/wrap.rs`, `src/vault.rs`); OpenSK master keys derived from it; resident credentials encrypted (`src/env/harden.rs`). No PIN hash stored. Without a PIN: clear |
+| Flash use | 12 KiB (two key slots + retry counter) | 12 KiB vault + 80 KiB `wasefire-store` (`src/env/flash_store.rs`) |
+| Heap | 160 KiB (Argon2) | 128 KiB (OpenSK); Argon2 uses a separate static 64 KiB buffer |
 | Concurrency | single executor, cooperative | OpenSK blocking in thread mode, USB/LED on an interrupt executor, packet queues in between |
 | Touch | BOOTSEL, fresh press (own code) | BOOTSEL, fresh press via OpenSK's `UserPresence` (`src/env/user_presence.rs`) |
 | Tests | 79 unit tests + python-fido2 end-to-end | OpenSK's own library tests only (`host-test/run.sh`); the platform layer is hardware-tested only |
@@ -33,7 +35,10 @@ result after the move (maintainer, hardware): works on Linux, Windows and Androi
 * [ ] Test matrix on hardware: PIN dialogs, discoverable credentials, U2F-only sites, reset, power loss during a flash
   write, long idle, two clients, repeated registrations, P-256 timing, RAM headroom.
 * [ ] Provision a U2F attestation key (OpenSK `tools/configure.py`) if U2F-only sites matter.
-* [ ] Security: decide whether clear-text PIN hash and keys in flash are acceptable; consider a secure element.
+* [x] Security: PIN-wrapped master seed + resident-credential encryption added (this branch). Built and run on a Pico by the maintainer; no detailed test record.
+* [ ] Hardening tests on hardware: Argon2 time (tune `T_COST`), RAM headroom, setPIN/changePIN/verify, resident credentials across reboot, lock on USB reset, power loss during setPIN and reset, 8-try block, reset recovery of a damaged vault.
+* [ ] Re-validate `third_party/opensk-harden.patch` on every `OPENSK_REV` change.
+* [ ] Security: consider a secure element; offline guessing on a flash dump is only limited by Argon2 at 64 KiB.
 * [ ] Replace the prototype USB VID/PID and strings (`src/usb/mod.rs`).
 * [ ] Tests for `src/env/*` that can run on the host (flash store geometry, packet queues).
 
@@ -46,7 +51,7 @@ result after the move (maintainer, hardware): works on Linux, Windows and Androi
 | 1.1 | Held button satisfies presence | Fixed. Must be released, then pressed and held 30 ms (`usb/ctap.rs`). |
 | 1.2 | Stalled CTAPHID message blocks others | Fixed. 500 ms message timeout, injected clock, tested. |
 | 1.3 | INIT does not abort active transaction | Fixed. Same-channel INIT aborts; the waiting task drops the request and sends nothing. Tested. |
-| 1.4 | Lenient CBOR | Fixed centrally in `cbor::validate`: minimal encodings only, no tags/floats/indefinite, no duplicate keys, nesting <= 4, no trailing bytes, UTF-8 checked. Commands without a body must have none. |
+| 1.4 | Lenient CBOR | Fixed centrally in `cbor::validate`: minimal encodings only, no tags/floats/indefinite (floats in unknown fields were accepted again in round 2, #6), no duplicate keys, nesting <= 4, no trailing bytes, UTF-8 checked. Commands without a body must have none. |
 | 1.5 | `user` / descriptors not validated | Fixed. `user.id` required (1..64 bytes), `pubKeyCredParams` required, descriptors need `type` and `id` (other types ignored). |
 | 2.1 | Master key in plain flash | Cannot be fixed on RP2040. Documented in SECURITY.md. |
 | 2.2 | RNG not justified | Hardened (more raw input, pool, stuck-source halt) and documented honestly. Still ROSC-based. |
@@ -64,7 +69,7 @@ result after the move (maintainer, hardware): works on Linux, Windows and Androi
 
 # Round 2: second review round (custom firmware)
 
-Written without a Rust toolchain; **compiled and tested since** (see the verification summary of the third round).
+Written without a Rust toolchain; **compiled and tested since** (see the verification summary under *Integration of round 4*).
 
 | # | Finding | Result |
 |---|---------|--------|
@@ -93,7 +98,7 @@ Written without a Rust toolchain; **compiled and tested since** (see the verific
 
 # Round 3: PIN round (custom firmware)
 
-Written without a Rust toolchain; **compiled and tested since** (see the verification summary of the third round).
+Written without a Rust toolchain; **compiled and tested since** (see the verification summary under *Integration of round 4*).
 
 | Area | Change |
 |------|--------|
@@ -105,7 +110,7 @@ Written without a Rust toolchain; **compiled and tested since** (see the verific
 | Tests | Retry-counter and compaction tests, wrap tamper tests, PIN crypto KATs, full flows for both protocols (set/change/token/expiry/lockout/reset/failed writes), python-fido2 end-to-end section. |
 
 Known limits: offline PIN guessing against a flash dump (Argon2 memory is RAM-limited), key in RAM during a session,
-no `pinUvAuthToken` permissions / RP-ID binding (CTAP 2.0 style `getPinToken` only). (`minPINLength` is reported by `getInfo` since the third round.)
+no `pinUvAuthToken` permissions / RP-ID binding (CTAP 2.0 style `getPinToken` only). (`minPINLength` is reported by `getInfo` since round 4.)
 
 # Round 4: firmware-fixes.patch + tests-fixes.patch (custom firmware)
 
