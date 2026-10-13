@@ -34,7 +34,24 @@ static mut ARGON_MEM: [MaybeUninit<Block>; BLOCKS] = {
     [U; BLOCKS]
 };
 
-fn kdf(pin_hash: &[u8; 16], salt: &[u8; 16], m_kib: u32, t: u8) -> Option<[u8; 64]> {
+/// The Argon2 password: the 16-byte PIN hash, or - for PUF-bound records - an HMAC of it under
+/// the SRAM-PUF key (so a flash dump alone cannot be used to test PIN guesses).
+fn password(pin_hash: &[u8; 16], puf: Option<&[u8; 32]>) -> (Zeroizing<[u8; 32]>, usize) {
+    let mut pw = Zeroizing::new([0u8; 32]);
+    match puf {
+        Some(k) => {
+            let h = hmac_of(k, &[b"puf-pin", pin_hash]).finalize().into_bytes();
+            pw.copy_from_slice(&h);
+            (pw, 32)
+        }
+        None => {
+            pw[..16].copy_from_slice(pin_hash);
+            (pw, 16)
+        }
+    }
+}
+
+fn kdf(password: &[u8], salt: &[u8; 16], m_kib: u32, t: u8) -> Option<[u8; 64]> {
     if !(8..=MAX_M_KIB).contains(&m_kib) || m_kib % 4 != 0 || t == 0 {
         return None;
     }
@@ -48,7 +65,7 @@ fn kdf(pin_hash: &[u8; 16], salt: &[u8; 16], m_kib: u32, t: u8) -> Option<[u8; 6
         core::ptr::write_bytes(base, 0, BLOCKS * 1024);
         let mem = core::slice::from_raw_parts_mut(base as *mut Block, m_kib as usize);
         let ok = a
-            .hash_password_into_with_memory(pin_hash, salt, &mut out, mem)
+            .hash_password_into_with_memory(password, salt, &mut out, mem)
             .is_ok();
         // Wipe the working set (volatile: must not be optimised away).
         for i in 0..BLOCKS * 1024 {
@@ -79,9 +96,15 @@ fn tag_of(mac_key: &[u8], m_kib: u32, t: u8, salt: &[u8; 16], body: &[u8; 32]) -
     )
 }
 
-/// Wraps `seed` under the PIN. `None` only if the key derivation itself fails.
-pub fn wrap(seed: &[u8; 32], pin_hash: &[u8; 16], salt: [u8; 16]) -> Option<Record> {
-    let mut k = kdf(pin_hash, &salt, M_KIB, T_COST)?;
+/// Wraps `seed` under the PIN (and the PUF key if given). `None` only if the key derivation fails.
+pub fn wrap(
+    seed: &[u8; 32],
+    pin_hash: &[u8; 16],
+    salt: [u8; 16],
+    puf: Option<&[u8; 32]>,
+) -> Option<Record> {
+    let (pw, n) = password(pin_hash, puf);
+    let mut k = kdf(&pw[..n], &salt, M_KIB, T_COST)?;
     let mut ks: [u8; 32] = hmac_of(&k[..32], &[b"fido-wrap-ks", &salt])
         .finalize()
         .into_bytes()
@@ -98,6 +121,7 @@ pub fn wrap(seed: &[u8; 32], pin_hash: &[u8; 16], salt: [u8; 16]) -> Option<Reco
     k.zeroize();
     Some(Record {
         wrapped: true,
+        puf: puf.is_some(),
         m_kib: M_KIB,
         t_cost: T_COST,
         salt,
@@ -108,11 +132,18 @@ pub fn wrap(seed: &[u8; 32], pin_hash: &[u8; 16], salt: [u8; 16]) -> Option<Reco
 
 /// Recovers the seed. `None` = wrong PIN (or damaged / unsupported record). The tag comparison is
 /// constant-time (`subtle`), the result is wiped on drop.
-pub fn unwrap(rec: &Record, pin_hash: &[u8; 16]) -> Option<Zeroizing<[u8; 32]>> {
-    if !rec.wrapped {
+///
+/// `puf` must be `Some` exactly when `rec.puf` is set.
+pub fn unwrap(
+    rec: &Record,
+    pin_hash: &[u8; 16],
+    puf: Option<&[u8; 32]>,
+) -> Option<Zeroizing<[u8; 32]>> {
+    if !rec.wrapped || rec.puf != puf.is_some() {
         return None;
     }
-    let mut k = Zeroizing::new(kdf(pin_hash, &rec.salt, rec.m_kib, rec.t_cost)?);
+    let (pw, n) = password(pin_hash, puf);
+    let mut k = Zeroizing::new(kdf(&pw[..n], &rec.salt, rec.m_kib, rec.t_cost)?);
     let expect = tag_of(&k[32..], rec.m_kib, rec.t_cost, &rec.salt, &rec.body)
         .finalize()
         .into_bytes();
@@ -144,4 +175,30 @@ pub fn expand_into(seed: &[u8; 32], out: &mut [u8; 128]) {
         chunk.copy_from_slice(&block);
         block.zeroize();
     }
+}
+
+/// A no-PIN record whose seed is masked with the PUF key: a flash dump alone does not hold the seed.
+pub fn plain_puf(seed: &[u8; 32], puf: &[u8; 32]) -> Record {
+    let mut rec = Record::plain(*seed);
+    let mask = hmac_of(puf, &[b"puf-plain-mask"]).finalize().into_bytes();
+    for (b, m) in rec.body.iter_mut().zip(mask.iter()) {
+        *b ^= m;
+    }
+    rec.puf = true;
+    rec
+}
+
+/// The seed of a no-PIN record (`puf` must be `Some` exactly when `rec.puf` is set).
+pub fn plain_seed(rec: &Record, puf: Option<&[u8; 32]>) -> Option<Zeroizing<[u8; 32]>> {
+    if rec.wrapped || rec.puf != puf.is_some() {
+        return None;
+    }
+    let mut seed = Zeroizing::new(rec.body);
+    if let Some(k) = puf {
+        let mask = hmac_of(k, &[b"puf-plain-mask"]).finalize().into_bytes();
+        for (b, m) in seed.iter_mut().zip(mask.iter()) {
+            *b ^= m;
+        }
+    }
+    Some(seed)
 }

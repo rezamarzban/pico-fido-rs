@@ -6,13 +6,15 @@ authors = ["sawyer bristol <sawyerbristol@gmail.com>"]
 
 [features]
 # Default: board + 2MiB flash. USB serial is OFF (privacy); enable with --features usb_serial.
-default = ["rp2040_board", "flash_2m"]
+default = ["rp2040_board", "flash_2m", "sram_puf"]
 rp2040_board = []
 flash_2m = []
 flash_4m = []
 flash_8m = []
 flash_16m = []
 usb_serial = []
+# Device-bound key from the SRAM power-up state (src/puf.rs). Reserves 512 bytes of RAM.
+sram_puf = []
 
 [dependencies]
 cortex-m = { version = "0.7.7", features = ["inline-asm"] }

@@ -3,16 +3,20 @@
 A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this before relying on it.
 
 ## What it protects against
-* Phishing and credential theft over the network: credentials are bound to the website (RP ID) and signed.
-* A lost device that is never opened: nothing is exposed over USB except signatures.
+* Phishing and credential theft over the network: credentials are bound to the website (RP ID) and signed. This assumes an uncompromised browser/OS and a relying party that checks the RP ID; it does not help against malware on the host.
+* A lost device that is never opened: the USB interface does not export the private keys or the master key
+  material. It answers ordinary CTAP requests, and which of them need a fresh BOOTSEL press is decided by
+  OpenSK following the CTAP rules (see below). **Without a PIN, whoever holds the device can use it to sign in.**
 * User presence is a **fresh press of BOOTSEL** (`src/env/user_presence.rs`): the button must be seen released
   after the check started and then pressed, so a button already held down when a request arrives does not count.
   Which operations ask for presence is decided by OpenSK following the CTAP rules.
 
 ## What it does NOT protect against
-* **Anyone who can read the flash, when no PIN is set.** The seed is then stored in clear in the vault. The RP2040 has
+* **Anyone who can read the flash, when no PIN is set.** Without the SRAM PUF the seed is then stored in clear in the vault; with it (the default in
+  this branch) a flash-only copy is not enough, but anyone who can run code on the device can still recover it (see
+  *SRAM PUF* below). The RP2040 has
   no secure storage, no flash encryption and no OTP key area, and the USB bootloader or SWD can read the whole
-  flash. A secure element that signs internally is the only real fix.
+  flash. A secure element that signs internally would keep the key out of flash, but is not a complete fix: the ATECC608 used in the `atecc-*` branches, for example, has no user-presence check, so anyone with access to its bus can still request signatures.
 * **Offline PIN guessing on a flash dump, when a PIN is set.** The seed is wrapped with Argon2id (64 KiB), but the
   RP2040 can only afford a small cost, so a short PIN falls quickly to a GPU/ASIC attacker. Use a long passphrase.
 * **Short PINs.** The firmware requires at least 10 code points because of the point above; use a long
@@ -29,8 +33,9 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   upstream does not ship for the RP2040. Results from other boards do not carry over.
 
 ## Behaviour worth knowing
-* **Store and vault.** The last 12 KiB of flash are the vault, the 80 KiB below it (`STORE_PAGES` = 20) the store. If that area holds nothing the
-  store understands, it is erased once at boot and started empty. A reset or a damaged store therefore loses
+* **Store and vault.** The last 12 KiB of flash are the vault, the 4 KiB below it the PUF helper sector, the 76 KiB below that (`STORE_PAGES` = 19) the store. If the store area holds nothing the
+  store understands, it is erased once at boot and started empty; a vault sector holding unrecognised data is not
+  erased, and the device refuses to work until a CTAP reset. A reset or a damaged store therefore loses
   credentials; keep **two** devices registered per account.
 * **Flash writes** run from RAM with interrupts masked: the USB interrupt can be delayed for the duration of a
   sector erase (tens of ms).
@@ -45,7 +50,8 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   device across connections.
 * **Unpinned dependencies.** Without a committed `Cargo.lock` and a pinned OpenSK commit (`third_party/OPENSK_REV`)
   builds are not reproducible.
-* **Verification.** The maintainer reports it works on Linux, Windows and Android. Hardware behaviour for flash
+* **Verification.** The maintainer reports that this branch was built, flashed to a Pico and tested, and works on Linux, Windows and Android;
+  the hardening has no detailed test record. Hardware behaviour for flash
   failures, power loss and timing was not systematically tested. See `README.md`, "Verification status".
 
 ## Hardened key storage (vault + HardenPersist)
@@ -58,18 +64,44 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   and authenticated before they reach the key-value store. Metadata (counters, large blobs,
   settings) stays in clear.
 * The PIN retry counter is the vault's (8 tries, written before each guess).
-* **Without a PIN the seed is stored in clear**: the device is then only as secure as its flash.
-* The master is forgotten on USB reset / suspend / unplug (next packet) and on power-off. While
+* **Without a PIN the seed is stored unwrapped** (in clear unless the SRAM PUF masks it, see below): without the PUF
+  the device is then only as secure as its flash; with it, a flash-only copy is not enough.
+* The master is forgotten on USB reset / suspend / unplug (at once, from the USB handler) and on power-off. While
   locked, credential-ID operations (including U2F and `uv=false` assertions) fail until the PIN is
   entered once.
-* **Offline guessing:** an attacker with a flash dump can try PINs offline at the cost of Argon2
-  with 64 KiB. The RP2040 cannot make that expensive; use a long passphrase (min. 10 code points
+* **Offline guessing:** without the SRAM PUF, an attacker with a flash dump can try PINs offline at the cost
+  of Argon2 with 64 KiB; with it (see below) a flash-only dump is not enough, but code execution on the device is. The RP2040 cannot make that expensive; use a long passphrase (min. 10 code points
   by default).
 * Not protected: RAM while a session is open, side channels, fault injection; the RNG is the ROSC
   (not a certified TRNG).
 * Reflash with a full flash erase: the layout moved (vault at the end, store 12 KiB lower).
 * An interrupted setPIN (power cut between the vault write and the PIN record) can leave a state that only a CTAP
   reset fixes. A damaged vault makes the device refuse to work until a reset.
+
+## SRAM PUF (`src/puf.rs`)
+
+* **What it does:** the power-up state of 496 reserved RAM bytes (first 512 bytes of SRAM, outside the linker's RAM)
+  is turned into a 256-bit key by a code-offset fuzzy extractor (128-bit secret, 31x repetition code, interleaved).
+  The public helper data and an 8-byte check sit in one flash sector. The key is mixed into the Argon2 password of a
+  PIN-wrapped seed and masks the seed of a no-PIN record, and is derived on demand (never stored in RAM).
+* **What it buys:** a dump, backup or programmer read of the **flash only** is no longer enough to test PIN guesses
+  offline or to recover the seed, and a seed cannot be moved to another RP2040.
+* **What it does NOT buy:** anyone who can run code on the device can read the same RAM at power-up and combine it
+  with the helper data: BOOTSEL (flash a dumping firmware, then boot it without losing the pattern) and SWD both give
+  that on the RP2040, which has no debug lock-out. Against an attacker who holds the device it only adds a step.
+* **Unknowns (measure them):** RP2040 SRAM start-up behaviour is not characterised by the vendor. Bias, bit error
+  rate over temperature / supply ramp / ageing, and whether the boot ROM leaves the first 512 bytes alone are
+  **unverified**. Every boot logs `puf: N bit errors of 3968`; the 31x code corrects up to 15 flips per bit-group, so
+  a healthy chip should show well under 15 % (< 600). Enrolment uses a single sample and does not select stable
+  cells; the entropy of the 128-bit secret is assumed, not measured. The repetition code leaks structure in the
+  helper data; if the cells are strongly biased the effective secret is smaller than 128 bits.
+* **Remanence / warm resets:** a quick unplug-replug can leave the old RAM content in place (not a fresh power-up
+  pattern). Enrolment is only done on a power-on reset and checks that the sample is roughly balanced; recovery is
+  attempted every boot and verified by the check. If it fails, the PIN dialog errors out without counting a wrong PIN:
+  unplug for about 10 s. After a UF2 reflash the bootloader may have overwritten the reserved RAM; same remedy.
+* **Failure modes:** a PUF-bound record with an unrecoverable key stays locked until the key returns or a CTAP reset
+  (which re-enrols, needs a power-on reset). A power cut during the one-time enrolment write leaves a damaged helper
+  sector: CTAP reset repairs it. Build with `sram_puf` off (`build.sh -P`) to run without it.
 
 ## RAM guard (`src/ram_guard.rs`, `src/guard.rs`)
 **What it is.** The master seed exists in RAM as 8 XOR shares in scattered, non-adjacent slots of a decoy-filled
