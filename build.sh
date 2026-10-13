@@ -88,6 +88,10 @@ if [ ! -f "$OPENSK_LIB" ]; then
   fi
 fi
 [ -f "$OPENSK_LIB" ] || { echo "error: $OPENSK_LIB is missing after fetching OpenSK" >&2; exit 1; }
+# Hardening patch (PIN hook for the master-key vault); idempotent.
+if ! grep -q unlock_with_pin "$OPENSK_DIR/libraries/opensk/src/api/persist.rs"; then
+  patch -p1 -d "$OPENSK_DIR" < third_party/opensk-harden.patch || { echo "error: opensk-harden.patch does not apply to this OpenSK revision" >&2; exit 1; }
+fi
 echo "OpenSK: $(git -C "$OPENSK_DIR" log -1 --format='%h %s' 2>/dev/null || echo 'unknown revision')"
 
 # We pick the toolchain explicitly with +<toolchain>, so ignore the one pinned in the repo.

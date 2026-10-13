@@ -43,6 +43,9 @@ LED: fast blink (200 ms on/off) = ready; very fast flicker = busy (or the browse
 almost solid = waiting for your button press.
 
 ## 5. Things to know
+- **PIN after every plug-in:** the key is locked on USB reset, suspend and unplug. Enter the PIN once (any site that asks
+  for it) before U2F or no-PIN-prompt logins work; until then they fail. A PIN check takes about a second.
+- **First install:** erase the whole flash first (the layout changed), then flash the UF2.
 - **Wrong PINs:** the usual CTAP rules apply: after 3 wrong PINs in a row, unplug and replug; after 8 in total the PIN
   is blocked.
 - **Forgotten or blocked PIN:** the only way out is a reset, which **deletes all credentials**. Unplug, replug and run
@@ -50,7 +53,7 @@ almost solid = waiting for your button press.
   shortly after power-up. Press the button when asked.
 - **Passkeys / U2F:** OpenSK supports discoverable credentials and U2F. Neither has been systematically tested on
   this device. U2F-only sites need an attestation key that this firmware does not ship (see `README.md`).
-- **Backup:** credentials depend on the keys stored inside this device (the 80 KiB store at the end of flash), so a
+- **Backup:** credentials depend on the keys stored inside this device (the 80 KiB store and the 12 KiB vault at the end of flash), so a
   second key cannot be a clone. Register **two** devices on every account. Flashing firmware that changes the flash
   layout, or erasing the flash, loses every credential.
 - **If a site does not recognise the key:** the USB IDs are prototype placeholders; test on webauthn.io first.

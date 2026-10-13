@@ -6,6 +6,7 @@
 
 mod clock;
 mod flash_store;
+mod harden;
 pub mod hid;
 mod persist;
 mod rng;
@@ -13,6 +14,7 @@ mod user_presence;
 
 use clock::PicoClock;
 use hid::PicoHidConnection;
+pub use harden::{HardenPersist, LOCK_REQUEST};
 pub use persist::PicoPersist;
 use rng::PicoRng;
 pub use user_presence::PicoUserPresence;
@@ -24,8 +26,9 @@ use opensk::api::key_store;
 use opensk::env::Env;
 
 /// OpenSK defaults, except:
-/// * PINs must have at least 10 code points. The PIN hash is stored in clear in flash (OpenSK
-///   design), so a long passphrase is the only protection of a stolen device.
+/// * PINs must have at least 10 code points. The master key is wrapped with Argon2id under the
+///   PIN, but the RP2040 cannot make offline guessing expensive enough for short PINs: a long
+///   passphrase is the real protection of a stolen device.
 /// * `use_batch_attestation` stays false (packed self-attestation): switching it on without a
 ///   provisioned attestation key would make every makeCredential fail. U2F registration needs the
 ///   key anyway (provision it with OpenSK's tools/configure.py).
@@ -38,13 +41,13 @@ pub const CUSTOMIZATION: CustomizationImpl = CustomizationImpl {
 pub struct PicoEnv {
     rng: PicoRng,
     user_presence: PicoUserPresence,
-    persist: PicoPersist,
+    persist: HardenPersist,
     clock: PicoClock,
     hid: PicoHidConnection,
 }
 
 impl PicoEnv {
-    pub fn new(persist: PicoPersist, user_presence: PicoUserPresence) -> Self {
+    pub fn new(persist: HardenPersist, user_presence: PicoUserPresence) -> Self {
         Self {
             rng: PicoRng::new(),
             user_presence,
@@ -68,7 +71,7 @@ impl fmt::Write for DefmtWrite {
 impl Env for PicoEnv {
     type Rng = PicoRng;
     type UserPresence = PicoUserPresence;
-    type Persist = PicoPersist;
+    type Persist = HardenPersist;
     type KeyStore = Self;
     type Write = DefmtWrite;
     type Customization = CustomizationImpl;
@@ -114,6 +117,6 @@ impl Env for PicoEnv {
     }
 }
 
-// OpenSK's blanket `KeyStore` implementation (master keys in `Persist`, credential IDs encrypted
-// with them).
+// OpenSK's blanket `KeyStore` implementation. Its master keys come from `HardenPersist::
+// key_store_bytes` (RAM, unlocked by the PIN), so credential IDs are encrypted with them.
 impl key_store::Helper for PicoEnv {}

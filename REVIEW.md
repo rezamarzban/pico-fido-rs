@@ -12,9 +12,9 @@ no longer exist, and none of the fixes below apply to the current firmware.
 | CTAP2 / CBOR / CTAPHID / ClientPIN | own code, ~3000 lines | OpenSK library (pinned commit in `third_party/OPENSK_REV`) |
 | U2F (CTAP1) | none | `ctap1` feature (attestation key must be provisioned) |
 | Credentials | stateless, derived from one master key, ES256 only | OpenSK credential model (store-backed, discoverable credentials possible) |
-| PIN protection of key at rest | Argon2id wrapping of the master key | **none**: OpenSK keeps PIN hash and keys in clear in flash |
-| Flash use | 12 KiB (two key slots + retry counter) | 80 KiB `wasefire-store` (`src/env/flash_store.rs`) |
-| Heap | 160 KiB (Argon2) | 128 KiB (OpenSK) |
+| PIN protection of key at rest | Argon2id wrapping of the master key | Argon2id wrapping of a 32-byte seed in the vault (`src/wrap.rs`, `src/vault.rs`); OpenSK master keys derived from it; resident credentials encrypted (`src/env/harden.rs`). No PIN hash stored. Without a PIN: clear |
+| Flash use | 12 KiB (two key slots + retry counter) | 12 KiB vault + 80 KiB `wasefire-store` (`src/env/flash_store.rs`) |
+| Heap | 160 KiB (Argon2) | 128 KiB (OpenSK); Argon2 uses a separate static 64 KiB buffer |
 | Concurrency | single executor, cooperative | OpenSK blocking in thread mode, USB/LED on an interrupt executor, packet queues in between |
 | Touch | BOOTSEL, fresh press (own code) | BOOTSEL, fresh press via OpenSK's `UserPresence` (`src/env/user_presence.rs`) |
 | Tests | 79 unit tests + python-fido2 end-to-end | OpenSK's own library tests only (`host-test/run.sh`); the platform layer is hardware-tested only |
@@ -33,7 +33,10 @@ result after the move (maintainer, hardware): works on Linux, Windows and Androi
 * [ ] Test matrix on hardware: PIN dialogs, discoverable credentials, U2F-only sites, reset, power loss during a flash
   write, long idle, two clients, repeated registrations, P-256 timing, RAM headroom.
 * [ ] Provision a U2F attestation key (OpenSK `tools/configure.py`) if U2F-only sites matter.
-* [ ] Security: decide whether clear-text PIN hash and keys in flash are acceptable; consider a secure element.
+* [x] Security: PIN-wrapped master seed + resident-credential encryption added (this branch). **Untested on hardware.**
+* [ ] Hardening tests on hardware: Argon2 time (tune `T_COST`), RAM headroom, setPIN/changePIN/verify, resident credentials across reboot, lock on USB reset, power loss during setPIN and reset, 8-try block, reset recovery of a damaged vault.
+* [ ] Re-validate `third_party/opensk-harden.patch` on every `OPENSK_REV` change.
+* [ ] Security: consider a secure element; offline guessing on a flash dump is only limited by Argon2 at 64 KiB.
 * [ ] Replace the prototype USB VID/PID and strings (`src/usb/mod.rs`).
 * [ ] Tests for `src/env/*` that can run on the host (flash store geometry, packet queues).
 
