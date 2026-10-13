@@ -1,7 +1,8 @@
 diff --git a/libraries/opensk/src/api/persist.rs b/libraries/opensk/src/api/persist.rs
+index ed4d41d..d78ed37 100644
 --- a/libraries/opensk/src/api/persist.rs
 +++ b/libraries/opensk/src/api/persist.rs
-@@ -81,6 +81,15 @@
+@@ -81,6 +81,15 @@ pub trait Persist {
          Ok(())
      }
  
@@ -18,9 +19,10 @@ diff --git a/libraries/opensk/src/api/persist.rs b/libraries/opensk/src/api/pers
      fn credential_bytes(&self, key: usize) -> CtapResult<Vec<u8>> {
          if !keys::CREDENTIALS.contains(&key) {
 diff --git a/libraries/opensk/src/ctap/client_pin.rs b/libraries/opensk/src/ctap/client_pin.rs
+index fa929ed..1ef0920 100644
 --- a/libraries/opensk/src/ctap/client_pin.rs
 +++ b/libraries/opensk/src/ctap/client_pin.rs
-@@ -198,7 +198,18 @@
+@@ -198,7 +198,18 @@ impl<E: Env> ClientPin<E> {
                      .decrypt(&pin_hash_enc)
                      .map_err(|_| Ctap2StatusCode::CTAP2_ERR_PIN_INVALID)?;
  
@@ -40,3 +42,57 @@ diff --git a/libraries/opensk/src/ctap/client_pin.rs b/libraries/opensk/src/ctap
                      self.get_mut_pin_protocol(pin_uv_auth_protocol)
                          .regenerate(env);
                      if storage::pin_retries(env)? == 0 {
+diff --git a/libraries/opensk/src/ctap/mod.rs b/libraries/opensk/src/ctap/mod.rs
+index 6eeb16d..e2303e2 100644
+--- a/libraries/opensk/src/ctap/mod.rs
++++ b/libraries/opensk/src/ctap/mod.rs
+@@ -449,6 +449,14 @@ impl<E: Env> StatefulPermission<E> {
+         self.channel = None;
+     }
+ 
++    /// Drops the state of any in-flight stateful command. The power-up Reset permission survives:
++    /// the host's USB enumeration happens inside that window and must not forfeit it.
++    pub fn cancel(&mut self) {
++        if !matches!(self.command_type, Some(StatefulCommand::Reset)) {
++            self.clear();
++        }
++    }
++
+     /// Clears all state if communication is coming from a different channel.
+     pub fn clear_old_channels(&mut self, channel: Channel) {
+         // There are different possible choices for incoming traffic on a different channel:
+@@ -599,6 +607,17 @@ impl<E: Env> CtapState<E> {
+         }
+     }
+ 
++    /// Hardened-vault hook: forgets everything an interrupted host session left behind (USB
++    /// reset / suspend / disconnect): pending U2F touch, PIN/UV tokens, stateful commands.
++    pub fn cancel_in_flight(&mut self, env: &mut E) {
++        #[cfg(feature = "ctap1")]
++        {
++            self.u2f_up_state = U2fUserPresenceState::new();
++        }
++        self.client_pin.reset(env);
++        self.stateful_command_permission.cancel();
++    }
++
+     pub fn increment_global_signature_counter(&mut self, env: &mut E) -> CtapResult<()> {
+         if env.customization().use_signature_counter() {
+             let increment = env.rng().next_u32() % 8 + 1;
+diff --git a/libraries/opensk/src/lib.rs b/libraries/opensk/src/lib.rs
+index a0dd7c9..7c05fe4 100644
+--- a/libraries/opensk/src/lib.rs
++++ b/libraries/opensk/src/lib.rs
+@@ -112,6 +112,12 @@ impl<E: Env> Ctap<E> {
+         }
+     }
+ 
++    /// Hardened-vault hook: cancels every in-flight operation and forgets the session state.
++    pub fn cancel_in_flight(&mut self) {
++        self.hid = MainHid::default();
++        self.state.cancel_in_flight(&mut self.env);
++    }
++
+     pub fn should_wink(&mut self) -> bool {
+         self.hid.should_wink(&mut self.env)
+     }

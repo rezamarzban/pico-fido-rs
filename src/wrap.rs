@@ -14,7 +14,8 @@ use argon2::{Algorithm, Argon2, Block, Params, Version};
 use core::mem::MaybeUninit;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use zeroize::Zeroize;
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::store::Record;
 
@@ -105,41 +106,42 @@ pub fn wrap(seed: &[u8; 32], pin_hash: &[u8; 16], salt: [u8; 16]) -> Option<Reco
     })
 }
 
-/// Recovers the seed. `None` = wrong PIN (or damaged / unsupported record).
-pub fn unwrap(rec: &Record, pin_hash: &[u8; 16]) -> Option<[u8; 32]> {
+/// Recovers the seed. `None` = wrong PIN (or damaged / unsupported record). The tag comparison is
+/// constant-time (`subtle`), the result is wiped on drop.
+pub fn unwrap(rec: &Record, pin_hash: &[u8; 16]) -> Option<Zeroizing<[u8; 32]>> {
     if !rec.wrapped {
         return None;
     }
-    let mut k = kdf(pin_hash, &rec.salt, rec.m_kib, rec.t_cost)?;
-    let ok = tag_of(&k[32..], rec.m_kib, rec.t_cost, &rec.salt, &rec.body)
-        .verify_slice(&rec.tag)
-        .is_ok();
-    let mut seed = None;
-    if ok {
-        let mut ks: [u8; 32] = hmac_of(&k[..32], &[b"fido-wrap-ks", &rec.salt])
-            .finalize()
-            .into_bytes()
-            .into();
-        let mut m = [0u8; 32];
-        for ((o, b), s) in m.iter_mut().zip(&rec.body).zip(&ks) {
-            *o = b ^ s;
-        }
-        ks.zeroize();
-        seed = Some(m);
+    let mut k = Zeroizing::new(kdf(pin_hash, &rec.salt, rec.m_kib, rec.t_cost)?);
+    let expect = tag_of(&k[32..], rec.m_kib, rec.t_cost, &rec.salt, &rec.body)
+        .finalize()
+        .into_bytes();
+    if !bool::from(expect.as_slice().ct_eq(&rec.tag)) {
+        k.zeroize();
+        return None;
     }
-    k.zeroize();
-    seed
+    let mut ks: [u8; 32] = hmac_of(&k[..32], &[b"fido-wrap-ks", &rec.salt])
+        .finalize()
+        .into_bytes()
+        .into();
+    let mut m = Zeroizing::new([0u8; 32]);
+    for ((o, b), s) in m.iter_mut().zip(&rec.body).zip(&ks) {
+        *o = b ^ s;
+    }
+    ks.zeroize();
+    Some(m)
 }
 
 /// Expands the 32-byte seed to the 128 bytes OpenSK's key store expects: encryption key,
 /// authentication key and the two cred-random keys (see `get_master_keys` in OpenSK).
-pub fn expand(seed: &[u8; 32]) -> [u8; 128] {
-    let mut out = [0u8; 128];
+/// Writes into a caller-owned buffer so no plaintext copy is left behind by a by-value return.
+pub fn expand_into(seed: &[u8; 32], out: &mut [u8; 128]) {
     for (i, chunk) in out.chunks_mut(32).enumerate() {
-        let block = hmac_of(seed, &[b"harden-master-v1", &[i as u8]])
+        let mut block: [u8; 32] = hmac_of(seed, &[b"harden-master-v1", &[i as u8]])
             .finalize()
-            .into_bytes();
+            .into_bytes()
+            .into();
         chunk.copy_from_slice(&block);
+        block.zeroize();
     }
-    out
 }
