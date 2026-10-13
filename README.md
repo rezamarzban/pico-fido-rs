@@ -78,20 +78,42 @@ At least **10 code points** (`default_min_pin_length` in `src/env/mod.rs`). Set 
 
 With a PIN set, the 32-byte master seed is wrapped with **Argon2id** (64 KiB static buffer, `M_KIB`/`T_COST` in
 `src/wrap.rs`) and no PIN hash is stored; the Argon2 tag is the PIN verifier. The 128 bytes of OpenSK master keys
-are derived from the seed in RAM after a correct PIN and dropped on USB reset / suspend / unplug. Resident
+are derived on demand from the seed, which after a correct PIN lives in RAM only as XOR shares (see **RAM
+guard** below) and is dropped on USB reset / suspend / unplug. Resident
 credentials are encrypted under keys derived from the master. The PIN retry counter (8 tries) is the vault's.
 
 **Consequences:** after every USB reset the PIN must be entered once before *any* credential-ID operation works,
 including U2F and `uv=discouraged` assertions. Without a PIN the seed is in clear in flash. `T_COST` is untuned:
 time a PIN check on hardware. See `SECURITY.md`.
 
+## RAM guard
+`src/ram_guard.rs` (pure logic) and `src/guard.rs` (firmware singleton): the master seed is held as `N` = 8 XOR
+shares (`SHARES` in `guard.rs`, 4..=16, compile-time checked) in randomly chosen, non-adjacent slots of a 2 KiB
+static pool whose other slots are random decoys. Shares are re-randomised by XORing fresh masks into share 0 and
+share i (the secret is never reconstructed): every 1 ms by a task on the interrupt executor, and before and after
+every reveal / PIN check / HID packet. Masks come from a ChaCha20 DRBG seeded once at boot (ROSC, flash unique ID,
+ADC noise, timer jitter, conditioned pool -> SHA-256) and reseeded about once a second. Temporaries are
+`Zeroizing`; secret types have no `Debug`. A refresh costs roughly 100 us inside a critical section: tune
+`REFRESH_MS`. See `SECURITY.md` for what this does and does not buy.
+
+## USB cancellation
+USB reset, suspend, disable and deconfigure call `env::hid::cancel_all()`: it bumps an epoch, forgets the seed
+(with a PIN set) and flushes both queues. The user-presence wait, packet waits and `send` check the epoch, so a
+pending button wait ends within 5 ms with `Canceled`, a late button press or a packet of the new session cannot
+complete the old operation, and the cancelled operation's responses are dropped. The main loop then calls
+`Ctap::cancel_in_flight()` (patch below). A signature already being computed cannot be interrupted; its result is
+discarded.
+
 ## OpenSK patch
 `third_party/opensk-harden.patch` (applied by `build.sh`, or manually with `patch -p1 -d third_party/OpenSK <
-third_party/opensk-harden.patch`) adds `Persist::unlock_with_pin` (default: legacy behaviour) and calls it in
-`verify_pin_hash_enc`. Re-check it whenever `OPENSK_REV` changes.
+third_party/opensk-harden.patch`) adds `Persist::unlock_with_pin` (default: legacy behaviour), calls it in
+`verify_pin_hash_enc`, and adds `Ctap::cancel_in_flight()` (drops the pending U2F touch, PIN tokens, HID state and
+stateful commands, but keeps the power-up Reset window). `build.sh` replaces an older version of the patch.
+Re-check it whenever `OPENSK_REV` changes.
 
 ## Tests
     sh host-test/run.sh     # OpenSK's own library unit tests (the protocol logic), run on the host
+                            # + host-test/guard: ram_guard and vault (store.rs) unit tests
 
 The earlier host tests (custom CBOR, CTAPHID, PIN, key store, python-fido2 end-to-end) tested code that no longer
 exists and were removed. **Nothing in this repository tests `src/env/*`, the USB bridge or the executor split**:

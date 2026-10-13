@@ -8,7 +8,7 @@ use embassy_time::{block_for, Duration, Instant};
 use opensk::api::connection::{RecvStatus, UsbEndpoint};
 use opensk::api::user_presence::{UserPresence, UserPresenceError, UserPresenceWaitResult};
 
-use super::hid::IN_CH;
+use super::hid::{op_cancelled, IN_CH};
 use crate::{LedState, LED_SIGNAL};
 
 const POLL: Duration = Duration::from_millis(5);
@@ -58,6 +58,12 @@ impl UserPresence for PicoUserPresence {
     ) -> UserPresenceWaitResult {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         loop {
+            // Reset / suspend / unplug: give up at once. Checked BEFORE the button and the queue,
+            // so a press or a packet of the new session can never complete the old operation.
+            if op_cancelled() {
+                self.released = false;
+                return Ok((Err(UserPresenceError::Canceled), RecvStatus::Timeout));
+            }
             if self.poll_fresh_press() {
                 info!("user presence: button pressed");
                 return Ok((Ok(()), RecvStatus::Timeout));
