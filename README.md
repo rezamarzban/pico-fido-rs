@@ -2,7 +2,7 @@
 
 A FIDO2 / U2F security key for the Raspberry Pi Pico (RP2040), written in Rust with Embassy. The CTAP
 protocol itself is **Google's OpenSK library** (Apache-2.0); this repository is the RP2040 platform layer
-around it (USB, flash store, button, RNG). This branch adds a PIN-wrapped master-key vault to the OpenSK-based firmware. **Experimental, and the hardening is new and untested on hardware. Read `SECURITY.md` before relying on it.**
+around it (USB, flash store, button, RNG). This branch adds a PIN-wrapped master-key vault to the OpenSK-based firmware. **Experimental. Built and tested on a Raspberry Pi Pico (Linux, Windows, Android). Read `SECURITY.md` before relying on it.**
 
 ## Architecture
 | Part | Where |
@@ -10,7 +10,7 @@ around it (USB, flash store, button, RNG). This branch adds a PIN-wrapped master
 | CTAP2 / CTAP1 (U2F), CTAPHID, ClientPIN, credential logic | OpenSK, `third_party/OpenSK/libraries/opensk` (git submodule; commit in `third_party/OPENSK_REV`) |
 | `opensk::env::Env` for the Pico | `src/env/mod.rs` (`PicoEnv`; customization: minimum PIN length 10, batch attestation off) |
 | Persistent store (credentials, metadata, PIN length) | `src/env/persist.rs` + `src/env/flash_store.rs`, on the `wasefire-store` crate (cleartext backend) |
-| Hardening: master key + resident-credential encryption, PIN verifier, retry counter | `src/env/harden.rs` (`HardenPersist`), `src/vault.rs`, `src/store.rs`, `src/wrap.rs`; PIN hook in `third_party/opensk-harden.patch` |
+| Hardening: master key + resident-credential encryption, PIN check (Argon2id tag, no stored PIN hash), retry counter | `src/env/harden.rs` (`HardenPersist`), `src/vault.rs`, `src/store.rs`, `src/wrap.rs`; PIN hook in `third_party/opensk-harden.patch` |
 | User presence = fresh BOOTSEL press | `src/env/user_presence.rs` |
 | Packet bridge between USB (async) and OpenSK (blocking) | `src/env/hid.rs` (two queues) |
 | Random numbers | `src/env/rng.rs` -> `src/keys.rs` (ring oscillator + SHA-256, `src/health.rs` health tests) |
@@ -30,10 +30,16 @@ pin, rebuild, retest on hardware and update the file.
 ## Flash layout
 The **last 92 KiB** of flash are kept out of the linker's FLASH region (`build.rs`):
 * the last **12 KiB** (`VAULT_BYTES`) are the vault: `[PIN retry counter][seed slot 0][seed slot 1]` (`src/vault.rs`);
-* the **80 KiB** below it (20 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store.
+* the **4 KiB** below it (`PUF_BYTES`) hold the SRAM-PUF helper data (`src/puf.rs`);
+* the **76 KiB** below that (19 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store.
+
+With the `sram_puf` feature (default) `build.rs` also takes the first 512 bytes of RAM out of the linker's RAM: no
+section, heap or stack ever touches them, they are only read at start-up.
 
 `build.rs` derives everything from the single `flash_*` feature, so firmware, store and vault cannot overlap.
-This layout differs from the earlier branches: **erase the whole flash before the first install** (a vault sector
+The store lost one page to the PUF sector, so an existing device **reformats its key-value store** on the first boot of
+this version (resident credentials are lost; the seed in the vault survives and is bound to the PUF at that boot). This
+layout differs from the earlier branches: **erase the whole flash before the first install** on a fresh device (a vault sector
 holding old data is reported as damaged and the device refuses to work until a CTAP reset). On first boot a blank
 vault gets a fresh random seed; a store area the store does not understand is erased once.
 
@@ -64,7 +70,7 @@ release can break a working build. Generate it with a successful build and commi
 fetches OpenSK at the pinned commit (or the submodule commit), installs the toolchain and `elf2uf2-rs`, builds with
 the right `--features` (`-s` flash size in MiB, `-u` adds the USB serial number) and writes
 `out/pico-fido-rs-<N>m.uf2`. Hold BOOTSEL while plugging in and copy the file to the `RPI-RP2` drive. It builds the
-*committed* revision of the repository. This script itself was only syntax-checked; the maintainer's Colab build
+*committed* revision of the repository. **The default `-b` is `main`**, which holds the earliest custom firmware (no `flash_*` features), so the script stops with an error: always pass `-b openSK-based-se2`. This script itself was only syntax-checked; the maintainer's Colab build
 (same toolchain and features) is what was run on hardware.
 
 ## U2F attestation
@@ -76,24 +82,38 @@ U2F registration needs an attestation key and certificate, which this firmware d
 At least **10 code points** (`default_min_pin_length` in `src/env/mod.rs`). Set it with any FIDO2 client
 (`fido2-token -S`, `ykman fido access change-pin`, Chrome/Windows security-key settings).
 
-With a PIN set, the 32-byte master seed is wrapped with **Argon2id** (64 KiB static buffer, `M_KIB`/`T_COST` in
-`src/wrap.rs`) and no PIN hash is stored; the Argon2 tag is the PIN verifier. The 128 bytes of OpenSK master keys
+With a PIN set, the 32-byte master seed is wrapped with **Argon2id** (64 KiB static buffer; `M_KIB` = 64, `T_COST` = 24 in
+`src/wrap.rs`) and no PIN hash is stored; a wrong PIN is detected by the record's HMAC-SHA-256 tag (keys derived with Argon2id), so no separate PIN
+verifier exists. The 128 bytes of OpenSK master keys
 are derived on demand from the seed, which after a correct PIN lives in RAM only as XOR shares (see **RAM
 guard** below) and is dropped on USB reset / suspend / unplug. Resident
 credentials are encrypted under keys derived from the master. The PIN retry counter (8 tries) is the vault's.
 
+## SRAM PUF
+`src/puf.rs`. The power-up pattern of 496 reserved RAM bytes is turned into a device-bound key by a fuzzy extractor
+(128-bit secret, 31x repetition code, helper data + 8-byte check in the PUF sector). The key is derived on demand and
+never kept in RAM. It is mixed into the Argon2 password (`HMAC(K_puf, PIN hash)`) and masks the seed of a no-PIN
+record, so **a copy of the flash alone no longer allows offline PIN guessing or recovering the seed**. Records written
+by an older build are bound automatically (no-PIN: at boot; PIN set: after the next correct PIN, one extra Argon2
+run). First boot enrols the PUF (needs a power-on reset, i.e. plugging the Pico in). Every boot logs the measured
+bit errors (`puf: N bit errors of 3968`): read them over RTT on your chip before trusting it. If the key cannot be
+recovered (power-up pattern too noisy, RAM still charged from a quick unplug), the PIN dialog fails with a hardware
+error that is **not** counted as a wrong PIN: unplug for about 10 s and retry. Build with `-P` / without `sram_puf` to
+disable it. **It does not protect against anyone who can run code on the device (BOOTSEL, SWD)**: see `SECURITY.md`.
+
 **Consequences:** after every USB reset the PIN must be entered once before *any* credential-ID operation works,
-including U2F and `uv=discouraged` assertions. Without a PIN the seed is in clear in flash. `T_COST` is untuned:
-time a PIN check on hardware. See `SECURITY.md`.
+including U2F and `uv=discouraged` assertions. Without a PIN the seed is stored unwrapped in flash (masked by the SRAM PUF when that is enabled, see below). `T_COST` is untuned:
+time a PIN check on hardware (the comment in `src/wrap.rs` targets roughly 0.5 to 1 s per check; that is a target,
+not a measurement). See `SECURITY.md`.
 
 ## RAM guard
 `src/ram_guard.rs` (pure logic) and `src/guard.rs` (firmware singleton): the master seed is held as `N` = 8 XOR
 shares (`SHARES` in `guard.rs`, 4..=16, compile-time checked) in randomly chosen, non-adjacent slots of a 2 KiB
 static pool whose other slots are random decoys. Shares are re-randomised by XORing fresh masks into share 0 and
-share i (the secret is never reconstructed): every 1 ms by a task on the interrupt executor, and before and after
+share i (share refresh itself never reconstructs the secret; key use and PIN checks do, briefly, see `SECURITY.md`): every 1 ms by a task on the interrupt executor, and before and after
 every reveal / PIN check / HID packet. Masks come from a ChaCha20 DRBG seeded once at boot (ROSC, flash unique ID,
 ADC noise, timer jitter, conditioned pool -> SHA-256) and reseeded about once a second. Temporaries are
-`Zeroizing`; secret types have no `Debug`. A refresh costs roughly 100 us inside a critical section: tune
+`Zeroizing`; secret types have no `Debug`. A refresh is estimated at roughly 100 us inside a critical section (not measured on hardware): tune
 `REFRESH_MS`. See `SECURITY.md` for what this does and does not buy.
 
 ## USB cancellation
@@ -120,10 +140,11 @@ exists and were removed. **Nothing in this repository tests `src/env/*`, the USB
 they are checked on hardware only.
 
 ## Verification status (be honest about it)
-Reported by the maintainer (not independently verified): firmware built with the Colab script
+Reported by the maintainer (not independently verified): this branch was built and flashed to a Raspberry Pi Pico and tested on hardware, and
+the OpenSK-based firmware family (this branch included) **works on Linux, Windows and Android**. The base firmware was built with the Colab script
 (`nightly-2026-06-03`, `flash_2m`, no `usb_serial`, size-optimised release profile), flashed to a Pico, and
 **working on Linux, Windows and Android with all tried browsers**. This is the behaviour the earlier custom
-firmware did not have on Windows and Android.
+firmware did not have on Windows and Android. The maintainer did not record the details of the hardening tests (see the list below).
 
 Checked while preparing this tree:
 * The firmware patch that created `src/env/*` and the OpenSK wiring applies cleanly, and `src/`, `build.rs` and
@@ -131,10 +152,7 @@ Checked while preparing this tree:
 * The OpenSK library alone, at the pinned commit, with `ctap1,software_crypto`, type-checks for
   `thumbv6m-none-eabi` (check only).
 
-**Hardening status:** `HardenPersist`, the vault and the patch were written without compiling. The first build
-found three errors (a status-code name, `swap` on `thumbv6m` atomics, now `portable_atomic`), fixed in this tree;
-the rest of the build is unconfirmed. Not yet tested: Argon2 timing and heap/RAM headroom, PIN set/change/verify on
-hardware, resident credentials after reboot, power loss during setPIN/reset, lock on USB reset.
+**Hardening status:** `HardenPersist`, the vault and the patch were first written without compiling (the first build found three errors, since fixed). The branch has since been built and run on a Pico by the maintainer. **No detailed test record exists** for: Argon2 timing and heap/RAM headroom, PIN set/change/verify, resident credentials after reboot, power loss during setPIN/reset, lock on USB reset, the RAM guard, USB cancellation and vault-update checks, and the SRAM PUF (measured bit errors per boot: see `REVIEW.md`). Treat these as working in the maintainer's use but not systematically verified.
 
 **Not done / unknown:**
 * `cargo clippy -- --deny=warnings`, `cargo fmt --check` and the CI workflow were never run on this tree.

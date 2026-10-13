@@ -70,6 +70,8 @@ pub trait Vault {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Record {
     pub wrapped: bool,
+    /// Bound to the SRAM PUF key (src/puf.rs): the PIN password / plain-seed mask is mixed with it.
+    pub puf: bool,
     pub m_kib: u32,
     pub t_cost: u8,
     pub salt: [u8; 16],
@@ -98,6 +100,7 @@ impl Record {
     pub fn plain(key: [u8; 32]) -> Self {
         Record {
             wrapped: false,
+            puf: false,
             m_kib: 0,
             t_cost: 0,
             salt: [0; 16],
@@ -154,7 +157,7 @@ fn encode(rec: &Record, seq: u32) -> [u8; REC_LEN] {
     let mut r = [0u8; REC_LEN];
     r[..4].copy_from_slice(&MAGIC);
     r[4..8].copy_from_slice(&seq.to_le_bytes());
-    r[8] = rec.wrapped as u8;
+    r[8] = rec.wrapped as u8 | (rec.puf as u8) << 1;
     r[9..13].copy_from_slice(&rec.m_kib.to_le_bytes());
     r[13] = rec.t_cost;
     r[14..30].copy_from_slice(&rec.salt);
@@ -168,14 +171,16 @@ fn encode(rec: &Record, seq: u32) -> [u8; REC_LEN] {
 fn decode(r: &[u8; REC_LEN]) -> Option<(Record, u32)> {
     let seq = u32::from_le_bytes(r[4..8].try_into().unwrap());
     if r[..4] == MAGIC && Sha256::digest(&r[..94])[..16] == r[94..] {
-        let wrapped = match r[8] {
-            0 => false,
-            1 => true,
-            _ => return None,
-        };
+        // bit 0: PIN-wrapped, bit 1: PUF-bound
+        if r[8] > 3 {
+            return None;
+        }
+        let wrapped = r[8] & 1 != 0;
+        let puf = r[8] & 2 != 0;
         return Some((
             Record {
                 wrapped,
+                puf,
                 m_kib: u32::from_le_bytes(r[9..13].try_into().unwrap()),
                 t_cost: r[13],
                 salt: r[14..30].try_into().unwrap(),

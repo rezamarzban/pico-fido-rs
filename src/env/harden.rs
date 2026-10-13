@@ -16,7 +16,7 @@
 //! * The PIN retry counter is the vault's power-cut-safe counter, not OpenSK's.
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use defmt::error;
+use defmt::{error, warn};
 use portable_atomic::{AtomicBool, Ordering};
 use hmac::{Hmac, Mac};
 use opensk::api::persist::{keys, Persist, PersistIter};
@@ -28,6 +28,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::PicoPersist;
 use crate::guard;
+use crate::puf::{Puf, Status as PufStatus};
 use crate::keys::fill_random;
 use crate::store::{Record, Replaced, Vault, TRIES_MAX};
 use crate::vault::FlashVault;
@@ -59,6 +60,8 @@ struct State {
 pub struct HardenPersist {
     raw: PicoPersist,
     st: RefCell<State>,
+    /// SRAM PUF (src/puf.rs). Its key is derived on demand and never stored.
+    puf: Puf,
 }
 
 type Hm = Hmac<Sha256>;
@@ -149,17 +152,53 @@ fn scrubbed(mut rec: Record) -> Record {
 }
 
 impl HardenPersist {
-    pub fn new(raw: PicoPersist, vault: FlashVault, rec: Option<Record>) -> Self {
+    pub fn new(raw: PicoPersist, vault: FlashVault, rec: Option<Record>, mut puf: Puf) -> Self {
         let mut st = State {
             vault,
             rec: None,
             pending: None,
         };
+        // First boot with the PUF feature: enrol now (only a power-on reset can).
+        if puf.status() == PufStatus::Blank {
+            puf.enroll();
+        }
+        let key = puf.key();
         if let Some(r) = rec {
             WRAPPED.store(r.wrapped, Ordering::Relaxed);
-            // Without a PIN the seed is stored in clear, so it is available right away.
-            if !r.wrapped && !guard::store_seed(&r.body) {
-                error!("guard: could not store the seed");
+            if r.puf && key.is_none() {
+                // Bound to the PUF but this boot cannot recover the key: do not guess, do not
+                // count it as a wrong PIN, do not touch the record.
+                error!("puf: record is PUF-bound but the key is unavailable - unplug for 10 s, or CTAP reset");
+                WRAPPED.store(false, Ordering::Relaxed);
+            } else if !r.wrapped {
+                // Without a PIN the seed is available right away (unmasked with the PUF key).
+                let kref = if r.puf { key.as_ref().map(|k| &**k) } else { None };
+                match wrap::plain_seed(&r, kref) {
+                    Some(seed) if guard::store_seed(&seed) => {
+                        let mut keep = r;
+                        // Not yet bound, but a PUF key exists: bind the plain seed now.
+                        if !keep.puf {
+                            if let Some(k) = key.as_ref() {
+                                let up = wrap::plain_puf(&seed, &**k);
+                                match st.vault.replace(&up) {
+                                    Replaced::New(s) => {
+                                        if !s.old_wiped && !matches!(st.vault.purge_stale(), Ok(true)) {
+                                            warn!("puf: the unbound record could not be wiped");
+                                        }
+                                        keep = up;
+                                    }
+                                    Replaced::Kept(_) => warn!("puf: could not bind the seed, keeping the unbound record"),
+                                    Replaced::NoKey | Replaced::Unknown => {
+                                        st.fail_closed();
+                                        return HardenPersist { raw, st: RefCell::new(st), puf };
+                                    }
+                                }
+                            }
+                        }
+                        st.rec = Some(scrubbed(keep));
+                    }
+                    _ => error!("guard: could not store the seed"),
+                }
             } else {
                 st.rec = Some(scrubbed(r));
             }
@@ -167,6 +206,7 @@ impl HardenPersist {
         HardenPersist {
             raw,
             st: RefCell::new(st),
+            puf,
         }
     }
 
@@ -259,11 +299,44 @@ impl Persist for HardenPersist {
             // nobody can unlock this, a CTAP reset is needed.
             return Ok(Some(false));
         }
+        // PUF key, derived now and wiped on drop. A PUF-bound record cannot be checked without
+        // it, and that is not a wrong PIN: the attempt already counted is refunded.
+        let key = self.puf.key();
+        if rec.puf && key.is_none() {
+            if let Some(page) = st.pending.take() {
+                let _ = st.vault.finish_try(page);
+            }
+            error!("puf: key unavailable - unplug for 10 s and retry (not counted as a wrong PIN)");
+            return Err(hw_fail());
+        }
+        let kref = if rec.puf { key.as_ref().map(|k| &**k) } else { None };
         guard::refresh_now();
-        let ok = match wrap::unwrap(&rec, pin_hash) {
+        let ok = match wrap::unwrap(&rec, pin_hash, kref) {
             Some(seed) => {
                 if !guard::store_seed(&seed) {
                     return Err(hw_fail());
+                }
+                // Record not yet PUF-bound but a key exists: bind it now that the PIN is at hand.
+                if !rec.puf {
+                    if let Some(k) = key.as_ref() {
+                        let mut salt = [0u8; 16];
+                        fill_random(&mut salt);
+                        if let Some(up) = wrap::wrap(&seed, pin_hash, salt, Some(&**k)) {
+                            match st.vault.replace(&up) {
+                                Replaced::New(s) => {
+                                    if !s.old_wiped && !matches!(st.vault.purge_stale(), Ok(true)) {
+                                        warn!("puf: the unbound record could not be wiped");
+                                    }
+                                    st.rec = Some(up);
+                                }
+                                Replaced::Kept(_) => warn!("puf: could not bind the PIN record, keeping the unbound one"),
+                                Replaced::NoKey | Replaced::Unknown => {
+                                    st.fail_closed();
+                                    return Err(hw_fail());
+                                }
+                            }
+                        }
+                    }
                 }
                 true
             }
@@ -274,10 +347,15 @@ impl Persist for HardenPersist {
     }
 
     fn set_pin(&mut self, pin_hash: &[u8; 16], pin_code_point_length: u8) -> CtapResult<()> {
+        let key = self.puf.key();
         {
             let st = self.st.get_mut();
             if !guard::has_seed() {
                 return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
+            }
+            if key.is_none() && st.rec.as_ref().map_or(false, |r| r.puf) {
+                error!("set_pin: PUF key unavailable");
+                return Err(hw_fail());
             }
             // 1. Counter first. The caller is authenticated (no PIN yet, or the old PIN was just
             //    verified), so clearing it early gives nothing away, and a failure here changes
@@ -291,7 +369,7 @@ impl Persist for HardenPersist {
                 }
                 let mut salt = [0u8; 16];
                 fill_random(&mut salt);
-                wrap::wrap(&seed, pin_hash, salt).ok_or_else(hw_fail)?
+                wrap::wrap(&seed, pin_hash, salt, key.as_ref().map(|k| &**k)).ok_or_else(hw_fail)?
             };
             guard::refresh_now();
             // 3. Commit. Only a record that is durable AND whose predecessor was verified wiped
@@ -362,7 +440,17 @@ impl Persist for HardenPersist {
         self.raw.insert(keys::RESET_COMPLETION, &[])?;
         let mut seed = Zeroizing::new([0u8; 32]);
         fill_random(&mut seed[..]);
-        let rec = Record::plain(*seed);
+        // Bind the new seed to the PUF. Without a usable key, (re-)enrol first: a reset wipes
+        // everything that depended on the old key anyway. That needs a power-on reset; if there
+        // is none, the new seed is stored unbound and gets bound at a later boot.
+        if !matches!(self.puf.status(), PufStatus::Ready | PufStatus::Disabled) {
+            self.puf.enroll();
+        }
+        let key = self.puf.key();
+        let rec = match key.as_ref() {
+            Some(k) => wrap::plain_puf(&seed, &**k),
+            None => Record::plain(*seed),
+        };
         {
             let st = self.st.get_mut();
             match st.vault.replace(&rec) {

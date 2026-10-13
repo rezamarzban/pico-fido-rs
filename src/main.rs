@@ -26,6 +26,7 @@ mod env;
 mod guard;
 mod health;
 mod keys;
+mod puf;
 mod ram_guard;
 mod store;
 mod usb;
@@ -54,11 +55,15 @@ pub const FLASH_SIZE: usize = FLASH_MB * 1024 * 1024;
 
 /// Pages of 4 KiB at the end of flash for OpenSK's key-value store. build.rs keeps the same
 /// amount (80 KiB) out of the linker's FLASH region: change both together.
-pub const STORE_PAGES: usize = 20;
+pub const STORE_PAGES: usize = 19;
 
 /// The last 12 KiB of flash hold the vault: [PIN retry counter][seed slot 0][seed slot 1].
 /// build.rs keeps them (and the store above) out of the linker's FLASH region.
 pub const VAULT_BYTES: usize = 3 * 4096;
+
+/// One sector just below the vault holds the SRAM-PUF helper data (src/puf.rs): 76 KiB store +
+/// 4 KiB PUF + 12 KiB vault = the same 92 KiB build.rs keeps out of the FLASH region.
+pub const PUF_BYTES: usize = 4096;
 
 // Heap for OpenSK (alloc): credentials, CBOR, the P-256 software crypto, message buffers.
 const HEAP_SIZE: usize = 128 * 1024;
@@ -150,8 +155,9 @@ fn main() -> ! {
     // OpenSK in thread mode. The flash moves into the key-value store, BOOTSEL into user presence.
     static FLASH: StaticCell<RefCell<keys::Fl>> = StaticCell::new();
     let flash: &'static RefCell<keys::Fl> = &*FLASH.init(RefCell::new(flash));
+    let puf = puf::Puf::open(flash);
     let (vault, rec) = vault::open(flash);
-    let persist = HardenPersist::new(PicoPersist::new(flash), vault, rec);
+    let persist = HardenPersist::new(PicoPersist::new(flash), vault, rec, puf);
     let env = PicoEnv::new(persist, PicoUserPresence::new(p.BOOTSEL));
     let mut ctap = Ctap::new(env);
     info!("OpenSK initialised");
