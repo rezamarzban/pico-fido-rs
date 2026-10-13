@@ -23,16 +23,18 @@ use embedded_alloc::Heap;
 use {defmt_rtt as _, panic_probe as _};
 
 mod env;
+mod guard;
 mod health;
 mod keys;
+mod ram_guard;
 mod store;
 mod usb;
 mod vault;
 mod wrap;
 
 use core::cell::RefCell;
-use core::sync::atomic::Ordering;
-use env::{HardenPersist, PicoEnv, PicoPersist, PicoUserPresence, LOCK_REQUEST};
+use embassy_rp::adc::{Adc, Channel as AdcChannel, Config as AdcConfig};
+use env::{HardenPersist, PicoEnv, PicoPersist, PicoUserPresence};
 use static_cell::StaticCell;
 use opensk::api::connection::{HidConnection as _, UsbEndpoint};
 use opensk::env::Env as _;
@@ -98,6 +100,8 @@ async fn usb_executor_init(parts: AssertSend<UsbParts>) {
     spawner.spawn(usb::run_usb(device)).unwrap();
     spawner.spawn(usb::usb_io(reader, writer)).unwrap();
     spawner.spawn(blinker(led)).unwrap();
+    // Share refresh every millisecond, also while the main thread signs or waits for the button.
+    spawner.spawn(guard::tick_task()).unwrap();
 }
 
 #[entry]
@@ -107,6 +111,16 @@ fn main() -> ! {
 
     let p = embassy_rp::init(Default::default());
     let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
+
+    // RAM guard: seed the mask DRBG once, before any secret is stored (ROSC, flash unique ID,
+    // ADC noise, timer jitter -> SHA-256).
+    {
+        let mut uid = [0u8; 8];
+        let _ = flash.blocking_unique_id(&mut uid); // not secret; a failed read only drops that input
+        let mut adc = Adc::new_blocking(p.ADC, AdcConfig::default());
+        let mut sensor = AdcChannel::new_temp_sensor(p.ADC_TEMP_SENSOR);
+        guard::init(&uid, || adc.blocking_read(&mut sensor).unwrap_or(0));
+    }
 
     // Persistent serial number (privacy trade-off): build without `usb_serial` to omit it.
     let serial = if cfg!(feature = "usb_serial") {
@@ -149,6 +163,7 @@ fn main() -> ! {
 fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
     let mut winking = false;
     let mut u2f_armed = false;
+    let mut seen = env::hid::epoch();
     LED_SIGNAL.signal(LedState::Active);
     loop {
         let wink = ctap.should_wink();
@@ -166,11 +181,19 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
             None
         };
         let mut packet = [0u8; 64];
-        let received = env::hid::recv_packet(&mut packet, timeout);
+        let received = env::hid::wait_packet(&mut packet, timeout, seen);
 
-        // USB reset / suspend / unplug: forget the master key, the next use needs the PIN again.
-        if LOCK_REQUEST.swap(false, Ordering::Relaxed) {
+        // USB reset / suspend / unplug: the wait above ends at once. Forget the master key (the
+        // next use needs the PIN again) and every in-flight operation: HID reassembly, pending
+        // U2F touch, PIN tokens, stateful commands.
+        let now = env::hid::epoch();
+        if now != seen {
+            seen = now;
             ctap.env().persist().lock();
+            ctap.cancel_in_flight();
+            u2f_armed = false;
+            winking = false;
+            LED_SIGNAL.signal(LedState::Active);
         }
 
         // U2F has no begin/end calls: the loop polls the button while a U2F request waits for it.
@@ -181,7 +204,16 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
         }
 
         if received {
+            // Stamp the operation: everything blocking inside it (user presence, sends) stops
+            // as soon as a reset / suspend / unplug bumps the epoch.
+            let op = env::hid::begin_op();
+            guard::refresh_now();
             for out in ctap.process_hid_packet(&packet, Transport::MainHid) {
+                // A cancelled operation never answers (stale responses must not leak into the
+                // next host session).
+                if env::hid::epoch() != op {
+                    break;
+                }
                 if ctap
                     .env()
                     .hid_connection()
@@ -192,6 +224,7 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
                     break;
                 }
             }
+            guard::refresh_now();
             if !u2f_armed && !winking {
                 LED_SIGNAL.signal(LedState::Active);
             }

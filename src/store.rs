@@ -26,6 +26,7 @@
 //! PIN was correct. The failure count is the number of STARTED flags after the last DONE flag.
 //! A correct PIN therefore needs no erase; the sector is only erased when it is full or on reset.
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 pub const REC_LEN: usize = 110;
 pub const TRIES_MAX: usize = 8;
@@ -51,6 +52,9 @@ pub trait Sectors {
 /// below implement it on top of [`Sectors`]; the firmware wraps them with logging (keys.rs).
 pub trait Vault {
     fn replace(&mut self, rec: &Record) -> Replaced;
+    /// Retries destroying an older record that `replace` could not wipe (`Saved::old_wiped`).
+    /// `Ok(true)` only if the old slot was verified dead.
+    fn purge_stale(&mut self) -> Result<bool, ()>;
     /// Number of failed PIN attempts since the last correct one.
     fn tries_used(&mut self) -> Result<u8, ()>;
     /// Persists "one attempt started" and returns its page. Call BEFORE evaluating the PIN.
@@ -61,8 +65,9 @@ pub trait Vault {
     fn clear_tries(&mut self) -> Result<(), ()>;
 }
 
-/// The key material stored in a slot.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// The key material stored in a slot. Holds secrets (`body` is the plain seed when not wrapped):
+/// no derived Debug, wiped on drop.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Record {
     pub wrapped: bool,
     pub m_kib: u32,
@@ -70,6 +75,22 @@ pub struct Record {
     pub salt: [u8; 16],
     pub body: [u8; 32],
     pub tag: [u8; 32],
+}
+
+impl core::fmt::Debug for Record {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Record")
+            .field("wrapped", &self.wrapped)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Record {
+    fn drop(&mut self) {
+        self.salt.zeroize();
+        self.body.zeroize();
+        self.tag.zeroize();
+    }
 }
 
 impl Record {
@@ -187,7 +208,9 @@ fn scan<S: Sectors>(s: &mut S) -> Result<(Best, bool), S::Error> {
         let mut r = [0u8; REC_LEN];
         s.read(slot, &mut r)?;
         blank &= r.iter().all(|&b| b == 0xFF);
-        if let Some((rec, seq)) = decode(&r) {
+        let decoded = decode(&r);
+        r.zeroize();
+        if let Some((rec, seq)) = decoded {
             let better = match &best {
                 None => true,
                 Some((_, p)) => newer(seq, p.seq),
@@ -217,18 +240,25 @@ fn write_verified<S: Sectors>(
     s.erase(slot).map_err(|_| SaveError::Io)?;
     s.write(slot, rec).map_err(|_| SaveError::Io)?;
     let mut back = [0u8; REC_LEN];
-    s.read(slot, &mut back).map_err(|_| SaveError::Io)?;
-    if back != *rec {
+    let read = s.read(slot, &mut back).map_err(|_| SaveError::Io);
+    let same = back == *rec;
+    back.zeroize();
+    read?;
+    if !same {
         return Err(SaveError::Verify);
     }
     Ok(())
 }
 
-/// Reads `slot` back and checks that it no longer holds a valid record. (Software read-back
-/// shows what the flash returns; it is not proof of physical erasure.)
+/// Reads `slot` back and checks that nothing of the record is left: the record area must be
+/// uniformly erased (0xFF) or zero-programmed (0x00). A read error counts as "not dead". (Software
+/// read-back shows what the flash returns; it is not proof of physical erasure.)
 fn slot_is_dead<S: Sectors>(s: &mut S, slot: usize) -> bool {
     let mut back = [0u8; REC_LEN];
-    s.read(slot, &mut back).is_ok() && decode(&back).is_none()
+    let dead = s.read(slot, &mut back).is_ok()
+        && (back.iter().all(|&b| b == 0xFF) || back.iter().all(|&b| b == 0x00));
+    back.zeroize();
+    dead
 }
 
 /// Destroys whatever is in `slot`. Erase is tried twice and every "successful" erase is read back;
@@ -257,10 +287,14 @@ pub fn purge_stale<S: Sectors>(s: &mut S) -> Result<bool, SaveError> {
     };
     let other = p.slot ^ 1;
     let mut r = [0u8; REC_LEN];
-    s.read(other, &mut r).map_err(|_| SaveError::Io)?;
-    if decode(&r).is_none() {
+    let read = s.read(other, &mut r).map_err(|_| SaveError::Io);
+    let valid = decode(&r).is_some();
+    r.zeroize();
+    read?;
+    if !valid && slot_is_dead(s, other) {
         return Ok(true);
     }
+    // A valid stale record, or leftovers of a half-erased one: destroy it.
     Ok(wipe(s, other))
 }
 
@@ -276,8 +310,10 @@ pub fn save<S: Sectors>(s: &mut S, rec: &Record) -> Result<Saved, SaveError> {
         },
         None => Pos { seq: 1, slot: 0 },
     };
-    let raw = encode(rec, pos.seq);
-    if let Err(e) = write_verified(s, pos.slot, &raw) {
+    let mut raw = encode(rec, pos.seq);
+    let written = write_verified(s, pos.slot, &raw);
+    raw.zeroize();
+    if let Err(e) = written {
         // Best effort: take the half-done record back out so the previous record stays the only one.
         let _ = s.erase(pos.slot);
         return Err(e);
@@ -385,6 +421,9 @@ pub struct SectorVault<'a, S: Sectors>(pub &'a mut S);
 impl<S: Sectors> Vault for SectorVault<'_, S> {
     fn replace(&mut self, rec: &Record) -> Replaced {
         replace_record(self.0, rec)
+    }
+    fn purge_stale(&mut self) -> Result<bool, ()> {
+        purge_stale(self.0).map_err(|_| ())
     }
     fn tries_used(&mut self) -> Result<u8, ()> {
         count_tries(self.0).map_err(|_| ())

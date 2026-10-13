@@ -1,0 +1,15 @@
+[package]
+name = "guard-host-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Host-side tests of src/ram_guard.rs and src/store.rs (no hardware, no Embassy).
+[workspace]
+
+[dependencies]
+rand_core = "0.6"
+rand_chacha = "0.3"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+zeroize_derive = "=1.4.2"  # only needed with Cargo < 1.85 (1.5 needs edition 2024)

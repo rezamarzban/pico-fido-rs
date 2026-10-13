@@ -9,7 +9,8 @@
 # NOT covered here (needs hardware, see README "Verification status"): src/env/* (flash store,
 # BOOTSEL user presence, HID bridge, RNG), the USB stack and the interrupt-executor split.
 set -e
-cd "$(dirname "$0")/../third_party/OpenSK" || {
+HERE=$(cd "$(dirname "$0")" && pwd)
+cd "$HERE/../third_party/OpenSK" || {
   echo "third_party/OpenSK is missing: git submodule update --init --depth 1 third_party/OpenSK" >&2
   exit 1
 }
@@ -22,3 +23,5 @@ fi
   cargo test --no-default-features --features=std
   cargo test --features=std,config_command,ctap1 )
 cargo test --manifest-path=libraries/cbor/Cargo.toml
+# the repo-level .cargo/config.toml defaults to the Pico target: force the host target here
+( cd "$HERE/guard" && cargo test --target "$(rustc -vV | sed -n 's/^host: //p')" )
