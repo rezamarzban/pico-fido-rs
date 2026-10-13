@@ -3,19 +3,20 @@
 A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this before relying on it.
 
 ## What it protects against
-* Phishing and credential theft over the network: credentials are bound to the website (RP ID) and signed.
-* A lost device that is never opened: nothing is exposed over USB except signatures.
+* Phishing and credential theft over the network: credentials are bound to the website (RP ID) and signed. This assumes an uncompromised browser/OS and a relying party that checks the RP ID; it does not help against malware on the host.
+* A lost device that is never opened: the USB interface does not export the private keys or the master key
+  material. It answers ordinary CTAP requests, and which of them need a fresh BOOTSEL press is decided by
+  OpenSK following the CTAP rules (see below). **Without a PIN, whoever holds the device can use it to sign in.**
 * User presence is a **fresh press of BOOTSEL** (`src/env/user_presence.rs`): the button must be seen released
   after the check started and then pressed, so a button already held down when a request arrives does not count.
   Which operations ask for presence is decided by OpenSK following the CTAP rules.
 
 ## What it does NOT protect against
-* **Anyone who can read the flash.** OpenSK keeps its key material and the PIN hash in the key-value store *in
-  clear* (`src/env/persist.rs`; OpenSK's generic key store does not encrypt them). The RP2040 has no secure
-  storage, no flash encryption and no OTP key area, and the USB bootloader or SWD can read the whole flash.
-  With the stored keys, credentials can be recreated; with the PIN hash, the PIN can be guessed offline at PC speed.
-  This is **weaker than the earlier custom firmware**, which wrapped the master key with an Argon2id key derived from
-  the PIN. A secure element that signs internally is the only real fix.
+* **Anyone who can read the flash, when no PIN is set.** The seed is then stored in clear in the vault. The RP2040 has
+  no secure storage, no flash encryption and no OTP key area, and the USB bootloader or SWD can read the whole
+  flash. A secure element that signs internally would keep the key out of flash, but is not a complete fix: the ATECC608 used in the `atecc-*` branches, for example, has no user-presence check, so anyone with access to its bus can still request signatures.
+* **Offline PIN guessing on a flash dump, when a PIN is set.** The seed is wrapped with Argon2id (64 KiB), but the
+  RP2040 can only afford a small cost, so a short PIN falls quickly to a GPU/ASIC attacker. Use a long passphrase.
 * **Short PINs.** The firmware requires at least 10 code points because of the point above; use a long
   passphrase.
 * **Reading RAM** (debugger/SWD): the RP2040 has no debug lockout.
@@ -28,8 +29,9 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   upstream does not ship for the RP2040. Results from other boards do not carry over.
 
 ## Behaviour worth knowing
-* **Store.** The last 80 KiB of flash (`STORE_PAGES` = 20) are the store. If that area holds nothing the
-  store understands, it is erased once at boot and started empty. A reset or a damaged store therefore loses
+* **Store and vault.** The last 12 KiB of flash are the vault, the 80 KiB below it (`STORE_PAGES` = 20) the store. If the store area holds nothing the
+  store understands, it is erased once at boot and started empty; a vault sector holding unrecognised data is not
+  erased, and the device refuses to work until a CTAP reset. A reset or a damaged store therefore loses
   credentials; keep **two** devices registered per account.
 * **Flash writes** run from RAM with interrupts masked: the USB interrupt can be delayed for the duration of a
   sector erase (tens of ms).
@@ -41,5 +43,29 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   device across connections.
 * **Unpinned dependencies.** Without a committed `Cargo.lock` and a pinned OpenSK commit (`third_party/OPENSK_REV`)
   builds are not reproducible.
-* **Verification.** The maintainer reports it works on Linux, Windows and Android. Hardware behaviour for flash
+* **Verification.** The maintainer reports that this branch was built, flashed to a Pico and tested, and works on Linux, Windows and Android;
+  the hardening has no detailed test record. Hardware behaviour for flash
   failures, power loss and timing was not systematically tested. See `README.md`, "Verification status".
+
+## Hardened key storage (vault + HardenPersist)
+
+* The master seed (32 bytes) lives in a dual-slot, power-cut-safe vault in the last 12 KiB of flash.
+  With a PIN set it is wrapped with Argon2id (64 KiB, `T_COST` passes) + HMAC-SHA-256; the PIN
+  check is the wrap tag, no PIN hash is stored (the OpenSK PIN record holds zeros and the length).
+* From the seed, 128 bytes of OpenSK master keys are derived in RAM. Non-resident credentials
+  (credential IDs) and cred-random depend on them; resident credentials are additionally encrypted
+  and authenticated before they reach the key-value store. Metadata (counters, large blobs,
+  settings) stays in clear.
+* The PIN retry counter is the vault's (8 tries, written before each guess).
+* **Without a PIN the seed is stored in clear**: the device is then only as secure as its flash.
+* The master is forgotten on USB reset / suspend / unplug (next packet) and on power-off. While
+  locked, credential-ID operations (including U2F and `uv=false` assertions) fail until the PIN is
+  entered once.
+* **Offline guessing:** an attacker with a flash dump can try PINs offline at the cost of Argon2
+  with 64 KiB. The RP2040 cannot make that expensive; use a long passphrase (min. 10 code points
+  by default).
+* Not protected: RAM while a session is open, side channels, fault injection; the RNG is the ROSC
+  (not a certified TRNG).
+* Reflash with a full flash erase: the layout moved (vault at the end, store 12 KiB lower).
+* An interrupted setPIN (power cut between the vault write and the PIN record) can leave a state that only a CTAP
+  reset fixes. A damaged vault makes the device refuse to work until a reset.

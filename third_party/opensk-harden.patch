@@ -1,0 +1,42 @@
+diff --git a/libraries/opensk/src/api/persist.rs b/libraries/opensk/src/api/persist.rs
+--- a/libraries/opensk/src/api/persist.rs
++++ b/libraries/opensk/src/api/persist.rs
+@@ -81,6 +81,15 @@
+         Ok(())
+     }
+ 
++    /// Hardened-vault hook, called by PIN verification with the PIN hash the platform sent.
++    ///
++    /// Returns `None` if this implementation does not verify PINs itself (the caller then compares
++    /// with the stored PIN hash, as upstream does). Otherwise `Some(correct)`. A hardened
++    /// implementation also unlocks its master key on `Some(true)`.
++    fn unlock_with_pin(&mut self, _pin_hash: &[u8; PIN_AUTH_LENGTH]) -> CtapResult<Option<bool>> {
++        Ok(None)
++    }
++
+     /// Returns the byte array representation of a stored credential.
+     fn credential_bytes(&self, key: usize) -> CtapResult<Vec<u8>> {
+         if !keys::CREDENTIALS.contains(&key) {
+diff --git a/libraries/opensk/src/ctap/client_pin.rs b/libraries/opensk/src/ctap/client_pin.rs
+--- a/libraries/opensk/src/ctap/client_pin.rs
++++ b/libraries/opensk/src/ctap/client_pin.rs
+@@ -198,7 +198,18 @@
+                     .decrypt(&pin_hash_enc)
+                     .map_err(|_| Ctap2StatusCode::CTAP2_ERR_PIN_INVALID)?;
+ 
+-                if !bool::from(pin_hash.ct_eq(&pin_hash_dec)) {
++                let pin_ok = if pin_hash_dec.len() == PIN_AUTH_LENGTH {
++                    match env
++                        .persist()
++                        .unlock_with_pin(array_ref![pin_hash_dec, 0, PIN_AUTH_LENGTH])?
++                    {
++                        Some(ok) => ok,
++                        None => bool::from(pin_hash.ct_eq(&pin_hash_dec)),
++                    }
++                } else {
++                    false
++                };
++                if !pin_ok {
+                     self.get_mut_pin_protocol(pin_uv_auth_protocol)
+                         .regenerate(env);
+                     if storage::pin_retries(env)? == 0 {

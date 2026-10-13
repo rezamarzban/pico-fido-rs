@@ -8,30 +8,33 @@
 //! embassy flash driver, which runs them from RAM with interrupts masked: the USB interrupt is
 //! delayed for the duration of a sector erase (tens of ms), which the host tolerates (NAKs).
 use alloc::borrow::Cow;
+use core::cell::RefCell;
 use wasefire_store::{Storage, StorageError, StorageIndex, StorageResult};
 
 use crate::keys::Fl;
-use crate::{FLASH_SIZE, STORE_PAGES};
+use crate::{FLASH_SIZE, STORE_PAGES, VAULT_BYTES};
 
 pub const PAGE_SIZE: usize = 4096;
 const STORE_BYTES: usize = STORE_PAGES * PAGE_SIZE;
-const STORE_START: usize = FLASH_SIZE - STORE_BYTES;
+/// The vault (src/vault.rs) occupies the very end of flash, the store sits right below it.
+const STORE_START: usize = FLASH_SIZE - VAULT_BYTES - STORE_BYTES;
 /// Start of the memory-mapped flash (XIP window).
 const XIP_BASE: usize = 0x1000_0000;
 
 pub struct FlashStorage {
-    flash: Fl,
+    flash: &'static RefCell<Fl>,
 }
 
 impl FlashStorage {
-    pub fn new(flash: Fl) -> Self {
+    pub fn new(flash: &'static RefCell<Fl>) -> Self {
         FlashStorage { flash }
     }
 
     /// Erases the whole store area (used when the area holds nothing the store understands).
     pub fn format(&mut self) -> Result<(), embassy_rp::flash::Error> {
         self.flash
-            .blocking_erase(STORE_START as u32, FLASH_SIZE as u32)
+            .borrow_mut()
+            .blocking_erase(STORE_START as u32, (STORE_START + STORE_BYTES) as u32)
     }
 
     /// Flash offset of `index`, checked against the store area.
@@ -78,6 +81,7 @@ impl Storage for FlashStorage {
     fn write_slice(&mut self, index: StorageIndex, value: &[u8]) -> StorageResult<()> {
         let offset = Self::offset(&index, value.len())?;
         self.flash
+            .borrow_mut()
             .blocking_write(offset as u32, value)
             .map_err(|_| StorageError::CustomError)
     }
@@ -86,6 +90,7 @@ impl Storage for FlashStorage {
         let index = StorageIndex { page, byte: 0 };
         let from = Self::offset(&index, PAGE_SIZE)?;
         self.flash
+            .borrow_mut()
             .blocking_erase(from as u32, (from + PAGE_SIZE) as u32)
             .map_err(|_| StorageError::CustomError)
     }

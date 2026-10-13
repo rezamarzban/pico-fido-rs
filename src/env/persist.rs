@@ -3,9 +3,10 @@
 //! Only the four primitive accessors are implemented; everything else (PIN state, retry counters,
 //! credentials, large blobs, attestation) uses OpenSK's default methods built on them.
 //!
-//! What this means for security: OpenSK keeps its key material and the PIN hash in this store in
-//! clear. Anyone who can read the flash can read them (no secure element on the RP2040).
+//! This is the raw, cleartext backend. `HardenPersist` (harden.rs) wraps it and keeps the master
+//! key and the resident-credential secrets out of it (see SECURITY.md).
 use alloc::boxed::Box;
+use core::cell::RefCell;
 use alloc::vec::Vec;
 use defmt::{error, warn};
 use opensk::api::persist::{Persist, PersistIter};
@@ -22,7 +23,7 @@ pub struct PicoPersist {
 impl PicoPersist {
     /// Opens the store. An area that does not hold a valid store (first boot after the old
     /// firmware, or foreign data) is erased once and started empty; blank flash is already valid.
-    pub fn new(flash: Fl) -> Self {
+    pub fn new(flash: &'static RefCell<Fl>) -> Self {
         let storage = FlashStorage::new(flash);
         let store = match Store::new(storage) {
             Ok(store) => store,

@@ -55,6 +55,9 @@ static_cell = "2"
 rand = { version = "0.8.5", default-features = false }
 rand_core = { version = "0.6", default-features = false }
 sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 heapless = "0.8.0"
 portable-atomic = { version = "1.7.0", features = ["critical-section"] }
 embedded-alloc = "0.5.1"
