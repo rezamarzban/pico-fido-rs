@@ -2,14 +2,15 @@
 
 A FIDO2 / U2F security key for the Raspberry Pi Pico (RP2040), written in Rust with Embassy. The CTAP
 protocol itself is **Google's OpenSK library** (Apache-2.0); this repository is the RP2040 platform layer
-around it (USB, flash store, button, RNG). **Experimental. Read `SECURITY.md` before relying on it.**
+around it (USB, flash store, button, RNG). This branch adds a PIN-wrapped master-key vault to the OpenSK-based firmware. **Experimental, and the hardening is new and untested on hardware. Read `SECURITY.md` before relying on it.**
 
 ## Architecture
 | Part | Where |
 |------|-------|
 | CTAP2 / CTAP1 (U2F), CTAPHID, ClientPIN, credential logic | OpenSK, `third_party/OpenSK/libraries/opensk` (git submodule; commit in `third_party/OPENSK_REV`) |
 | `opensk::env::Env` for the Pico | `src/env/mod.rs` (`PicoEnv`; customization: minimum PIN length 10, batch attestation off) |
-| Persistent store (credentials, keys, PIN state) | `src/env/persist.rs` + `src/env/flash_store.rs`, on the `wasefire-store` crate |
+| Persistent store (credentials, metadata, PIN length) | `src/env/persist.rs` + `src/env/flash_store.rs`, on the `wasefire-store` crate (cleartext backend) |
+| Hardening: master key + resident-credential encryption, PIN verifier, retry counter | `src/env/harden.rs` (`HardenPersist`), `src/vault.rs`, `src/store.rs`, `src/wrap.rs`; PIN hook in `third_party/opensk-harden.patch` |
 | User presence = fresh BOOTSEL press | `src/env/user_presence.rs` |
 | Packet bridge between USB (async) and OpenSK (blocking) | `src/env/hid.rs` (two queues) |
 | Random numbers | `src/env/rng.rs` -> `src/keys.rs` (ring oscillator + SHA-256, `src/health.rs` health tests) |
@@ -27,11 +28,14 @@ the pinned commit: an unpinned OpenSK (for example a branch name) can change bet
 pin, rebuild, retest on hardware and update the file.
 
 ## Flash layout
-The **last 80 KiB** of flash (20 pages of 4 KiB, `STORE_PAGES` in `src/main.rs`) hold the OpenSK key-value store.
-`build.rs` keeps exactly that area out of the linker's FLASH region and derives everything from the single
-`flash_*` feature, so firmware and store cannot overlap. On first boot, if that area holds nothing the store
-understands (for example leftovers of the earlier custom firmware), it is **erased once** and started empty.
-Credentials and PINs from that earlier firmware are gone: register again.
+The **last 92 KiB** of flash are kept out of the linker's FLASH region (`build.rs`):
+* the last **12 KiB** (`VAULT_BYTES`) are the vault: `[PIN retry counter][seed slot 0][seed slot 1]` (`src/vault.rs`);
+* the **80 KiB** below it (20 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store.
+
+`build.rs` derives everything from the single `flash_*` feature, so firmware, store and vault cannot overlap.
+This layout differs from the earlier branches: **erase the whole flash before the first install** (a vault sector
+holding old data is reported as damaged and the device refuses to work until a CTAP reset). On first boot a blank
+vault gets a fresh random seed; a store area the store does not understand is erased once.
 
 ## Build
 Needs the **nightly** pinned in `rust-toolchain.toml` (`nightly-2026-06-03`, the one OpenSK pins; OpenSK is
@@ -68,11 +72,23 @@ U2F registration needs an attestation key and certificate, which this firmware d
 `tools/configure.py` (uses the `config_command` feature) to write them; that path was not tried here.
 `use_batch_attestation` is off, so FIDO2 registrations use self attestation.
 
-## PIN
+## PIN and key protection
 At least **10 code points** (`default_min_pin_length` in `src/env/mod.rs`). Set it with any FIDO2 client
-(`fido2-token -S`, `ykman fido access change-pin`, Chrome/Windows security-key settings). **OpenSK stores the PIN
-hash and the key material in clear in flash**: there is no Argon2 wrapping any more, and anyone who can read the
-flash can attack the PIN offline. See `SECURITY.md`.
+(`fido2-token -S`, `ykman fido access change-pin`, Chrome/Windows security-key settings).
+
+With a PIN set, the 32-byte master seed is wrapped with **Argon2id** (64 KiB static buffer, `M_KIB`/`T_COST` in
+`src/wrap.rs`) and no PIN hash is stored; the Argon2 tag is the PIN verifier. The 128 bytes of OpenSK master keys
+are derived from the seed in RAM after a correct PIN and dropped on USB reset / suspend / unplug. Resident
+credentials are encrypted under keys derived from the master. The PIN retry counter (8 tries) is the vault's.
+
+**Consequences:** after every USB reset the PIN must be entered once before *any* credential-ID operation works,
+including U2F and `uv=discouraged` assertions. Without a PIN the seed is in clear in flash. `T_COST` is untuned:
+time a PIN check on hardware. See `SECURITY.md`.
+
+## OpenSK patch
+`third_party/opensk-harden.patch` (applied by `build.sh`, or manually with `patch -p1 -d third_party/OpenSK <
+third_party/opensk-harden.patch`) adds `Persist::unlock_with_pin` (default: legacy behaviour) and calls it in
+`verify_pin_hash_enc`. Re-check it whenever `OPENSK_REV` changes.
 
 ## Tests
     sh host-test/run.sh     # OpenSK's own library unit tests (the protocol logic), run on the host
@@ -92,6 +108,11 @@ Checked while preparing this tree:
   `rust-toolchain.toml` here are identical to it.
 * The OpenSK library alone, at the pinned commit, with `ctap1,software_crypto`, type-checks for
   `thumbv6m-none-eabi` (check only).
+
+**Hardening status:** `HardenPersist`, the vault and the patch were written without compiling. The first build
+found three errors (a status-code name, `swap` on `thumbv6m` atomics, now `portable_atomic`), fixed in this tree;
+the rest of the build is unconfirmed. Not yet tested: Argon2 timing and heap/RAM headroom, PIN set/change/verify on
+hardware, resident credentials after reboot, power loss during setPIN/reset, lock on USB reset.
 
 **Not done / unknown:**
 * `cargo clippy -- --deny=warnings`, `cargo fmt --check` and the CI workflow were never run on this tree.
