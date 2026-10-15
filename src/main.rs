@@ -53,8 +53,9 @@ const _: () = core::assert!(
 );
 pub const FLASH_SIZE: usize = FLASH_MB * 1024 * 1024;
 
-/// Pages of 4 KiB at the end of flash for OpenSK's key-value store. build.rs keeps the same
-/// amount (80 KiB) out of the linker's FLASH region: change both together.
+/// Pages of 4 KiB at the end of flash for OpenSK's key-value store. build.rs keeps the store
+/// (76 KiB), the PUF sector and the vault (92 KiB in total) out of the linker's FLASH region:
+/// change them together.
 pub const STORE_PAGES: usize = 19;
 
 /// The last 12 KiB of flash hold the vault: [PIN retry counter][seed slot 0][seed slot 1].
@@ -156,8 +157,8 @@ fn main() -> ! {
     static FLASH: StaticCell<RefCell<keys::Fl>> = StaticCell::new();
     let flash: &'static RefCell<keys::Fl> = &*FLASH.init(RefCell::new(flash));
     let puf = puf::Puf::open(flash);
-    let (vault, rec) = vault::open(flash);
-    let persist = HardenPersist::new(PicoPersist::new(flash), vault, rec, puf);
+    let (vault, rec, blank) = vault::open(flash, !puf.required());
+    let persist = HardenPersist::new(PicoPersist::new(flash), vault, rec, blank, puf);
     let env = PicoEnv::new(persist, PicoUserPresence::new(p.BOOTSEL));
     let mut ctap = Ctap::new(env);
     info!("OpenSK initialised");
@@ -187,7 +188,7 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
             None
         };
         let mut packet = [0u8; 64];
-        let received = env::hid::wait_packet(&mut packet, timeout, seen);
+        let mut received = env::hid::wait_packet(&mut packet, timeout, seen);
 
         // USB reset / suspend / unplug: the wait above ends at once. Forget the master key (the
         // next use needs the PIN again) and every in-flight operation: HID reassembly, pending
@@ -195,6 +196,8 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
         let now = env::hid::epoch();
         if now != seen {
             seen = now;
+            // A packet dequeued just before the reset belongs to the old session: drop it.
+            received = false;
             ctap.env().persist().lock();
             ctap.cancel_in_flight();
             u2f_armed = false;
@@ -212,7 +215,7 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
         if received {
             // Stamp the operation: everything blocking inside it (user presence, sends) stops
             // as soon as a reset / suspend / unplug bumps the epoch.
-            let op = env::hid::begin_op();
+            let op = env::hid::begin_op_at(seen);
             guard::refresh_now();
             for out in ctap.process_hid_packet(&packet, Transport::MainHid) {
                 // A cancelled operation never answers (stale responses must not leak into the
@@ -267,6 +270,19 @@ pub async fn blinker(mut led: Output<'static>) {
         if let Some(new_signal) = LED_SIGNAL.try_take() {
             info!("Got new signal: {}", new_signal);
             signal = new_signal;
+        }
+
+        // SRAM PUF fault (key required but unavailable): 3 short blinks, then a pause. Takes
+        // precedence over every other state until a boot / reset with a working key clears it.
+        if puf::fault() {
+            for _ in 0..3 {
+                led.set_high();
+                Timer::after(Duration::from_millis(80)).await;
+                led.set_low();
+                Timer::after(Duration::from_millis(120)).await;
+            }
+            Timer::after(Duration::from_millis(900)).await;
+            continue;
         }
 
         let (on_time, off_time) = match signal {

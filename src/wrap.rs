@@ -25,6 +25,9 @@ pub const M_KIB: u32 = 64;
 pub const T_COST: u8 = 24;
 /// Largest memory cost a stored record may ask for: the size of the static buffer.
 pub const MAX_M_KIB: u32 = 64;
+/// Upper bound for a stored time cost. The value comes from flash, so a damaged or forged record
+/// must not be able to make a PIN check run for minutes.
+pub const MAX_T_COST: u8 = 64;
 
 const BLOCKS: usize = MAX_M_KIB as usize;
 const _: () = core::assert!(core::mem::size_of::<Block>() == 1024);
@@ -52,7 +55,7 @@ fn password(pin_hash: &[u8; 16], puf: Option<&[u8; 32]>) -> (Zeroizing<[u8; 32]>
 }
 
 fn kdf(password: &[u8], salt: &[u8; 16], m_kib: u32, t: u8) -> Option<[u8; 64]> {
-    if !(8..=MAX_M_KIB).contains(&m_kib) || m_kib % 4 != 0 || t == 0 {
+    if !(8..=MAX_M_KIB).contains(&m_kib) || m_kib % 4 != 0 || !(1..=MAX_T_COST).contains(&t) {
         return None;
     }
     let params = Params::new(m_kib, t as u32, 1, Some(64)).ok()?;
@@ -185,13 +188,31 @@ pub fn plain_puf(seed: &[u8; 32], puf: &[u8; 32]) -> Record {
         *b ^= m;
     }
     rec.puf = true;
+    // Authenticate the masked seed: with a wrong PUF key (for example after the helper data was
+    // replaced) `plain_seed` must fail instead of returning a wrong seed.
+    rec.tag = plain_tag(puf, &rec.body);
     rec
+}
+
+fn plain_tag(puf: &[u8; 32], body: &[u8; 32]) -> [u8; 32] {
+    hmac_of(puf, &[b"puf-plain-tag", body]).finalize().into_bytes().into()
+}
+
+/// A PUF-masked no-PIN record written before the tag existed (all-zero tag). It is still
+/// accepted, then re-sealed with a tag at the next boot that has the PUF key.
+pub fn legacy_plain_puf(rec: &Record) -> bool {
+    rec.puf && !rec.wrapped && rec.tag == [0u8; 32]
 }
 
 /// The seed of a no-PIN record (`puf` must be `Some` exactly when `rec.puf` is set).
 pub fn plain_seed(rec: &Record, puf: Option<&[u8; 32]>) -> Option<Zeroizing<[u8; 32]>> {
     if rec.wrapped || rec.puf != puf.is_some() {
         return None;
+    }
+    if let Some(k) = puf {
+        if !legacy_plain_puf(rec) && !bool::from(plain_tag(k, &rec.body).as_slice().ct_eq(&rec.tag)) {
+            return None; // wrong PUF key or damaged record
+        }
     }
     let mut seed = Zeroizing::new(rec.body);
     if let Some(k) = puf {

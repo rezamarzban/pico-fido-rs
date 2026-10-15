@@ -96,11 +96,13 @@ impl Vault for FlashVault {
     }
 }
 
-/// Opens the vault. Blank flash (first boot) creates a plain random seed. A read error or a
+/// Opens the vault. Blank flash (first boot) creates a plain random seed (or, with the SRAM PUF required, is left blank for the caller). A read error or a
 /// damaged, non-blank record yields `None`: the device then refuses to use any key until a CTAP
-/// reset, instead of silently replacing the seed.
-pub fn open(flash: &'static RefCell<Fl>) -> (FlashVault, Option<Record>) {
+/// reset, instead of silently replacing the seed. With `create_plain == false` a blank vault is
+/// left blank and reported (third value) so the caller can create a PUF-bound record.
+pub fn open(flash: &'static RefCell<Fl>, create_plain: bool) -> (FlashVault, Option<Record>, bool) {
     let mut v = FlashVault(flash);
+    let mut blank = false;
     let rec = match store::load(&mut Dev(flash)) {
         Ok(Loaded::Rec(r, p)) => {
             info!(
@@ -114,6 +116,12 @@ pub fn open(flash: &'static RefCell<Fl>) -> (FlashVault, Option<Record>) {
                 Err(_) => warn!("vault: could not check for older records"),
             }
             Some(r)
+        }
+        Ok(Loaded::Blank) if !create_plain => {
+            // First boot with the SRAM PUF required: the caller creates a PUF-bound record. A
+            // plain seed must never reach flash, not even for a moment.
+            blank = true;
+            None
         }
         Ok(Loaded::Blank) => {
             let mut k = Zeroizing::new([0u8; 32]);
@@ -137,5 +145,5 @@ pub fn open(flash: &'static RefCell<Fl>) -> (FlashVault, Option<Record>) {
             None
         }
     };
-    (v, rec)
+    (v, rec, blank)
 }

@@ -14,7 +14,7 @@ for its PIN-wrapped vault; the findings, parameters (for example Argon2 96 KiB, 
 | CTAP2 / CBOR / CTAPHID / ClientPIN | own code, ~3000 lines | OpenSK library (pinned commit in `third_party/OPENSK_REV`) |
 | U2F (CTAP1) | none | `ctap1` feature (attestation key must be provisioned) |
 | Credentials | stateless, derived from one master key, ES256 only | OpenSK credential model (store-backed, discoverable credentials possible) |
-| PIN protection of key at rest | Argon2id wrapping of the master key | Argon2id wrapping of a 32-byte seed in the vault (`src/wrap.rs`, `src/vault.rs`); OpenSK master keys derived from it; resident credentials encrypted (`src/env/harden.rs`). No PIN hash stored. Without a PIN: clear |
+| PIN protection of key at rest | Argon2id wrapping of the master key | Argon2id wrapping of a 32-byte seed in the vault (`src/wrap.rs`, `src/vault.rs`); OpenSK master keys derived from it; resident credentials encrypted (`src/env/harden.rs`). No PIN hash stored. Without a PIN: seed masked with the SRAM-PUF key and authenticated (in clear only in a build without `sram_puf`) |
 | Flash use | 12 KiB (two key slots + retry counter) | 12 KiB vault + 4 KiB SRAM-PUF helper + 76 KiB `wasefire-store` (`src/env/flash_store.rs`) |
 | Heap | 160 KiB (Argon2) | 128 KiB (OpenSK); Argon2 uses a separate static 64 KiB buffer |
 | Concurrency | single executor, cooperative | OpenSK blocking in thread mode, USB/LED on an interrupt executor, packet queues in between |
@@ -25,6 +25,25 @@ for its PIN-wrapped vault; the findings, parameters (for example Argon2 96 KiB, 
 Motivation: the custom firmware worked in Linux browsers but not on Windows and Android; the exact cause was never
 established (differences from a working U2F+CTAP2 key included no U2F, PIN policy and touch behaviour). Reported
 result after the move (maintainer, hardware): works on Linux, Windows and Android with all tried browsers.
+
+## Review of openSK-based-se3 (static review, then fixes)
+
+An external static review plus a second pass over the tree. Nothing here was compiled or run on hardware (no toolchain was
+available when the fixes were written): build, `cargo clippy`, `sh host-test/run.sh` and a hardware test are still open.
+
+| # | Finding | Result |
+|---|---------|--------|
+| BUG-1 | A blank PUF helper sector triggered enrolment even when the vault held a PUF-bound record: new PUF secret, orphaned seed; a no-PIN record has no tag, so a wrong seed was used silently | Fixed. No enrolment unless the vault is blank or holds an unbound record. PUF-masked plain records now carry an HMAC tag (older untagged ones are accepted once and re-sealed). |
+| BUG-2 | USB reset between dequeue and processing: the stale packet was processed and the operation was stamped with the new epoch | Fixed. Epoch re-checked after the dequeue (main loop, `wait_packet`, `recv_packet`, user-presence wait); the operation is stamped with the epoch of its packet (`begin_op_at`). |
+| BUG-3 | `try_decode` returned the PUF secret in a plain array; `is_some()` callers never wiped it | Fixed. Returned in `Zeroizing`; the code word and sample buffers are `Zeroizing` too. |
+| BUG-4 | Stored Argon2 time cost unbounded (up to 255) | Fixed. `MAX_T_COST` = 64 in `kdf`. |
+| DOC-1..8 | Wrong build branch, "only read at start-up", "never kept in RAM", offline-guessing claims, "clear" no-PIN record, fail-closed and cancellation claims | Fixed in README.md, SECURITY.md and this file. |
+| extra | Damaged vault / read error / seed-store failure locked the device without any LED signal | Fixed. LED fault pattern (no halt: a CTAP reset must stay possible). |
+| extra | LED fault flag was cleared at the start of a reset even if the reset later failed | Fixed. Cleared only after a completed reset. |
+| extra | `build.sh` fell back to an unlocked build and defaulted to the wrong branch | Fixed. |
+| extra | Host test `vault.rs` did not compile (`Record` literal without `puf`) | Fixed; `wrap.rs` is now covered by host tests. |
+| open | PUF helper is a single sector (power cut mid-reset needs a second reset); PIN counter erase window when its sector is full | Documented in SECURITY.md; would need extra flash sectors. |
+| open | No `Cargo.lock` | Needs a successful build to generate. |
 
 ## Status and open items
 * **Verified:** the firmware patch applies cleanly; `src/` here equals it. The OpenSK library alone, at the pinned
@@ -38,7 +57,7 @@ result after the move (maintainer, hardware): works on Linux, Windows and Androi
 * [x] Security: PIN-wrapped master seed + resident-credential encryption added (this branch). Built and run on a Pico by the maintainer; no detailed test record.
 * [ ] Hardening tests on hardware: Argon2 time (tune `T_COST`), RAM headroom, setPIN/changePIN/verify, resident credentials across reboot, lock on USB reset, power loss during setPIN and reset, 8-try block, reset recovery of a damaged vault.
 * [ ] Re-validate `third_party/opensk-harden.patch` on every `OPENSK_REV` change.
-* [ ] Security: consider a secure element; offline guessing on a flash dump is only limited by Argon2 at 64 KiB.
+* [ ] Security: consider a secure element; offline guessing is limited by Argon2 at 64 KiB only when the PUF is off or its secret is known (a flash-only dump lacks the PUF-derived password input).
 * [ ] Replace the prototype USB VID/PID and strings (`src/usb/mod.rs`).
 * [ ] Tests for `src/env/*` that can run on the host (flash store geometry, packet queues).
 
@@ -168,3 +187,15 @@ Documented in `README.md` and `SECURITY.md`; this file had no verification recor
 * [ ] Test: first boot enrolment, upgrade of an existing device (no-PIN and PIN-set), PIN verify with the key
   unavailable (no retry counted), reset re-enrolment, power cut during enrolment, quick unplug-replug.
 * [ ] `HAD_POR` is read from CHIP_RESET (0x4006_4008, bit 8): confirm on hardware.
+
+## SRAM PUF fail-closed round (written without compiling)
+Fixes the issue that a PUF failure could silently produce a plain / unbound seed record.
+* `vault::open(flash, create_plain)`: with the PUF required a blank vault stays blank and the first record is created
+  PUF-bound in `HardenPersist::new` (no plain seed ever reaches flash).
+* `new`: required + no key -> locked, `puf::set_fault(true)`. Boot-time bind failure (`Kept`/`NoKey`/`Unknown`) -> locked.
+* `incr_pin_fails` refuses before counting while the vault is closed or the PUF key is missing (a "refund" via `finish_try` would have forgiven earlier failures = counter bypass; removed); `set_pin` refuses without the key.
+* `reset`: refused before any write (no marker) unless the PUF can be (re-)enrolled; `init` no longer panics the boot when
+  only the PUF blocks a pending reset.
+* LED: 3 short blinks + pause while `puf::fault()`.
+* [ ] Build and test: blank first boot, enrolment failure (non-POR first boot), noisy sample with an unbound record,
+  noisy sample with a PUF-bound record, reset with and without a power-on reset, a flash write failure during binding.

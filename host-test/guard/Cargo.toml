@@ -4,12 +4,15 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
-# Host-side tests of src/ram_guard.rs and src/store.rs (no hardware, no Embassy).
+# Host-side tests of src/ram_guard.rs, src/store.rs and src/wrap.rs (no hardware, no Embassy).
 [workspace]
 
 [dependencies]
 rand_core = "0.6"
 rand_chacha = "0.3"
 sha2 = "0.10"
+hmac = "0.12"
+subtle = "2"
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 zeroize_derive = "=1.4.2"  # only needed with Cargo < 1.85 (1.5 needs edition 2024)
