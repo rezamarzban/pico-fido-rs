@@ -42,7 +42,8 @@ Every registration and every sign-in needs a **new** press. Holding the button b
 release it, then press again.
 
 LED: fast blink (200 ms on/off) = ready; very fast flicker = busy (or the browser asked the key to "wink");
-almost solid = waiting for your button press.
+almost solid = waiting for your button press; **3 short blinks, then a pause = the key's SRAM PUF is unavailable and the
+key is locked** (unplug it for about 10 seconds and plug it in again; if it persists, see `SECURITY.md`).
 
 ## 5. Things to know
 - **"Hardware failure" when entering the PIN:** with the SRAM PUF the key is re-read from RAM at power-up. If the pattern

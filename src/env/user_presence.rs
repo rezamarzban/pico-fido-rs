@@ -70,6 +70,11 @@ impl UserPresence for PicoUserPresence {
             }
             // OpenSK wants packets that arrive during the wait (e.g. CTAPHID_CANCEL, a new INIT).
             if let Ok(received) = IN_CH.try_receive() {
+                // A reset between the check at the top and this dequeue: old-session packet.
+                if op_cancelled() {
+                    self.released = false;
+                    return Ok((Err(UserPresenceError::Canceled), RecvStatus::Timeout));
+                }
                 *packet = received;
                 return Ok((
                     Err(UserPresenceError::Timeout),

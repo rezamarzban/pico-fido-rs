@@ -21,6 +21,7 @@ use defmt::{info, warn};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use portable_atomic::{AtomicBool, Ordering};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::keys::{fill_random, Fl};
@@ -47,6 +48,19 @@ const _: () = core::assert!(IMG_LEN <= PUF_BYTES);
 /// CHIP_RESET register (VREG_AND_CHIP_RESET + 0x08), bit 8 = HAD_POR.
 const CHIP_RESET: *const u32 = 0x4006_4008 as *const u32;
 const HAD_POR: u32 = 1 << 8;
+
+/// Set whenever the PUF is required (`sram_puf`) but its key is not available, or a record that
+/// depends on it cannot be used. The LED blinker shows it (3 short blinks, pause) until the
+/// condition is cleared by a boot / reset that has a working key.
+static FAULT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_fault(on: bool) {
+    FAULT.store(on, Ordering::Relaxed);
+}
+
+pub fn fault() -> bool {
+    FAULT.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, defmt::Format)]
 pub enum Status {
@@ -165,18 +179,23 @@ impl Puf {
         self.status
     }
 
-    /// The secret and the number of disagreeing bits, if this boot's sample decodes.
-    fn try_decode(&self) -> Option<([u8; 16], u32)> {
-        let mut r = [0u8; CODE_BYTES];
+    /// True when built with `sram_puf`: then no seed record may exist without PUF binding.
+    pub fn required(&self) -> bool {
+        self.status != Status::Disabled
+    }
+
+    /// The secret, if this boot's sample decodes. The secret is returned in a `Zeroizing`
+    /// wrapper, so callers that only test `is_some()` still wipe it when the value is dropped.
+    fn try_decode(&self) -> Option<Zeroizing<[u8; 16]>> {
+        let mut r = Zeroizing::new([0u8; CODE_BYTES]);
         read_sample(&mut r);
         for (x, w) in r.iter_mut().zip(&self.helper) {
             *x ^= w;
         }
-        let (mut s, errors) = decode(&r);
-        r.zeroize();
-        let mut chk = mac(&s, b"sram-puf-check-v1");
+        let (s, errors) = decode(&r);
+        let s = Zeroizing::new(s);
+        let chk = Zeroizing::new(mac(&s, b"sram-puf-check-v1"));
         let ok = bool::from(chk[..CHECK_LEN].ct_eq(&self.check));
-        chk.zeroize();
         info!(
             "puf: {} bit errors of {} ({} per mille), check {}",
             errors,
@@ -185,9 +204,8 @@ impl Puf {
             ok
         );
         if ok {
-            Some((s, errors))
+            Some(s)
         } else {
-            s.zeroize();
             None
         }
     }
@@ -198,10 +216,8 @@ impl Puf {
         if !matches!(self.status, Status::Ready | Status::Noisy) {
             return None;
         }
-        let (mut s, _) = self.try_decode()?;
-        let k = Zeroizing::new(mac(&s, b"sram-puf-key-v1"));
-        s.zeroize();
-        Some(k)
+        let s = self.try_decode()?;
+        Some(Zeroizing::new(mac(&s, b"sram-puf-key-v1")))
     }
 
     /// Enrols (or re-enrols, destroying the old helper) from the current RAM sample. Only on a
@@ -225,7 +241,7 @@ impl Puf {
         }
         let mut s = [0u8; 16];
         fill_random(&mut s);
-        let c = encode(&s);
+        let c = Zeroizing::new(encode(&s));
         let mut img = [0u8; IMG_LEN];
         img[..4].copy_from_slice(&MAGIC);
         let chk = mac(&s, b"sram-puf-check-v1");

@@ -18,7 +18,7 @@ impl Sectors for Mock {
     fn tries_mark(&mut self, p: usize, v: u8) -> Result<(), ()> { self.t[p] &= v; Ok(()) }
     fn tries_clear(&mut self) -> Result<(), ()> { self.t = [0xFF; TRIES_PAGES]; Ok(()) }
 }
-fn wrapped() -> Record { Record { wrapped: true, m_kib: 64, t_cost: 3, salt: [5; 16], body: [6; 32], tag: [7; 32] } }
+fn wrapped() -> Record { Record { wrapped: true, puf: false, m_kib: 64, t_cost: 3, salt: [5; 16], body: [6; 32], tag: [7; 32] } }
 
 #[test]
 fn old_plain_record_wiped_normally() {

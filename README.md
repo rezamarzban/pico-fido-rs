@@ -34,7 +34,8 @@ The **last 92 KiB** of flash are kept out of the linker's FLASH region (`build.r
 * the **76 KiB** below that (19 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store.
 
 With the `sram_puf` feature (default) `build.rs` also takes the first 512 bytes of RAM out of the linker's RAM: no
-section, heap or stack ever touches them, they are only read at start-up.
+section, heap or stack ever touches them. The PUF samples this region at start-up and again every time the PUF secret is
+reconstructed (PIN checks, set PIN, reset), so nothing may ever write to it.
 
 `build.rs` derives everything from the single `flash_*` feature, so firmware, store and vault cannot overlap.
 The store lost one page to the PUF sector, so an existing device **reformats its key-value store** on the first boot of
@@ -62,15 +63,16 @@ Enable **exactly one** `flash_*` feature (`flash_2m`, `flash_4m`, `flash_8m`, `f
 matches your board; do not use `--all-features`. `usb_serial` adds the flash unique ID as the USB serial number
 (off by default: it lets hosts recognise the device across connections).
 
-**Commit `Cargo.lock`.** There is none in this tree; without it every build resolves the newest crates and a future
-release can break a working build. Generate it with a successful build and commit it.
+**Commit `Cargo.lock`.** There is none in this tree (it needs a successful build to generate); without it every build resolves
+the newest crates, so the same source can produce different firmware at different times. Generate it with a successful build and
+commit it; `build.sh` then builds `--locked` only.
 
 ### One-command UF2 build (`build.sh`)
 `bash build.sh [-s 2|4|8|16] [-u] [-t TOOLCHAIN] [-r REPO_URL] [-b BRANCH] [-o OUT_DIR]` clones the repository,
 fetches OpenSK at the pinned commit (or the submodule commit), installs the toolchain and `elf2uf2-rs`, builds with
 the right `--features` (`-s` flash size in MiB, `-u` adds the USB serial number) and writes
 `out/pico-fido-rs-<N>m.uf2`. Hold BOOTSEL while plugging in and copy the file to the `RPI-RP2` drive. It builds the
-*committed* revision of the repository. **The default `-b` is `main`**, which holds the earliest custom firmware (no `flash_*` features), so the script stops with an error: always pass `-b openSK-based-se2`. This script itself was only syntax-checked; the maintainer's Colab build
+*committed* revision of the repository. **The default `-b` is `openSK-based-se3`** (this branch); pass `-b` to build another branch. With a committed `Cargo.lock` the script builds with `--locked` only and fails instead of resolving newer crates; without one it warns and builds unlocked. This script itself was only syntax-checked; the maintainer's Colab build
 (same toolchain and features) is what was run on hardware.
 
 ## U2F attestation
@@ -91,15 +93,29 @@ credentials are encrypted under keys derived from the master. The PIN retry coun
 
 ## SRAM PUF
 `src/puf.rs`. The power-up pattern of 496 reserved RAM bytes is turned into a device-bound key by a fuzzy extractor
-(128-bit secret, 31x repetition code, helper data + 8-byte check in the PUF sector). The key is derived on demand and
-never kept in RAM. It is mixed into the Argon2 password (`HMAC(K_puf, PIN hash)`) and masks the seed of a no-PIN
+(128-bit secret, 31x repetition code, helper data + 8-byte check in the PUF sector). The key is reconstructed on demand and never stored; it exists in RAM only while it is used, in `Zeroizing` buffers that are wiped when
+their lifetime ends (including the temporary secret of the helper-data check). It is mixed into the Argon2 password (`HMAC(K_puf, PIN hash)`) and masks the seed of a no-PIN
 record, so **a copy of the flash alone no longer allows offline PIN guessing or recovering the seed**. Records written
 by an older build are bound automatically (no-PIN: at boot; PIN set: after the next correct PIN, one extra Argon2
 run). First boot enrols the PUF (needs a power-on reset, i.e. plugging the Pico in). Every boot logs the measured
 bit errors (`puf: N bit errors of 3968`): read them over RTT on your chip before trusting it. If the key cannot be
 recovered (power-up pattern too noisy, RAM still charged from a quick unplug), the PIN dialog fails with a hardware
-error that is **not** counted as a wrong PIN: unplug for about 10 s and retry. Build with `-P` / without `sram_puf` to
-disable it. **It does not protect against anyone who can run code on the device (BOOTSEL, SWD)**: see `SECURITY.md`.
+error that is **not** counted as a wrong PIN: unplug for about 10 s and retry.
+
+**Fail closed.** With `sram_puf` the key is required. A PUF failure never results in a plain or unbound seed record or
+PIN record: a blank vault is only ever initialised with a PUF-bound seed (no plain seed touches flash first), an
+existing unbound record is used only once it can be bound, `set_pin` refuses without the key, and a CTAP reset is
+refused (nothing touched, no reset marker) unless the PUF can be (re-)enrolled on a power-on reset. A failed binding
+of an existing record also locks the device (the correct PIN is accepted as such but does not unlock; the binding is
+retried on the next entry). **A blank helper sector is not treated as "new device" when the vault already holds a PUF-bound
+record (or is damaged / unreadable):** the firmware then does not enrol (that would create a different PUF secret and orphan the
+seed), stays locked and shows the LED fault pattern until a CTAP reset on a power-on reset re-enrols. PUF-bound records carry an
+HMAC tag over the masked seed, so a wrong PUF key can never yield a wrong seed silently (records from older builds without the tag
+are accepted once and re-sealed at the next boot with a working key). A power cut inside a CTAP reset, after the helper was
+re-enrolled but before the new record was written, leaves the old record unusable with the new key: it stays locked (LED) and a second
+CTAP reset repairs it. While the key is unavailable no PIN attempt is counted and the retry counter is not touched. The device stays locked and the **LED shows the fault pattern: 3 short blinks, then a pause**, until a
+boot with a working key. Boot does not panic on a postponed reset. The only way out without a working PUF is a build
+without `sram_puf` (`build.sh -P`), which cannot read a PUF-bound record: that case is also reported by the LED. **It does not protect against anyone who can run code on the device (BOOTSEL, SWD)**: see `SECURITY.md`.
 
 **Consequences:** after every USB reset the PIN must be entered once before *any* credential-ID operation works,
 including U2F and `uv=discouraged` assertions. Without a PIN the seed is stored unwrapped in flash (masked by the SRAM PUF when that is enabled, see below). `T_COST` is untuned:
@@ -120,7 +136,8 @@ ADC noise, timer jitter, conditioned pool -> SHA-256) and reseeded about once a 
 USB reset, suspend, disable and deconfigure call `env::hid::cancel_all()`: it bumps an epoch, forgets the seed
 (with a PIN set) and flushes both queues. The user-presence wait, packet waits and `send` check the epoch, so a
 pending button wait ends within 5 ms with `Canceled`, a late button press or a packet of the new session cannot
-complete the old operation, and the cancelled operation's responses are dropped. The main loop then calls
+complete the old operation (a packet that was dequeued just before the reset is discarded, and every operation is stamped with the epoch under
+which its packet arrived, not with the epoch at the time it starts), and the cancelled operation's responses are dropped. The main loop then calls
 `Ctap::cancel_in_flight()` (patch below). A signature already being computed cannot be interrupted; its result is
 discarded.
 
@@ -133,7 +150,7 @@ Re-check it whenever `OPENSK_REV` changes.
 
 ## Tests
     sh host-test/run.sh     # OpenSK's own library unit tests (the protocol logic), run on the host
-                            # + host-test/guard: ram_guard and vault (store.rs) unit tests
+                            # + host-test/guard: ram_guard, vault (store.rs) and wrap (PIN wrap, Argon2 bounds, PUF-masked record) unit tests
 
 The earlier host tests (custom CBOR, CTAPHID, PIN, key store, python-fido2 end-to-end) tested code that no longer
 exists and were removed. **Nothing in this repository tests `src/env/*`, the USB bridge or the executor split**:

@@ -24,7 +24,7 @@ pub static OUT_CH: Channel<CriticalSectionRawMutex, HidPacket, QUEUE> = Channel:
 // ---- cancellation -----------------------------------------------------------------------------
 //
 // USB reset / suspend / disable / deconfigure bump CANCEL_EPOCH (`cancel_all`). The main loop
-// stamps every CTAP operation with the epoch it started in (`begin_op`). Anything that blocks
+// stamps every CTAP operation with the epoch it started in (`begin_op_at`). Anything that blocks
 // (user-presence wait, packet waits, sends) compares the two and gives up at once, and `send`
 // silently drops every packet of a cancelled operation, so nothing stale reaches the next host
 // session. A signature that is already being computed cannot be interrupted, but its response is
@@ -38,14 +38,16 @@ pub fn epoch() -> u32 {
     CANCEL_EPOCH.load(Ordering::Acquire)
 }
 
-/// Marks the start of a CTAP operation; returns its epoch.
-pub fn begin_op() -> u32 {
-    let e = epoch();
+/// Marks the start of a CTAP operation that belongs to epoch `e` (the epoch under which its
+/// packet was dequeued). If a reset advanced the epoch meanwhile, the operation is cancelled from
+/// its first instruction on (`op_cancelled` is true at once) instead of silently adopting the
+/// new epoch.
+pub fn begin_op_at(e: u32) -> u32 {
     OP_EPOCH.store(e, Ordering::Release);
     e
 }
 
-/// True once the operation started by the last `begin_op` has been cancelled.
+/// True once the operation started by the last `begin_op_at` has been cancelled.
 pub fn op_cancelled() -> bool {
     epoch() != OP_EPOCH.load(Ordering::Acquire)
 }
@@ -73,6 +75,11 @@ pub fn recv_packet(buf: &mut HidPacket, timeout_ms: Option<usize>) -> bool {
             return false;
         }
         if let Ok(packet) = IN_CH.try_receive() {
+            // Cancelled between the check above and the dequeue: the packet is from the old
+            // session, drop it.
+            if op_cancelled() {
+                return false;
+            }
             *buf = packet;
             return true;
         }
@@ -92,6 +99,11 @@ pub fn wait_packet(buf: &mut HidPacket, timeout_ms: Option<usize>, seen: u32) ->
             return false;
         }
         if let Ok(packet) = IN_CH.try_receive() {
+            // A reset may have landed between the check above and the dequeue: such a packet
+            // belongs to the old session and must not be processed.
+            if epoch() != seen {
+                return false;
+            }
             *buf = packet;
             return true;
         }

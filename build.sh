@@ -7,7 +7,7 @@
 #   -P  build WITHOUT the SRAM PUF (default: with; the `sram_puf` feature)
 #   -t  Rust nightly to use (default: nightly-2026-06-03, the one OpenSK pins, then `nightly`)
 #   -r  repository URL   (default https://github.com/rezamarzban/pico-fido-rs)
-#   -b  branch           (default main)
+#   -b  branch           (default openSK-based-se3)
 #   -o  output directory (default ./out)
 # Environment: OPENSK_URL / OPENSK_REV override where and which OpenSK commit is fetched
 #   (default: google/OpenSK at the commit in third_party/OPENSK_REV).
@@ -19,7 +19,7 @@ SERIAL=0
 PUF=1
 TOOLCHAIN=""
 REPO="https://github.com/rezamarzban/pico-fido-rs"
-BRANCH="main"
+BRANCH="openSK-based-se3"
 OUT_DIR="$PWD/out"
 OPENSK_URL="${OPENSK_URL:-https://github.com/google/OpenSK.git}"
 
@@ -119,8 +119,14 @@ BUILT=""
 for t in "${CANDIDATES[@]}"; do
   echo; echo "=== Trying $t ==="
   rustup toolchain install "$t" --profile minimal -c rust-src -c llvm-tools -t thumbv6m-none-eabi || continue
-  if cargo "+$t" build --release --locked --no-default-features --features "$FEATURES" \
-     || cargo "+$t" build --release --no-default-features --features "$FEATURES"; then
+  # With a committed Cargo.lock the build must use exactly it; without one, warn and resolve.
+  if [ -f Cargo.lock ]; then
+    LOCK_ARGS=(--locked)
+  else
+    echo "warning: no Cargo.lock in the repository: dependencies are resolved now and the build is NOT reproducible" >&2
+    LOCK_ARGS=()
+  fi
+  if cargo "+$t" build --release ${LOCK_ARGS[@]+"${LOCK_ARGS[@]}"} --no-default-features --features "$FEATURES"; then
     BUILT="$t"; break
   fi
 done

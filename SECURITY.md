@@ -17,8 +17,11 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   *SRAM PUF* below). The RP2040 has
   no secure storage, no flash encryption and no OTP key area, and the USB bootloader or SWD can read the whole
   flash. A secure element that signs internally would keep the key out of flash, but is not a complete fix: the ATECC608 used in the `atecc-*` branches, for example, has no user-presence check, so anyone with access to its bus can still request signatures.
-* **Offline PIN guessing on a flash dump, when a PIN is set.** The seed is wrapped with Argon2id (64 KiB), but the
-  RP2040 can only afford a small cost, so a short PIN falls quickly to a GPU/ASIC attacker. Use a long passphrase.
+* **Offline PIN guessing, when a PIN is set and the attacker has the PUF secret or the PUF is off.** With the default SRAM PUF
+  working, a flash-only dump does not contain the PUF-derived value mixed into the Argon2 password, so guesses cannot be tested
+  offline. If the PUF is disabled (`build.sh -P`) or its secret is obtained (code execution on the device: BOOTSEL, SWD), guessing
+  is limited only by Argon2id (64 KiB), which the RP2040 can only afford at a small cost: a short PIN then falls quickly to a
+  GPU/ASIC attacker. Use a long passphrase.
 * **Short PINs.** The firmware requires at least 10 code points because of the point above; use a long
   passphrase.
 * **Reading RAM** (debugger/SWD): the RP2040 has no debug lockout. The RAM guard (below) only raises the cost of
@@ -43,7 +46,9 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   user-presence wait, packet waits and `send`), forget the seed when a PIN is set, drop queued packets and let
   OpenSK forget pending state (`Ctap::cancel_in_flight`). A signature that is already being computed finishes, but
   nothing is sent. One response packet that the USB task had already taken from the queue may still go out; it
-  carries the old channel ID, which a new host session ignores.
+  carries the old channel ID, which a new host session ignores. A request packet that was dequeued just before a reset is
+  dropped (checked after the dequeue in the main loop, the packet waits and the user-presence wait), and each operation is stamped
+  with the epoch of its packet.
 * **Attestation.** `use_batch_attestation` is off: FIDO2 registrations use self attestation. U2F registration needs
   an attestation key provisioned with OpenSK's tools; none is shipped.
 * **USB serial number** (flash unique ID) is only present when built with `usb_serial`; it lets hosts correlate the
@@ -74,6 +79,9 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   by default).
 * Not protected: RAM while a session is open, side channels, fault injection; the RNG is the ROSC
   (not a certified TRNG).
+* **PIN retry counter, full sector:** after the counter sector has filled up, the next attempt erases it and re-writes the pending
+  failures; a power cut inside that window loses the count of the failures before it. Needs physical control of the USB power and
+  exact timing; not mitigated (it would need a second counter sector).
 * Reflash with a full flash erase: the layout moved (vault at the end, store 12 KiB lower).
 * An interrupted setPIN (power cut between the vault write and the PIN record) can leave a state that only a CTAP
   reset fixes. A damaged vault makes the device refuse to work until a reset.
@@ -99,8 +107,20 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   pattern). Enrolment is only done on a power-on reset and checks that the sample is roughly balanced; recovery is
   attempted every boot and verified by the check. If it fails, the PIN dialog errors out without counting a wrong PIN:
   unplug for about 10 s. After a UF2 reflash the bootloader may have overwritten the reserved RAM; same remedy.
+* **Fail closed:** with `sram_puf` the key is required. If it is unavailable the device locks and the LED blinks 3
+  short blinks + pause. Nothing is created, bound, wrapped or reset in that state: a blank vault is initialised only
+  with a PUF-bound seed, `set_pin` is refused, a CTAP reset is refused unless the PUF can be (re-)enrolled on a
+  power-on reset, and an existing unbound record is used only after it has been bound (an unbound record plus an
+  unavailable key locks the device instead of running unbound). In these states the retry counter is not touched (no attempt counted, none forgiven: a refund would call
+  `finish_try`, which forgives earlier failures and would let anyone who can make the key unavailable reset the counter).
+* **Missing helper data is not "new device":** a blank or damaged helper sector with an existing PUF-bound (or unreadable)
+  vault record never triggers enrolment. A new PUF secret would orphan the seed (and, before the record tag existed, silently
+  yield a wrong seed). The device stays locked with the LED fault pattern; a CTAP reset on a power-on reset re-enrols. The helper
+  sector is a single copy: a power cut inside a CTAP reset after re-enrolment but before the new record is durable leaves the
+  old record unusable; a second CTAP reset repairs it.
 * **Failure modes:** a PUF-bound record with an unrecoverable key stays locked until the key returns or a CTAP reset
-  (which re-enrols, needs a power-on reset). A power cut during the one-time enrolment write leaves a damaged helper
+  (which re-enrols, needs a power-on reset). A chip whose SRAM pattern is unusable can only run a build without
+  `sram_puf`, and then loses PUF-bound records. A power cut during the one-time enrolment write leaves a damaged helper
   sector: CTAP reset repairs it. Build with `sram_puf` off (`build.sh -P`) to run without it.
 
 ## RAM guard (`src/ram_guard.rs`, `src/guard.rs`)
