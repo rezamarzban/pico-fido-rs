@@ -42,6 +42,18 @@ available when the fixes were written): build, `cargo clippy`, `sh host-test/run
 | extra | LED fault flag was cleared at the start of a reset even if the reset later failed | Fixed. Cleared only after a completed reset. |
 | extra | `build.sh` fell back to an unlocked build and defaulted to the wrong branch | Fixed. |
 | extra | Host test `vault.rs` did not compile (`Record` literal without `puf`) | Fixed; `wrap.rs` is now covered by host tests. |
+| se3 review 2 | Migration continued although the older record could not be wiped | Fixed: lock + fault (unbound bind, legacy re-seal, PIN bind); `vault::open` locks with the PUF required. |
+| se3 review 2 | Legacy re-seal failure (`Kept`) kept using the untagged record | Fixed: fail closed until the tagged record is durable. |
+| se3 review 2 | Response enqueue could race `cancel_all` | Fixed with a critical section around check + enqueue. The incoming side cannot be tagged with an arrival epoch (see SECURITY.md). |
+| se3 review 2 | `fail_closed()` did not show the LED | Fixed: `fail_closed()` sets the fault. |
+| se3 review 2 | Any `Store::new()` error formatted the store | Fixed: only `InvalidStorage` formats. |
+| se3 review 2 | Failed PIN-record re-wrap (`wrap()` = None) still reported unlock | Fixed: seed cleared, fault, hardware failure. |
+| se3 review 3 | General faults were conflated with the PUF-key fault that makes `init` postpone a reset | Fixed: separate `SEC_FAULT` flag; LED shows either. |
+| se3 review 3 | Incoming USB read could complete after a reset | Mitigated: read restarted via `RESET_SIG`, epoch re-checked on completion. |
+| se3 review 3 | `set_pin` left a PIN-wrapped vault without PIN metadata when the old record could not be wiped | Fixed: metadata written, error reported afterwards. |
+| se3 review 4 | Stale endpoint data after suspend/deconfigure could reach the new read | Mitigated: endpoint drained after the reset signal (2 ms quiet time). Hardware test open. |
+| se3 review 4 | A failed pending reset in `init()` aborted the boot (`CtapState::new` unwraps) | Fixed: lock + fault, marker kept, retried next boot. |
+| se3 review 4 | `ctap.rs` comment indentation (rustfmt) | Fixed. |
 | open | PUF helper is a single sector (power cut mid-reset needs a second reset); PIN counter erase window when its sector is full | Documented in SECURITY.md; would need extra flash sectors. |
 | open | No `Cargo.lock` | Needs a successful build to generate. |
 

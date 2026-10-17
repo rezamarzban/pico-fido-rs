@@ -27,8 +27,14 @@ jobs:
           toolchain: ${{ env.NIGHTLY }}
           targets: thumbv6m-none-eabi
           components: rust-src, llvm-tools
-      - run: cargo build
-      - run: cargo build --release
+      # Cargo.lock is not in the repository yet: use it (--locked) as soon as it is committed.
+      - name: Locked builds when Cargo.lock exists
+        shell: bash
+        run: if [ -f Cargo.lock ]; then echo "LOCKED=--locked" >> "$GITHUB_ENV"; else echo "::warning::no Cargo.lock committed - build is not reproducible"; fi
+      - shell: bash
+        run: cargo build $LOCKED
+      - shell: bash
+        run: cargo build --release $LOCKED
   host-tests:
     name: Host tests (OpenSK library unit tests)
     runs-on: ubuntu-latest
@@ -53,7 +59,7 @@ jobs:
           targets: thumbv6m-none-eabi
           components: rust-src, llvm-tools, clippy
       # no --all-features: the flash_* features are mutually exclusive
-      - run: cargo clippy -- --deny=warnings
+      - run: if [ -f Cargo.lock ]; then L=--locked; fi; cargo clippy $L -- --deny=warnings
   formatting:
     name: Formatting
     runs-on: ubuntu-latest
