@@ -19,7 +19,7 @@ SERIAL=0
 PUF=1
 TOOLCHAIN=""
 REPO="https://github.com/rezamarzban/pico-fido-rs"
-BRANCH="openSK-based-se3"
+BRANCH="openSK-based-se4"
 OUT_DIR="$PWD/out"
 OPENSK_URL="${OPENSK_URL:-https://github.com/google/OpenSK.git}"
 

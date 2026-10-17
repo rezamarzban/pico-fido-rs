@@ -72,7 +72,7 @@ impl Storage for FlashStorage {
         10000
     }
 
-    fn read_slice(&self, index: StorageIndex, length: usize) -> StorageResult<Cow<[u8]>> {
+    fn read_slice(&self, index: StorageIndex, length: usize) -> StorageResult<Cow<'_, [u8]>> {
         let offset = Self::offset(&index, length)?;
         // SAFETY: the range was checked to lie inside the store area of the memory-mapped flash.
         let bytes = unsafe { core::slice::from_raw_parts((XIP_BASE + offset) as *const u8, length) };

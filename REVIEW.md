@@ -54,6 +54,8 @@ available when the fixes were written): build, `cargo clippy`, `sh host-test/run
 | se3 review 4 | Stale endpoint data after suspend/deconfigure could reach the new read | Mitigated: endpoint drained after the reset signal (2 ms quiet time). Hardware test open. |
 | se3 review 4 | A failed pending reset in `init()` aborted the boot (`CtapState::new` unwraps) | Fixed: lock + fault, marker kept, retried next boot. |
 | se3 review 4 | `ctap.rs` comment indentation (rustfmt) | Fixed. |
+| se4 review | 17 clippy warnings (`Cow<[u8]>` lifetime, `&**k`, `% n == 0`, doc lists) | Fixed (not re-run: no toolchain here). |
+| se4 review | Ignored `enroll()` result in `reset`; ignored `finish_try` result | `enroll()` failure now logged, `finish_try` failure logged (the attempt stays counted, which is the safe direction; it does not lose a try). |
 | open | PUF helper is a single sector (power cut mid-reset needs a second reset); PIN counter erase window when its sector is full | Documented in SECURITY.md; would need extra flash sectors. |
 | open | No `Cargo.lock` | Needs a successful build to generate. |
 

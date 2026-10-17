@@ -8,6 +8,7 @@
 //!   probability p = 2^-1, and the cutoff is 1 + the smallest c with P(Binomial(512, 1/2) > c)
 //!   <= 2^-20, which is 311 (SP 800-90B, table for W = 512). 410 would correspond to only
 //!   H = 0.5 bit per byte, a much weaker assumption than the one documented here.
+//!
 //! Additionally, two identical consecutive 64-byte samples are a failure; this catches a source
 //! frozen on a non-uniform pattern, which the two tests above cannot see.
 //!

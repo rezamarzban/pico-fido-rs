@@ -8,6 +8,7 @@
 //!   `body` is masked with the PUF key and `tag` authenticates it (all-zero tag = older record without it).
 //! * `wrapped = 1`: `body` is the master key encrypted under a key derived from the PIN
 //!   (wrap.rs), `tag` authenticates it. The plain key is NOT in flash.
+//!
 //! The older 56-byte "FK02" record (plain key only) is still read, and replaced on the next write.
 //!
 //! Rules:
