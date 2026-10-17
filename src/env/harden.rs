@@ -133,7 +133,8 @@ fn hw_fail() -> Ctap2StatusCode {
 /// Marks a PIN attempt as done (forgives earlier failures). A failure is logged; the attempt then
 /// simply stays counted, which is the safe direction.
 fn finish_try_logged(v: &mut FlashVault, page: usize) {
-    if v.finish_try(page).is_err() {
+    // One retry for a transient flash error, like `clear_tries_checked`.
+    if v.finish_try(page).is_err() && v.finish_try(page).is_err() {
         warn!("vault: could not mark the PIN attempt as done; it stays counted");
     }
 }
@@ -185,7 +186,10 @@ impl HardenPersist {
             if bound_or_unknown {
                 error!("puf: helper data missing but the vault holds a PUF-bound or unreadable record - not enrolling");
             } else {
-                puf.enroll();
+                if !puf.enroll() {
+                    // `enroll` logged the reason (not a power-on reset, unusable RAM sample, ...).
+                    warn!("puf: first-boot enrolment did not happen - device stays locked");
+                }
             }
         }
         let key = puf.key();
