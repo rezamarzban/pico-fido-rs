@@ -291,7 +291,13 @@ impl Puf {
         } else {
             Status::Noisy
         };
-        info!("puf: enrolled, status {}", self.status);
-        self.status == Status::Ready
+        if self.status == Status::Ready {
+            info!("puf: enrolled, status {}", self.status);
+            true
+        } else {
+            // The helper data was written, but this very sample does not decode: no usable key.
+            warn!("puf: helper written but the key cannot be reconstructed, status {}", self.status);
+            false
+        }
     }
 }
