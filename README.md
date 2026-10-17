@@ -111,7 +111,10 @@ retried on the next entry). **A blank helper sector is not treated as "new devic
 record (or is damaged / unreadable):** the firmware then does not enrol (that would create a different PUF secret and orphan the
 seed), stays locked and shows the LED fault pattern until a CTAP reset on a power-on reset re-enrols. PUF-bound records carry an
 HMAC tag over the masked seed, so a wrong PUF key can never yield a wrong seed silently (records from older builds without the tag
-are accepted once and re-sealed at the next boot with a working key). A power cut inside a CTAP reset, after the helper was
+are accepted once and re-sealed at the next boot with a working key). A migration (binding an old unbound or untagged record to the PUF) counts as done only when the older record is confirmed wiped and the new
+one is durable; otherwise the device locks with the LED fault pattern and the next boot retries (with the PUF required, `vault::open`
+also locks while an older record cannot be wiped). Every locked state shows the fault pattern. A pending reset that fails at boot for any reason other than the missing PUF key no longer aborts the boot: the device stays locked
+(LED fault pattern), the marker stays and the next boot repeats the reset. A power cut inside a CTAP reset, after the helper was
 re-enrolled but before the new record was written, leaves the old record unusable with the new key: it stays locked (LED) and a second
 CTAP reset repairs it. While the key is unavailable no PIN attempt is counted and the retry counter is not touched. The device stays locked and the **LED shows the fault pattern: 3 short blinks, then a pause**, until a
 boot with a working key. Boot does not panic on a postponed reset. The only way out without a working PUF is a build

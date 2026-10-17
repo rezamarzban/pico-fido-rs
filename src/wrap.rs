@@ -55,7 +55,7 @@ fn password(pin_hash: &[u8; 16], puf: Option<&[u8; 32]>) -> (Zeroizing<[u8; 32]>
 }
 
 fn kdf(password: &[u8], salt: &[u8; 16], m_kib: u32, t: u8) -> Option<[u8; 64]> {
-    if !(8..=MAX_M_KIB).contains(&m_kib) || m_kib % 4 != 0 || !(1..=MAX_T_COST).contains(&t) {
+    if !(8..=MAX_M_KIB).contains(&m_kib) || !m_kib.is_multiple_of(4) || !(1..=MAX_T_COST).contains(&t) {
         return None;
     }
     let params = Params::new(m_kib, t as u32, 1, Some(64)).ok()?;

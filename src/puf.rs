@@ -35,7 +35,9 @@ const SEC_BITS: usize = 128;
 const REP: usize = 31;
 const CODE_BITS: usize = SEC_BITS * REP; // 3968
 const CODE_BYTES: usize = CODE_BITS / 8; // 496
-const _: () = core::assert!(CODE_BITS % 8 == 0 && CODE_BYTES <= REGION_BYTES && CODE_BYTES % 4 == 0);
+const _: () = core::assert!(
+    CODE_BITS.is_multiple_of(8) && CODE_BYTES <= REGION_BYTES && CODE_BYTES.is_multiple_of(4)
+);
 
 /// Flash sector holding the helper data (just below the vault; carved from the key-value store).
 const OFFSET: u32 = (FLASH_SIZE - VAULT_BYTES - PUF_BYTES) as u32;
@@ -60,6 +62,20 @@ pub fn set_fault(on: bool) {
 
 pub fn fault() -> bool {
     FAULT.load(Ordering::Relaxed)
+}
+
+/// Any other locked state (damaged / unknown vault, failed migration, ...). Shown by the LED like
+/// `fault()` but kept apart: `HardenPersist::init` only postpones a pending reset for `fault()`
+/// (PUF key unavailable), never for this one.
+static SEC_FAULT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_sec_fault(on: bool) {
+    SEC_FAULT.store(on, Ordering::Relaxed);
+}
+
+/// What the LED shows: either condition.
+pub fn led_fault() -> bool {
+    fault() || SEC_FAULT.load(Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, defmt::Format)]
@@ -275,7 +291,13 @@ impl Puf {
         } else {
             Status::Noisy
         };
-        info!("puf: enrolled, status {}", self.status);
-        self.status == Status::Ready
+        if self.status == Status::Ready {
+            info!("puf: enrolled, status {}", self.status);
+            true
+        } else {
+            // The helper data was written, but this very sample does not decode: no usable key.
+            warn!("puf: helper written but the key cannot be reconstructed, status {}", self.status);
+            false
+        }
     }
 }

@@ -48,7 +48,11 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   nothing is sent. One response packet that the USB task had already taken from the queue may still go out; it
   carries the old channel ID, which a new host session ignores. A request packet that was dequeued just before a reset is
   dropped (checked after the dequeue in the main loop, the packet waits and the user-presence wait), and each operation is stamped
-  with the epoch of its packet.
+  with the epoch of its packet. A response is checked and enqueued as one step with respect to the reset handler (critical
+  section), so a reset cannot flush the queue in between. The USB task abandons its pending endpoint read on a reset (signal) and drops a packet whose read
+  completed across an epoch change; the first packet of the new session is accepted because the read is restarted. After a reset, suspend or deconfigure the USB task also reads and discards
+  whatever the endpoint still holds (until nothing arrives for 2 ms), so old-session data cannot be delivered to the new read. Residual: a
+  genuine packet of the new session that arrives within that 2 ms is dropped (the host retries INIT). Needs a hardware test.
 * **Attestation.** `use_batch_attestation` is off: FIDO2 registrations use self attestation. U2F registration needs
   an attestation key provisioned with OpenSK's tools; none is shipped.
 * **USB serial number** (flash unique ID) is only present when built with `usb_serial`; it lets hosts correlate the
@@ -118,6 +122,13 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   yield a wrong seed). The device stays locked with the LED fault pattern; a CTAP reset on a power-on reset re-enrols. The helper
   sector is a single copy: a power cut inside a CTAP reset after re-enrolment but before the new record is durable leaves the
   old record unusable; a second CTAP reset repairs it.
+* **Migration is not "protected" until the old record is gone:** binding an old unbound/untagged record (or a PIN record) to the PUF
+  locks the device if the older record could not be wiped (and, with the PUF required, `vault::open` refuses a vault whose older
+  record cannot be wiped). Software cannot erase flash that cannot be written: that case stays locked rather than claiming protection.
+* **set_pin with an unwipable older record:** the new record and the PIN metadata are both written, then an error is returned; the
+  device then needs the older record wiped (next boot retries; with the PUF required the vault stays locked until then).
+* **Key-value store:** only a store reported as invalid (foreign, older layout or corrupt: indistinguishable) is formatted; flash I/O
+  and other errors stop the boot without erasing credentials or a pending reset marker.
 * **Failure modes:** a PUF-bound record with an unrecoverable key stays locked until the key returns or a CTAP reset
   (which re-enrols, needs a power-on reset). A chip whose SRAM pattern is unusable can only run a build without
   `sram_puf`, and then loses PUF-bound records. A power cut during the one-time enrolment write leaves a damaged helper

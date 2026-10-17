@@ -1,7 +1,7 @@
 //! `wasefire_store::Storage` on the last `STORE_PAGES` sectors of the RP2040 flash.
 //!
 //! Geometry follows OpenSK's own "Nordic configuration" (4-byte words, 4 KiB pages, a word may be
-//! written twice between erases, 20 pages). build.rs keeps the same area out of the linker's FLASH
+//! written twice between erases, `STORE_PAGES` pages). build.rs keeps the same area out of the linker's FLASH
 //! region, so firmware and store can never overlap.
 //!
 //! Reads go straight through the XIP window (no copy, no flash lock). Writes and erases use the
@@ -72,7 +72,7 @@ impl Storage for FlashStorage {
         10000
     }
 
-    fn read_slice(&self, index: StorageIndex, length: usize) -> StorageResult<Cow<[u8]>> {
+    fn read_slice(&self, index: StorageIndex, length: usize) -> StorageResult<Cow<'_, [u8]>> {
         let offset = Self::offset(&index, length)?;
         // SAFETY: the range was checked to lie inside the store area of the memory-mapped flash.
         let bytes = unsafe { core::slice::from_raw_parts((XIP_BASE + offset) as *const u8, length) };

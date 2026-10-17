@@ -2,7 +2,9 @@
 //! mode). Two small queues carry the 64-byte HID packets; every OpenSK call that waits for the
 //! host simply polls them, while USB keeps being serviced by the higher-priority executor.
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::signal::Signal;
 use embassy_time::{block_for, Duration, Instant};
 use opensk::api::connection::{HidConnection, RecvStatus, UsbEndpoint};
 use opensk::ctap::status_code::{Ctap2StatusCode, CtapResult};
@@ -20,6 +22,11 @@ const POLL: Duration = Duration::from_micros(300);
 pub static IN_CH: Channel<CriticalSectionRawMutex, HidPacket, QUEUE> = Channel::new();
 /// Device -> host (filled by OpenSK, drained by the USB task).
 pub static OUT_CH: Channel<CriticalSectionRawMutex, HidPacket, QUEUE> = Channel::new();
+
+/// Makes "not cancelled? then enqueue the response" one step with respect to `cancel_all`, which
+/// runs in the USB interrupt executor: otherwise a reset could flush the queue between the check
+/// and the enqueue and the stale response would be sent afterwards.
+static SEND_LOCK: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
 
 // ---- cancellation -----------------------------------------------------------------------------
 //
@@ -58,7 +65,12 @@ pub fn cancel_all() {
     // Forget the seed now (with a PIN set), not at the next main-loop turn.
     super::harden::lock_now();
     flush();
+    // Tell the USB task to abandon the read it has in flight (see `usb::ctap::usb_io`).
+    RESET_SIG.signal(());
 }
+
+/// Raised by `cancel_all`; `usb_io` restarts its pending endpoint read when it fires.
+pub static RESET_SIG: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Drops everything that is queued (the host will start with a new INIT).
 pub fn flush() {
@@ -124,10 +136,15 @@ impl HidConnection for PicoHidConnection {
         }
         let deadline = Instant::now() + Duration::from_millis(SEND_TIMEOUT_MS);
         loop {
-            if OUT_CH.try_send(*buf).is_ok() {
-                return Ok(());
-            }
-            if op_cancelled() {
+            // Ok = queued, or dropped because the operation was cancelled meanwhile.
+            let queued = SEND_LOCK.lock(|_| {
+                if op_cancelled() {
+                    Ok(())
+                } else {
+                    OUT_CH.try_send(*buf).map_err(|_| ())
+                }
+            });
+            if queued.is_ok() {
                 return Ok(());
             }
             if Instant::now() >= deadline {
