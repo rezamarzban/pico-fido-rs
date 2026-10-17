@@ -148,7 +148,7 @@ pub async fn tick_task() {
         t.next().await;
         refresh_now();
         n = n.wrapping_add(1);
-        if n % RESEED_EVERY == 0 {
+        if n.is_multiple_of(RESEED_EVERY) {
             reseed();
         }
     }

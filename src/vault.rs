@@ -110,12 +110,25 @@ pub fn open(flash: &'static RefCell<Fl>, create_plain: bool) -> (FlashVault, Opt
                 p.seq,
                 if r.wrapped { "set" } else { "not set" }
             );
-            match store::purge_stale(&mut Dev(flash)) {
-                Ok(true) => {}
-                Ok(false) => warn!("vault: an older record is still readable and could not be wiped"),
-                Err(_) => warn!("vault: could not check for older records"),
+            let wiped = match store::purge_stale(&mut Dev(flash)) {
+                Ok(true) => true,
+                Ok(false) => {
+                    warn!("vault: an older record is still readable and could not be wiped");
+                    false
+                }
+                Err(_) => {
+                    warn!("vault: could not check for older records");
+                    false
+                }
+            };
+            if !wiped && !create_plain {
+                // SRAM PUF required: an older record may be unmasked or lack the PUF input. Do not
+                // use the vault until it is wiped (every boot retries); a CTAP reset also recovers.
+                error!("vault: older record not wiped with the PUF required - locked");
+                None
+            } else {
+                Some(r)
             }
-            Some(r)
         }
         Ok(Loaded::Blank) if !create_plain => {
             // First boot with the SRAM PUF required: the caller creates a PUF-bound record. A

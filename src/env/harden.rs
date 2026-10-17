@@ -130,6 +130,15 @@ fn hw_fail() -> Ctap2StatusCode {
     Ctap2StatusCode::CTAP2_ERR_VENDOR_HARDWARE_FAILURE
 }
 
+/// Marks a PIN attempt as done (forgives earlier failures). A failure is logged; the attempt then
+/// simply stays counted, which is the safe direction.
+fn finish_try_logged(v: &mut FlashVault, page: usize) {
+    // One retry for a transient flash error, like `clear_tries_checked`.
+    if v.finish_try(page).is_err() && v.finish_try(page).is_err() {
+        warn!("vault: could not mark the PIN attempt as done; it stays counted");
+    }
+}
+
 /// Clears the retry counter or fails; one retry for a transient flash error. A failure must reach
 /// the caller: a counter that stays full would block the (new) PIN for good.
 fn clear_tries_checked(v: &mut FlashVault) -> CtapResult<()> {
@@ -177,7 +186,10 @@ impl HardenPersist {
             if bound_or_unknown {
                 error!("puf: helper data missing but the vault holds a PUF-bound or unreadable record - not enrolling");
             } else {
-                puf.enroll();
+                if !puf.enroll() {
+                    // `enroll` logged the reason (not a power-on reset, unusable RAM sample, ...).
+                    warn!("puf: first-boot enrolment did not happen - device stays locked");
+                }
             }
         }
         let key = puf.key();
@@ -197,7 +209,7 @@ impl HardenPersist {
             if let Some(k) = key.as_ref() {
                 let mut seed = Zeroizing::new([0u8; 32]);
                 fill_random(&mut seed[..]);
-                let new_rec = wrap::plain_puf(&seed, &**k);
+                let new_rec = wrap::plain_puf(&seed, k);
                 match st.vault.replace(&new_rec) {
                     Replaced::New(_) if guard::store_seed(&seed) => {
                         WRAPPED.store(false, Ordering::Relaxed);
@@ -228,11 +240,15 @@ impl HardenPersist {
                         // Not yet bound, but a PUF key exists: bind the plain seed now.
                         if !keep.puf {
                             if let Some(k) = key.as_ref() {
-                                let up = wrap::plain_puf(&seed, &**k);
+                                let up = wrap::plain_puf(&seed, k);
                                 match st.vault.replace(&up) {
                                     Replaced::New(s) => {
-                                        if !s.old_wiped && !matches!(st.vault.purge_stale(), Ok(true)) {
-                                            warn!("puf: the unbound record could not be wiped");
+                                        if !st.old_gone(s.old_wiped) {
+                                            // The old seed (unmasked) is still readable in flash:
+                                            // the binding does not protect anything yet.
+                                            error!("puf: the unbound record could not be wiped - device locked");
+                                            st.fail_closed();
+                                            return HardenPersist { raw, st: RefCell::new(st), puf };
                                         }
                                         keep = up;
                                     }
@@ -250,17 +266,21 @@ impl HardenPersist {
                         else if wrap::legacy_plain_puf(&keep) {
                             // Seal an old PUF-masked record with its authentication tag.
                             if let Some(k) = key.as_ref() {
-                                let up = wrap::plain_puf(&seed, &**k);
+                                let up = wrap::plain_puf(&seed, k);
                                 match st.vault.replace(&up) {
                                     Replaced::New(s) => {
-                                        if !s.old_wiped && !matches!(st.vault.purge_stale(), Ok(true)) {
-                                            warn!("puf: the untagged record could not be wiped");
+                                        if !st.old_gone(s.old_wiped) {
+                                            error!("puf: the untagged record could not be wiped - device locked");
+                                            st.fail_closed();
+                                            return HardenPersist { raw, st: RefCell::new(st), puf };
                                         }
                                         keep = up;
                                     }
-                                    Replaced::Kept(_) => warn!("puf: could not add the tag to the record"),
-                                    Replaced::NoKey | Replaced::Unknown => {
-                                        puf::set_fault(true);
+                                    // The untagged record cannot detect a wrong PUF key: it is
+                                    // not used until the authenticated record is durable (the
+                                    // next boot retries).
+                                    Replaced::Kept(_) | Replaced::NoKey | Replaced::Unknown => {
+                                        error!("puf: could not seal the record with its tag - device locked");
                                         st.fail_closed();
                                         return HardenPersist { raw, st: RefCell::new(st), puf };
                                     }
@@ -281,7 +301,7 @@ impl HardenPersist {
             // Damaged vault or read error (`vault::open` returned no record): the device stays
             // locked, but show the LED fault pattern instead of failing silently. No halt: a CTAP
             // reset must still be possible to recover.
-            puf::set_fault(true);
+            puf::set_sec_fault(true);
         }
         HardenPersist {
             raw,
@@ -312,10 +332,19 @@ impl HardenPersist {
 }
 
 impl State {
+    /// True when the older record is confirmed unreadable: wiped by the update itself or by a
+    /// retry now. A PUF migration is only protective once this holds; otherwise the caller locks.
+    fn old_gone(&mut self, old_wiped: bool) -> bool {
+        old_wiped || matches!(self.vault.purge_stale(), Ok(true))
+    }
+
     /// The state after a failed vault update whose outcome is unknown: no key is usable until a
     /// CTAP reset (same as a damaged vault at boot).
     fn fail_closed(&mut self) {
         error!("vault: unknown flash state - locking until reset");
+        // Every locked state shows the LED fault pattern (cleared by a completed reset). Separate
+        // from the PUF-key fault, which `init` treats specially.
+        puf::set_sec_fault(true);
         self.rec = None;
         self.pending = None;
         WRAPPED.store(false, Ordering::Relaxed);
@@ -405,11 +434,29 @@ impl Persist for HardenPersist {
                     if let Some(k) = key.as_ref() {
                         let mut salt = [0u8; 16];
                         fill_random(&mut salt);
-                        if let Some(up) = wrap::wrap(&seed, pin_hash, salt, Some(&**k)) {
+                        let Some(up) = wrap::wrap(&seed, pin_hash, salt, Some(&**k)) else {
+                            // The PIN was right, but the PUF-bound record cannot be built: do not
+                            // report an unlock of a record that is still unbound.
+                            error!("puf: could not build the PUF-bound PIN record - not unlocking");
+                            puf::set_fault(true);
+                            guard::clear_seed();
+                            if let Some(page) = st.pending.take() {
+                                finish_try_logged(&mut st.vault, page);
+                            }
+                            return Err(hw_fail());
+                        };
+                        {
                             match st.vault.replace(&up) {
                                 Replaced::New(s) => {
-                                    if !s.old_wiped && !matches!(st.vault.purge_stale(), Ok(true)) {
-                                        warn!("puf: the unbound record could not be wiped");
+                                    if !st.old_gone(s.old_wiped) {
+                                        // The old record (PIN verifier without the PUF input) is
+                                        // still readable: lock until it is gone.
+                                        error!("puf: the unbound PIN record could not be wiped - device locked");
+                                        if let Some(page) = st.pending.take() {
+                                            finish_try_logged(&mut st.vault, page);
+                                        }
+                                        st.fail_closed();
+                                        return Err(hw_fail());
                                     }
                                     st.rec = Some(up);
                                 }
@@ -422,7 +469,7 @@ impl Persist for HardenPersist {
                                     puf::set_fault(true);
                                     guard::clear_seed();
                                     if let Some(page) = st.pending.take() {
-                                        let _ = st.vault.finish_try(page);
+                                        finish_try_logged(&mut st.vault, page);
                                     }
                                     return Err(hw_fail());
                                 }
@@ -445,6 +492,7 @@ impl Persist for HardenPersist {
 
     fn set_pin(&mut self, pin_hash: &[u8; 16], pin_code_point_length: u8) -> CtapResult<()> {
         let key = self.puf.key();
+        let mut wipe_failed = false;
         {
             let st = self.st.get_mut();
             if !guard::has_seed() {
@@ -478,14 +526,17 @@ impl Persist for HardenPersist {
                     st.rec = Some(rec);
                     st.pending = None;
                     WRAPPED.store(true, Ordering::Relaxed);
-                    if !saved.old_wiped && !matches!(st.vault.purge_stale(), Ok(true)) {
+                    if !st.old_gone(saved.old_wiped) {
                         // The new record wins on every boot, but the previous (plain or
                         // old-PIN) record may still be readable: do NOT report success. The seed
                         // stays usable in RAM, so setting the PIN again in this session retries
                         // the erase (the next save targets exactly that slot); after a lock or
                         // power cycle a CTAP reset is needed.
+                        // The new record is durable, so the PIN metadata below is still written
+                        // (otherwise a reboot would find a PIN-wrapped vault without PIN
+                        // properties); the error is reported afterwards.
                         error!("set_pin: previous record could not be wiped - PIN setup failed");
-                        return Err(hw_fail());
+                        wipe_failed = true;
                     }
                 }
                 // Nothing changed: the old record is still the newest one.
@@ -502,7 +553,11 @@ impl Persist for HardenPersist {
         props[0] = pin_code_point_length;
         self.raw.insert(keys::PIN_PROPERTIES, &props)?;
         // If power fails between these 2 transactions, PIN has to be set again.
-        self.raw.remove(keys::FORCE_PIN_CHANGE)
+        self.raw.remove(keys::FORCE_PIN_CHANGE)?;
+        if wipe_failed {
+            return Err(hw_fail());
+        }
+        Ok(())
     }
 
     fn pin_fails(&self) -> CtapResult<u8> {
@@ -549,12 +604,19 @@ impl Persist for HardenPersist {
     /// fault, and a reset on a power-on reset repairs it.
     fn init(&mut self) -> CtapResult<()> {
         if self.find(keys::RESET_COMPLETION)?.is_some() {
-            if let Err(e) = self.reset() {
-                if puf::fault() {
+            if self.reset().is_err() {
+                // Postpone only when the missing PUF key is what blocks the reset; any other failure
+                // (vault, flash) is reported as it is.
+                if self.puf.required() && self.puf.key().is_none() {
                     warn!("init: pending reset postponed, PUF key unavailable");
-                    return Ok(());
+                } else {
+                    // Do not abort the boot (`CtapState::new` unwraps `init`): stay locked with
+                    // the LED fault pattern; the marker stays, so the next boot repeats the reset
+                    // and a CTAP reset can be issued meanwhile.
+                    error!("init: pending reset failed - locked, will retry at the next boot");
+                    self.st.get_mut().fail_closed();
                 }
-                return Err(e);
+                return Ok(());
             }
         }
         Ok(())
@@ -566,8 +628,9 @@ impl Persist for HardenPersist {
         // If that fails, refuse: nothing is touched, no marker is written, and above all no plain
         // or unbound seed record is created.
         if self.puf.required() {
-            if self.puf.status() != PufStatus::Ready {
-                self.puf.enroll();
+            if self.puf.status() != PufStatus::Ready && !self.puf.enroll() {
+                // `enroll` logged the reason (not a power-on reset, unusable RAM sample, ...).
+                warn!("reset: PUF (re-)enrolment did not happen");
             }
             if self.puf.key().is_none() {
                 puf::set_fault(true);
@@ -581,7 +644,7 @@ impl Persist for HardenPersist {
         fill_random(&mut seed[..]);
         let key = self.puf.key();
         let rec = match key.as_ref() {
-            Some(k) => wrap::plain_puf(&seed, &**k),
+            Some(k) => wrap::plain_puf(&seed, k),
             None if !self.puf.required() => Record::plain(*seed),
             None => {
                 puf::set_fault(true);
@@ -603,6 +666,7 @@ impl Persist for HardenPersist {
                     }
                     if !wiped {
                         error!("reset: previous record could not be wiped");
+                        puf::set_sec_fault(true);
                         return Err(hw_fail());
                     }
                     // The new seed is durable, so the old counter is meaningless: a counter that
@@ -612,6 +676,7 @@ impl Persist for HardenPersist {
                 }
                 Replaced::Kept(_) => {
                     error!("reset: vault could not be re-initialised");
+                    puf::set_sec_fault(true);
                     return Err(hw_fail());
                 }
                 Replaced::NoKey | Replaced::Unknown => {
@@ -625,6 +690,7 @@ impl Persist for HardenPersist {
         // New seed durable and in RAM, old data gone: the device is usable again. The LED fault
         // pattern is cleared only here, never while a step above could still have failed.
         puf::set_fault(false);
+        puf::set_sec_fault(false);
         Ok(())
     }
 }

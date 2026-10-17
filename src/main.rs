@@ -274,7 +274,7 @@ pub async fn blinker(mut led: Output<'static>) {
 
         // SRAM PUF fault (key required but unavailable): 3 short blinks, then a pause. Takes
         // precedence over every other state until a boot / reset with a working key clears it.
-        if puf::fault() {
+        if puf::led_fault() {
             for _ in 0..3 {
                 led.set_high();
                 Timer::after(Duration::from_millis(80)).await;

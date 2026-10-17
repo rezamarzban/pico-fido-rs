@@ -27,7 +27,15 @@ impl PicoPersist {
         let storage = FlashStorage::new(flash);
         let store = match Store::new(storage) {
             Ok(store) => store,
-            Err((_, mut storage)) => {
+            // A flash I/O or argument error says nothing about the data: never erase the store
+            // (credentials, pending reset marker) because of it. Stop; a re-plug retries.
+            Err((StoreError::StorageError, _)) => defmt::panic!("flash: I/O error opening the key-value store - not formatting, re-plug"),
+            Err((StoreError::InvalidArgument | StoreError::NoCapacity | StoreError::NoLifetime, _)) => {
+                defmt::panic!("flash: unexpected error opening the key-value store - not formatting")
+            }
+            // InvalidStorage: foreign data, the layout of an older firmware, or corruption (the
+            // store cannot tell them apart). Only this case is erased and started empty.
+            Err((StoreError::InvalidStorage, mut storage)) => {
                 warn!("flash: no valid key-value store found, formatting the store area");
                 if storage.format().is_err() {
                     defmt::panic!("flash: cannot erase the store area");
