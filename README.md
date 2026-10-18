@@ -31,7 +31,7 @@ pin, rebuild, retest on hardware and update the file.
 The **last 92 KiB** of flash are kept out of the linker's FLASH region (`build.rs`):
 * the last **12 KiB** (`VAULT_BYTES`) are the vault: `[PIN retry counter][seed slot 0][seed slot 1]` (`src/vault.rs`);
 * the **4 KiB** below it (`PUF_BYTES`) hold the SRAM-PUF helper data (`src/puf.rs`);
-* the **76 KiB** below that (19 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store.
+* the **72 KiB** below that (18 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store. (Older images used 19 pages and one 4 KiB PUF sector: a device flashed with them must be erased and reset, the store is re-formatted.)
 
 With the `sram_puf` feature (default) `build.rs` also takes the first 512 bytes of RAM out of the linker's RAM: no
 section, heap or stack ever touches them. The PUF samples this region at start-up and again every time the PUF secret is
@@ -72,8 +72,15 @@ commit it; `build.sh` then builds `--locked` only.
 fetches OpenSK at the pinned commit (or the submodule commit), installs the toolchain and `elf2uf2-rs`, builds with
 the right `--features` (`-s` flash size in MiB, `-u` adds the USB serial number) and writes
 `out/pico-fido-rs-<N>m.uf2`. Hold BOOTSEL while plugging in and copy the file to the `RPI-RP2` drive. It builds the
-*committed* revision of the repository. **The default `-b` is `openSK-based-se3`** (this branch); pass `-b` to build another branch. With a committed `Cargo.lock` the script builds with `--locked` only and fails instead of resolving newer crates; without one it warns and builds unlocked. This script itself was only syntax-checked; the maintainer's Colab build
+*committed* revision of the repository. **The default `-b` is `openSK-based-se4`** (this branch); pass `-b` to build another branch. With a committed `Cargo.lock` the script builds with `--locked` only and fails instead of resolving newer crates; without one it warns and builds unlocked. This script itself was only syntax-checked; the maintainer's Colab build
 (same toolchain and features) is what was run on hardware.
+
+## Stack protection and measurement
+The firmware is linked with [`flip-link`](https://github.com/knurling-rs/flip-link) (`.cargo/config.toml`; `cargo install flip-link --locked`,
+done by `build.sh` and CI). It puts the stack below the statics, so an overflow faults instead of overwriting the heap or the secret-guard
+state. To measure the real headroom build a development image with `--features stack_probe`: it paints the unused stack at boot and logs
+`stack: peak N of M bytes` (defmt) whenever the peak grows, so run PIN, makeCredential, getAssertion (resident and not) and large-blob
+flows and read the log. Not measured yet.
 
 ## U2F attestation
 U2F registration needs an attestation key and certificate, which this firmware does not contain. OpenSK provides
@@ -114,9 +121,9 @@ HMAC tag over the masked seed, so a wrong PUF key can never yield a wrong seed s
 are accepted once and re-sealed at the next boot with a working key). A migration (binding an old unbound or untagged record to the PUF) counts as done only when the older record is confirmed wiped and the new
 one is durable; otherwise the device locks with the LED fault pattern and the next boot retries (with the PUF required, `vault::open`
 also locks while an older record cannot be wiped). Every locked state shows the fault pattern. A pending reset that fails at boot for any reason other than the missing PUF key no longer aborts the boot: the device stays locked
-(LED fault pattern), the marker stays and the next boot repeats the reset. A power cut inside a CTAP reset, after the helper was
-re-enrolled but before the new record was written, leaves the old record unusable with the new key: it stays locked (LED) and a second
-CTAP reset repairs it. While the key is unavailable no PIN attempt is counted and the retry counter is not touched. The device stays locked and the **LED shows the fault pattern: 3 short blinks, then a pause**, until a
+(LED fault pattern), the marker stays and the next boot repeats the reset. The PUF helper has two flash slots and every PUF-bound record names its slot: a re-enrolment writes the other slot, the new record is
+written, and only then the old helper is erased. A power cut anywhere in a CTAP reset therefore leaves a usable (record, helper) pair, and the
+next boot erases whichever helper the record does not name. While the key is unavailable no PIN attempt is counted and the retry counter is not touched. The device stays locked and the **LED shows the fault pattern: 3 short blinks, then a pause**, until a
 boot with a working key. Boot does not panic on a postponed reset. The only way out without a working PUF is a build
 without `sram_puf` (`build.sh -P`), which cannot read a PUF-bound record: that case is also reported by the LED. **It does not protect against anyone who can run code on the device (BOOTSEL, SWD)**: see `SECURITY.md`.
 

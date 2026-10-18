@@ -27,6 +27,8 @@ jobs:
           toolchain: ${{ env.NIGHTLY }}
           targets: thumbv6m-none-eabi
           components: rust-src, llvm-tools
+      - name: Install flip-link (the linker, see .cargo/config.toml)
+        run: cargo install flip-link --locked
       # Cargo.lock is not in the repository yet: use it (--locked) as soon as it is committed.
       - name: Locked builds when Cargo.lock exists
         shell: bash

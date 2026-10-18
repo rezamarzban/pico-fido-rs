@@ -18,7 +18,7 @@ impl Sectors for Mock {
     fn tries_mark(&mut self, p: usize, v: u8) -> Result<(), ()> { self.t[p] &= v; Ok(()) }
     fn tries_clear(&mut self) -> Result<(), ()> { self.t = [0xFF; TRIES_PAGES]; Ok(()) }
 }
-fn wrapped() -> Record { Record { wrapped: true, puf: false, m_kib: 64, t_cost: 3, salt: [5; 16], body: [6; 32], tag: [7; 32] } }
+fn wrapped() -> Record { Record { wrapped: true, puf: false, puf_slot: 0, m_kib: 64, t_cost: 3, salt: [5; 16], body: [6; 32], tag: [7; 32] } }
 
 #[test]
 fn old_plain_record_wiped_normally() {
@@ -63,4 +63,17 @@ fn failed_write_keeps_old_record() {
 fn record_debug_does_not_leak() {
     let s = format!("{:?}", Record::plain([0x5A; 32]));
     assert!(!s.contains("90") && !s.contains("body") && !s.contains("5A"), "{}", s);
+}
+
+#[test]
+fn puf_slot_survives_a_save_and_load() {
+    let mut m = Mock::new();
+    let mut rec = Record::plain([3; 32]);
+    rec.puf = true;
+    rec.puf_slot = 1;
+    assert!(matches!(replace_record(&mut m, &rec), Replaced::New(_)));
+    match load(&mut m) {
+        Ok(Loaded::Rec(r, _)) => { assert!(r.puf); assert_eq!(r.puf_slot, 1); }
+        r => panic!("{:?}", r),
+    }
 }

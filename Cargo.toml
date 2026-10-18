@@ -15,6 +15,8 @@ flash_16m = []
 usb_serial = []
 # Device-bound key from the SRAM power-up state (src/puf.rs). Reserves 512 bytes of RAM.
 sram_puf = []
+# Development only: paint the stack and log its peak use (src/stack_probe.rs). Needs flip-link.
+stack_probe = []
 
 [dependencies]
 cortex-m = { version = "0.7.7", features = ["inline-asm"] }

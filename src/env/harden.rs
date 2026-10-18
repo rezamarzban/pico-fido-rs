@@ -160,6 +160,14 @@ fn scrubbed(mut rec: Record) -> Record {
     rec
 }
 
+/// Records the PUF helper slot in a PUF-bound record (see `Puf::select` / `Puf::commit`).
+fn bind_slot(mut rec: Record, puf: &Puf) -> Record {
+    if rec.puf {
+        rec.puf_slot = puf.slot();
+    }
+    rec
+}
+
 impl HardenPersist {
     pub fn new(
         raw: PicoPersist,
@@ -173,6 +181,13 @@ impl HardenPersist {
             rec: None,
             pending: None,
         };
+        // A PUF-bound record names the helper slot it belongs to (two can be valid until a
+        // re-enrolment is committed).
+        if let Some(r) = rec.as_ref() {
+            if r.puf {
+                puf.select(r.puf_slot);
+            }
+        }
         // First boot with the PUF feature: enrol now (only a power-on reset can).
         // A blank helper sector only means "new device" when the vault holds no PUF-bound seed.
         // If a PUF-bound record exists (or the vault is damaged / unreadable), enrolling would
@@ -209,7 +224,7 @@ impl HardenPersist {
             if let Some(k) = key.as_ref() {
                 let mut seed = Zeroizing::new([0u8; 32]);
                 fill_random(&mut seed[..]);
-                let new_rec = wrap::plain_puf(&seed, k);
+                let new_rec = bind_slot(wrap::plain_puf(&seed, k), &puf);
                 match st.vault.replace(&new_rec) {
                     Replaced::New(_) if guard::store_seed(&seed) => {
                         WRAPPED.store(false, Ordering::Relaxed);
@@ -240,7 +255,7 @@ impl HardenPersist {
                         // Not yet bound, but a PUF key exists: bind the plain seed now.
                         if !keep.puf {
                             if let Some(k) = key.as_ref() {
-                                let up = wrap::plain_puf(&seed, k);
+                                let up = bind_slot(wrap::plain_puf(&seed, k), &puf);
                                 match st.vault.replace(&up) {
                                     Replaced::New(s) => {
                                         if !st.old_gone(s.old_wiped) {
@@ -266,7 +281,7 @@ impl HardenPersist {
                         else if wrap::legacy_plain_puf(&keep) {
                             // Seal an old PUF-masked record with its authentication tag.
                             if let Some(k) = key.as_ref() {
-                                let up = wrap::plain_puf(&seed, k);
+                                let up = bind_slot(wrap::plain_puf(&seed, k), &puf);
                                 match st.vault.replace(&up) {
                                     Replaced::New(s) => {
                                         if !st.old_gone(s.old_wiped) {
@@ -302,6 +317,10 @@ impl HardenPersist {
             // locked, but show the LED fault pattern instead of failing silently. No halt: a CTAP
             // reset must still be possible to recover.
             puf::set_sec_fault(true);
+        }
+        // Boot after an interrupted re-enrolment: the unreferenced helper is obsolete.
+        if st.rec.as_ref().map_or(false, |r| r.puf) {
+            puf.commit();
         }
         HardenPersist {
             raw,
@@ -445,6 +464,7 @@ impl Persist for HardenPersist {
                             }
                             return Err(hw_fail());
                         };
+                        let up = bind_slot(up, &self.puf);
                         {
                             match st.vault.replace(&up) {
                                 Replaced::New(s) => {
@@ -516,7 +536,10 @@ impl Persist for HardenPersist {
                 }
                 let mut salt = [0u8; 16];
                 fill_random(&mut salt);
-                wrap::wrap(&seed, pin_hash, salt, key.as_ref().map(|k| &**k)).ok_or_else(hw_fail)?
+                bind_slot(
+                    wrap::wrap(&seed, pin_hash, salt, key.as_ref().map(|k| &**k)).ok_or_else(hw_fail)?,
+                    &self.puf,
+                )
             };
             guard::refresh_now();
             // 3. Commit. Only a record that is durable AND whose predecessor was verified wiped
@@ -644,7 +667,7 @@ impl Persist for HardenPersist {
         fill_random(&mut seed[..]);
         let key = self.puf.key();
         let rec = match key.as_ref() {
-            Some(k) => wrap::plain_puf(&seed, k),
+            Some(k) => bind_slot(wrap::plain_puf(&seed, k), &self.puf),
             None if !self.puf.required() => Record::plain(*seed),
             None => {
                 puf::set_fault(true);
@@ -669,6 +692,9 @@ impl Persist for HardenPersist {
                         puf::set_sec_fault(true);
                         return Err(hw_fail());
                     }
+                    // The new record (bound to the new helper slot) is durable: the previous
+                    // helper is obsolete now.
+                    self.puf.commit();
                     // The new seed is durable, so the old counter is meaningless: a counter that
                     // cannot be cleared must fail the reset (marker stays, boot repeats it)
                     // instead of leaving a fresh PIN blocked.

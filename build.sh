@@ -7,7 +7,7 @@
 #   -P  build WITHOUT the SRAM PUF (default: with; the `sram_puf` feature)
 #   -t  Rust nightly to use (default: nightly-2026-06-03, the one OpenSK pins, then `nightly`)
 #   -r  repository URL   (default https://github.com/rezamarzban/pico-fido-rs)
-#   -b  branch           (default openSK-based-se3)
+#   -b  branch           (default openSK-based-se4)
 #   -o  output directory (default ./out)
 # Environment: OPENSK_URL / OPENSK_REV override where and which OpenSK commit is fetched
 #   (default: google/OpenSK at the commit in third_party/OPENSK_REV).
@@ -61,6 +61,9 @@ fi
 # shellcheck disable=SC1091
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 command -v elf2uf2-rs >/dev/null 2>&1 || cargo install elf2uf2-rs --locked
+# flip-link is the linker (.cargo/config.toml): the stack sits below the statics, so a stack overflow
+# faults instead of corrupting the heap and the secret-guard state.
+command -v flip-link >/dev/null 2>&1 || cargo install flip-link --locked
 
 # ---- 3. clone ----------------------------------------------------------------------------------
 rm -rf "$SRC"

@@ -2,6 +2,12 @@
 runner = "probe-rs run --chip RP2040"
 # runner = "elf2uf2-rs -d"
 
+# flip-link puts the stack below .data/.bss/the heap: an overflow runs off the bottom of RAM and
+# raises a HardFault instead of silently corrupting the heap or the RAM-guard state.
+# Install it once with `cargo install flip-link --locked` (build.sh does it).
+[target.thumbv6m-none-eabi]
+linker = "flip-link"
+
 [build]
 target = "thumbv6m-none-eabi" # Cortex-M0 and Cortex-M0+
 

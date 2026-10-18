@@ -28,6 +28,8 @@ mod health;
 mod keys;
 mod puf;
 mod ram_guard;
+#[cfg(feature = "stack_probe")]
+mod stack_probe;
 mod store;
 mod usb;
 mod vault;
@@ -54,17 +56,17 @@ const _: () = core::assert!(
 pub const FLASH_SIZE: usize = FLASH_MB * 1024 * 1024;
 
 /// Pages of 4 KiB at the end of flash for OpenSK's key-value store. build.rs keeps the store
-/// (76 KiB), the PUF sector and the vault (92 KiB in total) out of the linker's FLASH region:
+/// (72 KiB), the two PUF sectors and the vault (92 KiB in total) out of the linker's FLASH region:
 /// change them together.
-pub const STORE_PAGES: usize = 19;
+pub const STORE_PAGES: usize = 18;
 
 /// The last 12 KiB of flash hold the vault: [PIN retry counter][seed slot 0][seed slot 1].
 /// build.rs keeps them (and the store above) out of the linker's FLASH region.
 pub const VAULT_BYTES: usize = 3 * 4096;
 
-/// One sector just below the vault holds the SRAM-PUF helper data (src/puf.rs): 76 KiB store +
-/// 4 KiB PUF + 12 KiB vault = the same 92 KiB build.rs keeps out of the FLASH region.
-pub const PUF_BYTES: usize = 4096;
+/// Two sectors just below the vault hold the SRAM-PUF helper data (src/puf.rs, two slots): 72 KiB
+/// store + 8 KiB PUF + 12 KiB vault = the same 92 KiB build.rs keeps out of the FLASH region.
+pub const PUF_BYTES: usize = 2 * 4096;
 
 // Heap for OpenSK (alloc): credentials, CBOR, the P-256 software crypto, message buffers.
 const HEAP_SIZE: usize = 128 * 1024;
@@ -113,6 +115,8 @@ async fn usb_executor_init(parts: AssertSend<UsbParts>) {
 #[entry]
 fn main() -> ! {
     unsafe { HEAP.init(core::ptr::addr_of_mut!(HEAP_MEM) as usize, HEAP_SIZE) }
+    #[cfg(feature = "stack_probe")]
+    stack_probe::paint();
     info!("Starting (OpenSK)");
 
     let p = embassy_rp::init(Default::default());
@@ -173,6 +177,8 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
     let mut seen = env::hid::epoch();
     LED_SIGNAL.signal(LedState::Active);
     loop {
+        #[cfg(feature = "stack_probe")]
+        stack_probe::report();
         let wink = ctap.should_wink();
         if wink != winking {
             winking = wink;
