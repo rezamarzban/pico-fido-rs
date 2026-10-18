@@ -27,6 +27,9 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::keys::{fill_random, Fl};
 use crate::{FLASH_SIZE, PUF_BYTES, VAULT_BYTES};
 
+const SECTOR: usize = 4096;
+const _: () = core::assert!(PUF_BYTES == 2 * SECTOR);
+
 /// RAM bytes reserved at the start of SRAM (must match build.rs).
 pub const REGION_BYTES: usize = 512;
 const REGION_ADDR: usize = 0x2000_0000;
@@ -39,13 +42,19 @@ const _: () = core::assert!(
     CODE_BITS.is_multiple_of(8) && CODE_BYTES <= REGION_BYTES && CODE_BYTES.is_multiple_of(4)
 );
 
-/// Flash sector holding the helper data (just below the vault; carved from the key-value store).
-const OFFSET: u32 = (FLASH_SIZE - VAULT_BYTES - PUF_BYTES) as u32;
+/// Two flash sectors hold helper data (just below the vault; carved from the key-value store).
+/// Slot 0 is the sector next to the vault (the only one older firmware used), slot 1 the one below
+/// it. A re-enrolment writes the OTHER slot and the old helper stays valid until the new vault
+/// record, which names its slot, is durable (`Puf::commit`): a power cut at any point leaves a
+/// consistent pair of (record, helper).
+const fn slot_offset(i: usize) -> u32 {
+    (FLASH_SIZE - VAULT_BYTES - SECTOR * (i + 1)) as u32
+}
 const MAGIC: [u8; 4] = *b"PUF1";
 const CHECK_LEN: usize = 8;
 const HASH_LEN: usize = 16;
 const IMG_LEN: usize = 4 + CHECK_LEN + CODE_BYTES + HASH_LEN;
-const _: () = core::assert!(IMG_LEN <= PUF_BYTES);
+const _: () = core::assert!(IMG_LEN <= SECTOR);
 
 /// CHIP_RESET register (VREG_AND_CHIP_RESET + 0x08), bit 8 = HAD_POR.
 const CHIP_RESET: *const u32 = 0x4006_4008 as *const u32;
@@ -91,12 +100,45 @@ pub enum Status {
     Ready,
 }
 
+/// Public helper data of one enrolment.
+struct Slot {
+    check: [u8; CHECK_LEN],
+    helper: [u8; CODE_BYTES],
+}
+
+enum Parsed {
+    Blank,
+    Valid(Slot),
+    Damaged,
+}
+
+/// `None` = the sector could not be read (never assumed blank).
+fn read_slot(flash: &RefCell<Fl>, i: usize) -> Option<Parsed> {
+    let mut img = [0u8; IMG_LEN];
+    if flash.borrow_mut().blocking_read(slot_offset(i), &mut img).is_err() {
+        return None;
+    }
+    if img.iter().all(|&b| b == 0xFF) {
+        return Some(Parsed::Blank);
+    }
+    if img[..4] == MAGIC
+        && Sha256::digest(&img[..IMG_LEN - HASH_LEN])[..HASH_LEN] == img[IMG_LEN - HASH_LEN..]
+    {
+        let mut s = Slot { check: [0; CHECK_LEN], helper: [0; CODE_BYTES] };
+        s.check.copy_from_slice(&img[4..4 + CHECK_LEN]);
+        s.helper.copy_from_slice(&img[4 + CHECK_LEN..4 + CHECK_LEN + CODE_BYTES]);
+        return Some(Parsed::Valid(s));
+    }
+    Some(Parsed::Damaged)
+}
+
 pub struct Puf {
     flash: &'static RefCell<Fl>,
     status: Status,
     por: bool,
-    check: [u8; CHECK_LEN],
-    helper: [u8; CODE_BYTES],
+    slots: [Option<Slot>; 2],
+    /// The helper slot in use (the one the vault record names, see `select`).
+    active: usize,
 }
 
 fn bit(buf: &[u8], i: usize) -> u8 {
@@ -150,45 +192,102 @@ fn decode(x: &[u8; CODE_BYTES]) -> ([u8; 16], u32) {
 }
 
 impl Puf {
-    /// Reads the helper sector and tries to decode this boot's RAM sample.
+    /// Reads both helper slots and tries to decode this boot's RAM sample with the first valid one
+    /// (`select` switches to the slot a vault record names).
     pub fn open(flash: &'static RefCell<Fl>) -> Puf {
         let mut p = Puf {
             flash,
             status: Status::Disabled,
             // SAFETY: fixed, always-readable chip register.
             por: unsafe { CHIP_RESET.read_volatile() } & HAD_POR != 0,
-            check: [0; CHECK_LEN],
-            helper: [0; CODE_BYTES],
+            slots: [None, None],
+            active: 0,
         };
         if !cfg!(feature = "sram_puf") {
             return p;
         }
-        let mut img = [0u8; IMG_LEN];
-        if flash.borrow_mut().blocking_read(OFFSET, &mut img).is_err() {
-            warn!("puf: helper sector unreadable");
-            p.status = Status::Damaged;
-            return p;
+        let mut blank0 = false;
+        let mut io_error = false;
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..2 {
+            match read_slot(flash, i) {
+                None => {
+                    warn!("puf: helper slot {} unreadable", i);
+                    io_error = true;
+                }
+                Some(Parsed::Valid(s)) => p.slots[i] = Some(s),
+                // Only slot 0 decides "nothing enrolled": slot 1 may hold old key-value data
+                // from before the second slot existed.
+                Some(Parsed::Blank) => blank0 |= i == 0,
+                Some(Parsed::Damaged) => {}
+            }
         }
-        if img.iter().all(|&b| b == 0xFF) {
-            p.status = Status::Blank;
-        } else if img[..4] == MAGIC
-            && Sha256::digest(&img[..IMG_LEN - HASH_LEN])[..HASH_LEN] == img[IMG_LEN - HASH_LEN..]
-        {
-            p.check.copy_from_slice(&img[4..4 + CHECK_LEN]);
-            p.helper.copy_from_slice(&img[4 + CHECK_LEN..4 + CHECK_LEN + CODE_BYTES]);
-            p.status = if p.try_decode().is_some() {
-                Status::Ready
-            } else {
-                Status::Noisy
-            };
+        p.active = if p.slots[0].is_some() { 0 } else { 1 };
+        p.status = if p.slots[p.active].is_some() {
+            p.decode_status()
+        } else if blank0 && !io_error {
+            Status::Blank
         } else {
-            p.status = Status::Damaged;
-        }
+            Status::Damaged
+        };
         info!(
-            "puf: status {}, power-on reset {}",
-            p.status, p.por
+            "puf: status {}, helper slot {}, power-on reset {}",
+            p.status, p.active, p.por
         );
         p
+    }
+
+    fn decode_status(&self) -> Status {
+        if self.try_decode().is_some() {
+            Status::Ready
+        } else {
+            Status::Noisy
+        }
+    }
+
+    /// Uses the helper slot a PUF-bound vault record names. Both slots can hold a valid helper
+    /// while a re-enrolment is not committed; the record decides which one belongs to it. If that
+    /// slot holds no valid helper but the other does, the other one is a different secret: the
+    /// PUF is reported damaged (locked, fault pattern) instead of being used.
+    pub fn select(&mut self, slot: u8) {
+        if !cfg!(feature = "sram_puf") {
+            return;
+        }
+        let i = (slot & 1) as usize;
+        if self.slots[i].is_some() {
+            if self.active != i {
+                self.active = i;
+                self.status = self.decode_status();
+            }
+        } else if self.slots.iter().any(|s| s.is_some()) {
+            warn!("puf: the record's helper slot {} is not valid", i);
+            self.status = Status::Damaged;
+        }
+    }
+
+    /// The helper slot in use; stored in every PUF-bound vault record.
+    pub fn slot(&self) -> u8 {
+        self.active as u8
+    }
+
+    /// Erases the helper in the slot that is not in use (the previous one after a re-enrolment).
+    /// Call only when the active helper decodes and the vault record bound to it is durable.
+    pub fn commit(&mut self) {
+        if !cfg!(feature = "sram_puf") || self.status != Status::Ready {
+            return;
+        }
+        let other = 1 - self.active;
+        if self.slots[other].is_none() {
+            return;
+        }
+        let off = slot_offset(other);
+        let ok = self.flash.borrow_mut().blocking_erase(off, off + SECTOR as u32).is_ok();
+        if ok {
+            self.slots[other] = None;
+            info!("puf: previous helper slot {} erased", other);
+        } else {
+            warn!("puf: could not erase the previous helper slot {}", other);
+        }
     }
 
     pub fn status(&self) -> Status {
@@ -205,13 +304,14 @@ impl Puf {
     fn try_decode(&self) -> Option<Zeroizing<[u8; 16]>> {
         let mut r = Zeroizing::new([0u8; CODE_BYTES]);
         read_sample(&mut r);
-        for (x, w) in r.iter_mut().zip(&self.helper) {
+        let slot = self.slots[self.active].as_ref()?;
+        for (x, w) in r.iter_mut().zip(&slot.helper) {
             *x ^= w;
         }
         let (s, errors) = decode(&r);
         let s = Zeroizing::new(s);
         let chk = Zeroizing::new(mac(&s, b"sram-puf-check-v1"));
-        let ok = bool::from(chk[..CHECK_LEN].ct_eq(&self.check));
+        let ok = bool::from(chk[..CHECK_LEN].ct_eq(&slot.check));
         info!(
             "puf: {} bit errors of {} ({} per mille), check {}",
             errors,
@@ -270,27 +370,29 @@ impl Puf {
         r.zeroize();
         s.zeroize();
 
+        // Write the slot that is NOT in use: the old helper (and the vault record bound to it)
+        // stays intact until `commit`, so a power cut anywhere in here loses nothing.
+        let target = if self.slots[self.active].is_some() { 1 - self.active } else { 0 };
+        let off = slot_offset(target);
         let ok = {
             let mut f = self.flash.borrow_mut();
             let mut back = [0u8; IMG_LEN];
-            f.blocking_erase(OFFSET, OFFSET + PUF_BYTES as u32).is_ok()
-                && f.blocking_write(OFFSET, &img).is_ok()
-                && f.blocking_read(OFFSET, &mut back).is_ok()
+            f.blocking_erase(off, off + SECTOR as u32).is_ok()
+                && f.blocking_write(off, &img).is_ok()
+                && f.blocking_read(off, &mut back).is_ok()
                 && back == img
         };
         if !ok {
-            warn!("puf: could not write the helper sector");
-            self.status = Status::Damaged;
+            warn!("puf: could not write helper slot {}", target);
+            self.slots[target] = None;
             return false;
         }
-        self.check.copy_from_slice(&img[4..4 + CHECK_LEN]);
-        self.helper
-            .copy_from_slice(&img[4 + CHECK_LEN..4 + CHECK_LEN + CODE_BYTES]);
-        self.status = if self.try_decode().is_some() {
-            Status::Ready
-        } else {
-            Status::Noisy
-        };
+        let mut slot = Slot { check: [0; CHECK_LEN], helper: [0; CODE_BYTES] };
+        slot.check.copy_from_slice(&img[4..4 + CHECK_LEN]);
+        slot.helper.copy_from_slice(&img[4 + CHECK_LEN..4 + CHECK_LEN + CODE_BYTES]);
+        self.slots[target] = Some(slot);
+        self.active = target;
+        self.status = self.decode_status();
         if self.status == Status::Ready {
             info!("puf: enrolled, status {}", self.status);
             true

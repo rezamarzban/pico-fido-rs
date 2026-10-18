@@ -36,7 +36,7 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   upstream does not ship for the RP2040. Results from other boards do not carry over.
 
 ## Behaviour worth knowing
-* **Store and vault.** The last 12 KiB of flash are the vault, the 4 KiB below it the PUF helper sector, the 76 KiB below that (`STORE_PAGES` = 19) the store. If the store area holds nothing the
+* **Store and vault.** The last 12 KiB of flash are the vault, the 8 KiB below it the two PUF helper sectors, the 72 KiB below that (`STORE_PAGES` = 18) the store. If the store area holds nothing the
   store understands, it is erased once at boot and started empty; a vault sector holding unrecognised data is not
   erased, and the device refuses to work until a CTAP reset. A reset or a damaged store therefore loses
   credentials; keep **two** devices registered per account.
@@ -120,13 +120,19 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
 * **Missing helper data is not "new device":** a blank or damaged helper sector with an existing PUF-bound (or unreadable)
   vault record never triggers enrolment. A new PUF secret would orphan the seed (and, before the record tag existed, silently
   yield a wrong seed). The device stays locked with the LED fault pattern; a CTAP reset on a power-on reset re-enrols. The helper
-  sector is a single copy: a power cut inside a CTAP reset after re-enrolment but before the new record is durable leaves the
-  old record unusable; a second CTAP reset repairs it.
+  has two slots and the vault record names the slot it was bound to (record flag bit 2): a re-enrolment writes the other slot and the
+  old one is erased only after the new record is durable (`Puf::commit`), so a power cut in a CTAP reset cannot leave a record
+  without its helper. If the slot a record names holds no valid helper while the other does, the PUF is reported damaged
+  (locked, fault pattern) rather than using a different secret.
 * **Migration is not "protected" until the old record is gone:** binding an old unbound/untagged record (or a PIN record) to the PUF
   locks the device if the older record could not be wiped (and, with the PUF required, `vault::open` refuses a vault whose older
   record cannot be wiped). Software cannot erase flash that cannot be written: that case stays locked rather than claiming protection.
 * **set_pin with an unwipable older record:** the new record and the PIN metadata are both written, then an error is returned; the
   device then needs the older record wiped (next boot retries; with the PUF required the vault stays locked until then).
+* **Stack overflow:** the firmware is linked with `flip-link`, so the stack is the lowest RAM region and an overflow runs off the
+  bottom of RAM into a HardFault instead of corrupting the heap or the RAM-guard state. The fault stops the device (no reset, no
+  watchdog): unplug it. An overflow first passes through the 512 reserved PUF bytes, so a power cycle is needed before the PUF key
+  works again. Peak stack use is measured with `--features stack_probe` (development builds; see README).
 * **Key-value store:** only a store reported as invalid (foreign, older layout or corrupt: indistinguishable) is formatted; flash I/O
   and other errors stop the boot without erasing credentials or a pending reset marker.
 * **Failure modes:** a PUF-bound record with an unrecoverable key stays locked until the key returns or a CTAP reset

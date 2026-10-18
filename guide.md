@@ -61,7 +61,7 @@ key is locked** (unplug it for about 10 seconds and plug it in again; if it pers
   shortly after power-up. Press the button when asked.
 - **Passkeys / U2F:** OpenSK supports discoverable credentials and U2F. Neither has been systematically tested on
   this device. U2F-only sites need an attestation key that this firmware does not ship (see `README.md`).
-- **Backup:** credentials depend on the keys stored inside this device (the store, the SRAM-PUF helper sector and the 12 KiB vault at the end of flash, plus the chip's own SRAM pattern), so a
+- **Backup:** credentials depend on the keys stored inside this device (the store, the SRAM-PUF helper sectors and the 12 KiB vault at the end of flash, plus the chip's own SRAM pattern), so a
   second key cannot be a clone. Register **two** devices on every account. Flashing firmware that changes the flash
   layout, or erasing the flash, loses every credential.
 - **If a site does not recognise the key:** the USB IDs are prototype placeholders; test on webauthn.io first.

@@ -74,6 +74,10 @@ pub struct Record {
     pub wrapped: bool,
     /// Bound to the SRAM PUF key (src/puf.rs): the PIN password / plain-seed mask is mixed with it.
     pub puf: bool,
+    /// Which of the two PUF helper slots (src/puf.rs) the key of this record comes from (0 or 1).
+    /// Only meaningful with `puf`. Written into the record so that a re-enrolment is committed by
+    /// the record itself: both helpers can exist until the new record is durable.
+    pub puf_slot: u8,
     pub m_kib: u32,
     pub t_cost: u8,
     pub salt: [u8; 16],
@@ -103,6 +107,7 @@ impl Record {
         Record {
             wrapped: false,
             puf: false,
+            puf_slot: 0,
             m_kib: 0,
             t_cost: 0,
             salt: [0; 16],
@@ -159,7 +164,7 @@ fn encode(rec: &Record, seq: u32) -> [u8; REC_LEN] {
     let mut r = [0u8; REC_LEN];
     r[..4].copy_from_slice(&MAGIC);
     r[4..8].copy_from_slice(&seq.to_le_bytes());
-    r[8] = rec.wrapped as u8 | (rec.puf as u8) << 1;
+    r[8] = rec.wrapped as u8 | (rec.puf as u8) << 1 | (rec.puf_slot & 1) << 2;
     r[9..13].copy_from_slice(&rec.m_kib.to_le_bytes());
     r[13] = rec.t_cost;
     r[14..30].copy_from_slice(&rec.salt);
@@ -173,8 +178,8 @@ fn encode(rec: &Record, seq: u32) -> [u8; REC_LEN] {
 fn decode(r: &[u8; REC_LEN]) -> Option<(Record, u32)> {
     let seq = u32::from_le_bytes(r[4..8].try_into().unwrap());
     if r[..4] == MAGIC && Sha256::digest(&r[..94])[..16] == r[94..] {
-        // bit 0: PIN-wrapped, bit 1: PUF-bound
-        if r[8] > 3 {
+        // bit 0: PIN-wrapped, bit 1: PUF-bound, bit 2: PUF helper slot
+        if r[8] > 7 {
             return None;
         }
         let wrapped = r[8] & 1 != 0;
@@ -183,6 +188,7 @@ fn decode(r: &[u8; REC_LEN]) -> Option<(Record, u32)> {
             Record {
                 wrapped,
                 puf,
+                puf_slot: (r[8] >> 2) & 1,
                 m_kib: u32::from_le_bytes(r[9..13].try_into().unwrap()),
                 t_cost: r[13],
                 salt: r[14..30].try_into().unwrap(),

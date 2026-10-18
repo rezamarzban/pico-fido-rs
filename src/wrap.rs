@@ -125,6 +125,7 @@ pub fn wrap(
     Some(Record {
         wrapped: true,
         puf: puf.is_some(),
+        puf_slot: 0, // the caller sets the real slot (`bind_slot` in env/harden.rs)
         m_kib: M_KIB,
         t_cost: T_COST,
         salt,

@@ -56,7 +56,11 @@ available when the fixes were written): build, `cargo clippy`, `sh host-test/run
 | se3 review 4 | `ctap.rs` comment indentation (rustfmt) | Fixed. |
 | se4 review | 17 clippy warnings (`Cow<[u8]>` lifetime, `&**k`, `% n == 0`, doc lists) | Fixed (not re-run: no toolchain here). |
 | se4 review | Ignored `enroll()` result in `reset`; ignored `finish_try` result | `enroll()` failure now logged, `finish_try` failure logged (the attempt stays counted, which is the safe direction; it does not lose a try). |
-| open | PUF helper is a single sector (power cut mid-reset needs a second reset); PIN counter erase window when its sector is full | Documented in SECURITY.md; would need extra flash sectors. |
+| se4 stack | No stack-overflow protection: the stack grew down into `.bss` (128 KiB heap, RAM-guard statics) | `flip-link` is now the linker (`.cargo/config.toml`, installed by `build.sh` and CI): the stack is the lowest RAM region and an overflow faults. Peak use can be logged with `--features stack_probe`. Not built or run here; the measured peak is still open. |
+| open | No hardware watchdog. A feed would have to come from the blocking waits (`block_for` loops, user presence, Argon2, flash erase) as well as the main loop, otherwise legitimate long operations trigger a reset | Not changed |
+| open | Flash store erase budget (`max_page_erases` = 10000 per page) is a conservative software limit; reaching it makes the store refuse writes | Documented only |
+| se4 puf2 | PUF helper was a single sector: a power cut inside a CTAP reset left the old record without its helper | Fixed: two helper slots, the record names its slot, the old helper is erased only after the new record is durable. Layout change (store 19 -> 18 pages): old images must be erased. Not compiled or power-cut tested. |
+| open | PIN counter erase window when its sector is full | Documented in SECURITY.md; would need an extra flash sector. |
 | open | No `Cargo.lock` | Needs a successful build to generate. |
 
 ## Status and open items
