@@ -1,7 +1,7 @@
 use guard_host_tests::store::*;
 
-struct Mock { s: [[u8; REC_LEN]; 2], t: [u8; TRIES_PAGES], bad_erase: [bool; 2], bad_write: [bool; 2], half_erase: [bool; 2] }
-impl Mock { fn new() -> Self { Mock { s: [[0xFF; REC_LEN]; 2], t: [0xFF; TRIES_PAGES], bad_erase: [false; 2], bad_write: [false; 2], half_erase: [false; 2] } } }
+struct Mock { s: [[u8; REC_LEN]; 2], t: [u8; TRIES_PAGES], bad_erase: [bool; 2], bad_write: [bool; 2], half_erase: [bool; 2], clear_fails: Vec<u8> }
+impl Mock { fn new() -> Self { Mock { s: [[0xFF; REC_LEN]; 2], t: [0xFF; TRIES_PAGES], bad_erase: [false; 2], bad_write: [false; 2], half_erase: [false; 2], clear_fails: Vec::new() } } }
 impl Sectors for Mock {
     type Error = ();
     fn read(&mut self, slot: usize, buf: &mut [u8; REC_LEN]) -> Result<(), ()> { *buf = self.s[slot]; Ok(()) }
@@ -16,7 +16,12 @@ impl Sectors for Mock {
     }
     fn tries_read(&mut self, o: &mut [u8; TRIES_PAGES]) -> Result<(), ()> { *o = self.t; Ok(()) }
     fn tries_mark(&mut self, p: usize, v: u8) -> Result<(), ()> { self.t[p] &= v; Ok(()) }
-    fn tries_clear(&mut self) -> Result<(), ()> { self.t = [0xFF; TRIES_PAGES]; Ok(()) }
+    fn tries_clear(&mut self) -> Result<(), ()> {
+        // failures that were pending (since the last DONE flag) at the moment of the erase
+        let pending = self.t.iter().take_while(|&&b| b != 0xFF).fold(0u8, |f, &b| if b == 0x00 { 0 } else { f + 1 });
+        self.clear_fails.push(pending);
+        self.t = [0xFF; TRIES_PAGES]; Ok(())
+    }
 }
 fn wrapped() -> Record { Record { wrapped: true, puf: false, puf_slot: 0, m_kib: 64, t_cost: 3, salt: [5; 16], body: [6; 32], tag: [7; 32] } }
 
@@ -76,4 +81,29 @@ fn puf_slot_survives_a_save_and_load() {
         Ok(Loaded::Rec(r, _)) => { assert!(r.puf); assert_eq!(r.puf_slot, 1); }
         r => panic!("{:?}", r),
     }
+}
+
+#[test]
+fn counter_sector_is_never_erased_with_failures_pending() {
+    let mut m = Mock::new();
+    // 200 rounds of 0..=7 wrong guesses followed by one correct PIN: the sector fills up many times.
+    for round in 0..200usize {
+        let wrong = round % 8;
+        for _ in 0..wrong { begin_try(&mut m).unwrap(); }
+        assert_eq!(count_tries(&mut m).unwrap() as usize, wrong);
+        let p = begin_try(&mut m).unwrap();
+        finish_try(&mut m, p).unwrap();
+        assert_eq!(count_tries(&mut m).unwrap(), 0);
+    }
+    assert!(!m.clear_fails.is_empty(), "the sector should have been recycled");
+    assert!(m.clear_fails.iter().all(|&f| f == 0), "erased with failures pending: {:?}", m.clear_fails);
+}
+
+#[test]
+fn eight_failures_block_even_after_recycling() {
+    let mut m = Mock::new();
+    for _ in 0..50 { let p = begin_try(&mut m).unwrap(); finish_try(&mut m, p).unwrap(); }
+    for _ in 0..TRIES_MAX { begin_try(&mut m).unwrap(); }
+    assert_eq!(count_tries(&mut m).unwrap() as usize, TRIES_MAX);
+    assert!(begin_try(&mut m).is_err());
 }

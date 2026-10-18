@@ -75,6 +75,11 @@ the right `--features` (`-s` flash size in MiB, `-u` adds the USB serial number)
 *committed* revision of the repository. **The default `-b` is `openSK-based-se4`** (this branch); pass `-b` to build another branch. With a committed `Cargo.lock` the script builds with `--locked` only and fails instead of resolving newer crates; without one it warns and builds unlocked. This script itself was only syntax-checked; the maintainer's Colab build
 (same toolchain and features) is what was run on hardware.
 
+## Watchdog (optional)
+Build with `--features watchdog` to enable the RP2040 watchdog (8 s). Only the main thread feeds it (`src/wdog.rs`), so a hang or a
+stack-overflow fault ends in a reset. It is off by default: a single blocking step longer than 8 s without feeding (Argon2, a signature, a
+store compaction) would reset the device in the middle of a command, so time the longest step on your hardware first. Not built or tested.
+
 ## Stack protection and measurement
 The firmware is linked with [`flip-link`](https://github.com/knurling-rs/flip-link) (`.cargo/config.toml`; `cargo install flip-link --locked`,
 done by `build.sh` and CI). It puts the stack below the statics, so an overflow faults instead of overwriting the heap or the secret-guard

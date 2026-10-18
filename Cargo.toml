@@ -17,6 +17,8 @@ usb_serial = []
 sram_puf = []
 # Development only: paint the stack and log its peak use (src/stack_probe.rs). Needs flip-link.
 stack_probe = []
+# Hardware watchdog fed by the main thread only (src/wdog.rs). Off until the longest blocking step is measured.
+watchdog = []
 
 [dependencies]
 cortex-m = { version = "0.7.7", features = ["inline-asm"] }
