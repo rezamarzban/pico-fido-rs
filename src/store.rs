@@ -389,7 +389,10 @@ pub fn begin_try<S: Sectors>(s: &mut S) -> Result<usize, SaveError> {
     let page = match free {
         Some(p) => p,
         None => {
-            // Sector full: erase and re-write the pending failures (0 in the usual case).
+            // Sector full. `finish_try` recycles the sector while no failure is pending, so this
+            // is only reached if that erase failed (or the sector was filled by an older
+            // firmware). Re-write the pending failures after the erase; a power cut in this
+            // window can only forgive failures that were counted since the last success.
             s.tries_clear().map_err(|_| SaveError::Io)?;
             for p in 0..fails as usize {
                 s.tries_mark(p, T_START).map_err(|_| SaveError::Io)?;
@@ -406,10 +409,23 @@ pub fn begin_try<S: Sectors>(s: &mut S) -> Result<usize, SaveError> {
 }
 
 /// The PIN was correct: marks the attempt DONE, which forgives all earlier failures.
+///
+/// This is also where the counter sector is recycled. Every failure is forgiven at this moment, so
+/// erasing the sector loses no count whatever happens to the power: a cut leaves either the old
+/// marks (ending in this DONE flag) or a blank sector, both meaning "0 failures". Doing it only
+/// when the sector would be too full for a worst-case run of failed attempts (`TRIES_MAX` pages)
+/// guarantees that `begin_try` never has to erase with failures pending (see there).
 pub fn finish_try<S: Sectors>(s: &mut S, page: usize) -> Result<(), SaveError> {
     s.tries_mark(page, T_DONE).map_err(|_| SaveError::Io)?;
-    if read_tries(s)?[page] != T_DONE {
+    let f = read_tries(s)?;
+    if f[page] != T_DONE {
         return Err(SaveError::Verify);
+    }
+    let free = f.iter().filter(|&&b| b == 0xFF).count();
+    if free < TRIES_MAX {
+        // Best effort: the forgiveness above is already durable and the sector stays usable
+        // (a torn erase only counts against the user, never in their favour).
+        let _ = s.tries_clear();
     }
     Ok(())
 }

@@ -5,7 +5,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
-use embassy_time::{block_for, Duration, Instant};
+use embassy_time::{Duration, Instant};
 use opensk::api::connection::{HidConnection, RecvStatus, UsbEndpoint};
 use opensk::ctap::status_code::{Ctap2StatusCode, CtapResult};
 use portable_atomic::{AtomicU32, Ordering};
@@ -98,7 +98,7 @@ pub fn recv_packet(buf: &mut HidPacket, timeout_ms: Option<usize>) -> bool {
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return false;
         }
-        block_for(POLL);
+        crate::wdog::poll_wait(POLL);
     }
 }
 
@@ -122,7 +122,7 @@ pub fn wait_packet(buf: &mut HidPacket, timeout_ms: Option<usize>, seen: u32) ->
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return false;
         }
-        block_for(POLL);
+        crate::wdog::poll_wait(POLL);
     }
 }
 
@@ -150,7 +150,7 @@ impl HidConnection for PicoHidConnection {
             if Instant::now() >= deadline {
                 return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_HARDWARE_FAILURE);
             }
-            block_for(POLL);
+            crate::wdog::poll_wait(POLL);
         }
     }
 

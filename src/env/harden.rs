@@ -169,6 +169,31 @@ fn bind_slot(mut rec: Record, puf: &Puf) -> Record {
 }
 
 impl HardenPersist {
+    /// Boot-time repair of a power cut inside `set_pin` (see there). Only acts on a loaded record.
+    fn reconcile_pin_metadata(&mut self) -> CtapResult<()> {
+        let Some(wrapped) = self.st.get_mut().rec.as_ref().map(|r| r.wrapped) else {
+            return Ok(());
+        };
+        let has_props = self.raw.find(keys::PIN_PROPERTIES)?.is_some();
+        match (wrapped, has_props) {
+            (false, true) => {
+                // set_pin was cut before its vault commit: no PIN exists, the seed is intact.
+                warn!("init: PIN metadata without a PIN-wrapped vault - removed");
+                self.raw.remove(keys::PIN_PROPERTIES)?;
+            }
+            (true, false) => {
+                // A PIN-wrapped vault must come with metadata (only older firmware could cut
+                // between the two). The real length is unknown: use the enforced minimum.
+                warn!("init: PIN-wrapped vault without PIN metadata - restored");
+                let mut props = [0u8; 17];
+                props[0] = 10; // default_min_pin_length (src/env/mod.rs)
+                self.raw.insert(keys::PIN_PROPERTIES, &props)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub fn new(
         raw: PicoPersist,
         vault: FlashVault,
@@ -542,7 +567,16 @@ impl Persist for HardenPersist {
                 )
             };
             guard::refresh_now();
-            // 3. Commit. Only a record that is durable AND whose predecessor was verified wiped
+            // 3. PIN metadata BEFORE the vault commit. The only inconsistent states a power cut can
+            //    leave are then "metadata says PIN, vault has no PIN" (undone by `init`, the
+            //    seed is untouched) and "old PIN record + new length" (harmless). The reverse
+            //    (PIN-wrapped vault, no metadata) cannot be produced any more.
+            let was_wrapped = st.rec.as_ref().is_some_and(|r| r.wrapped);
+            // The stored PIN "hash" is zeros: the real check is the Argon2 tag in the vault.
+            let mut props = [0u8; 17];
+            props[0] = pin_code_point_length;
+            self.raw.insert(keys::PIN_PROPERTIES, &props)?;
+            // 4. Commit. Only a record that is durable AND whose predecessor was verified wiped
             //    counts as success.
             match st.vault.replace(&rec) {
                 Replaced::New(saved) => {
@@ -563,7 +597,13 @@ impl Persist for HardenPersist {
                     }
                 }
                 // Nothing changed: the old record is still the newest one.
-                Replaced::Kept(_) => return Err(hw_fail()),
+                Replaced::Kept(_) => {
+                    if !was_wrapped {
+                        // Undo the metadata, otherwise a PIN would be expected that never existed.
+                        let _ = self.raw.remove(keys::PIN_PROPERTIES);
+                    }
+                    return Err(hw_fail());
+                }
                 // The flash state is unknown or empty: stop using any key.
                 Replaced::NoKey | Replaced::Unknown => {
                     st.fail_closed();
@@ -571,11 +611,7 @@ impl Persist for HardenPersist {
                 }
             }
         }
-        // The stored PIN "hash" is zeros: the real check is the Argon2 tag in the vault.
-        let mut props = [0u8; 17];
-        props[0] = pin_code_point_length;
-        self.raw.insert(keys::PIN_PROPERTIES, &props)?;
-        // If power fails between these 2 transactions, PIN has to be set again.
+        // Last: if power fails here the PIN is set and a PIN change is merely still requested.
         self.raw.remove(keys::FORCE_PIN_CHANGE)?;
         if wipe_failed {
             return Err(hw_fail());
@@ -641,8 +677,9 @@ impl Persist for HardenPersist {
                 }
                 return Ok(());
             }
+            return Ok(());
         }
-        Ok(())
+        self.reconcile_pin_metadata()
     }
 
     fn reset(&mut self) -> CtapResult<()> {

@@ -4,7 +4,7 @@
 //! button that is already held down when a request arrives does not count.
 use defmt::info;
 use embassy_rp::peripherals::BOOTSEL;
-use embassy_time::{block_for, Duration, Instant};
+use embassy_time::{Duration, Instant};
 use opensk::api::connection::{RecvStatus, UsbEndpoint};
 use opensk::api::user_presence::{UserPresence, UserPresenceError, UserPresenceWaitResult};
 
@@ -84,7 +84,7 @@ impl UserPresence for PicoUserPresence {
             if Instant::now() >= deadline {
                 return Ok((Err(UserPresenceError::Timeout), RecvStatus::Timeout));
             }
-            block_for(POLL);
+            crate::wdog::poll_wait(POLL);
         }
     }
 

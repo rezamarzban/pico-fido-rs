@@ -30,6 +30,7 @@ mod puf;
 mod ram_guard;
 #[cfg(feature = "stack_probe")]
 mod stack_probe;
+mod wdog;
 mod store;
 mod usb;
 mod vault;
@@ -120,6 +121,8 @@ fn main() -> ! {
     info!("Starting (OpenSK)");
 
     let p = embassy_rp::init(Default::default());
+    #[cfg(feature = "watchdog")]
+    wdog::start(embassy_rp::watchdog::Watchdog::new(p.WATCHDOG));
     let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
 
     // RAM guard: seed the mask DRBG once, before any secret is stored (ROSC, flash unique ID,
@@ -177,6 +180,7 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
     let mut seen = env::hid::epoch();
     LED_SIGNAL.signal(LedState::Active);
     loop {
+        wdog::feed();
         #[cfg(feature = "stack_probe")]
         stack_probe::report();
         let wink = ctap.should_wink();

@@ -83,12 +83,13 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   by default).
 * Not protected: RAM while a session is open, side channels, fault injection; the RNG is the ROSC
   (not a certified TRNG).
-* **PIN retry counter, full sector:** after the counter sector has filled up, the next attempt erases it and re-writes the pending
-  failures; a power cut inside that window loses the count of the failures before it. Needs physical control of the USB power and
-  exact timing; not mitigated (it would need a second counter sector).
+* **PIN retry counter, full sector:** the counter sector is erased by `finish_try`, i.e. right after a correct PIN, when every
+  earlier failure has just been forgiven, and only when fewer than `TRIES_MAX` (8) pages are left. A power cut during that erase
+  therefore cannot lose a pending failure, and `begin_try` can no longer meet a full sector with failures pending (its old
+  erase-and-rewrite path remains only as a fallback if that erase failed). A torn erase can only count against the user.
 * Reflash with a full flash erase: the layout moved (vault at the end, store 12 KiB lower).
-* An interrupted setPIN (power cut between the vault write and the PIN record) can leave a state that only a CTAP
-  reset fixes. A damaged vault makes the device refuse to work until a reset.
+* An interrupted setPIN is repaired at the next boot (see "setPIN power cut" below). A damaged vault makes the device refuse to
+  work until a reset.
 
 ## SRAM PUF (`src/puf.rs`)
 
@@ -127,11 +128,18 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
 * **Migration is not "protected" until the old record is gone:** binding an old unbound/untagged record (or a PIN record) to the PUF
   locks the device if the older record could not be wiped (and, with the PUF required, `vault::open` refuses a vault whose older
   record cannot be wiped). Software cannot erase flash that cannot be written: that case stays locked rather than claiming protection.
+* **setPIN power cut:** the PIN metadata is written BEFORE the vault commit and `init` repairs the two inconsistent states: metadata
+  without a PIN-wrapped vault (cut before the commit: the metadata is removed, the seed is intact, set the PIN again) and, for
+  vaults written by older firmware, a PIN-wrapped vault without metadata (restored with the minimum PIN length). No CTAP reset is
+  needed any more. A failed commit that leaves the old plain record removes the metadata again.
+* **Watchdog (feature `watchdog`, off by default):** fed only by the main thread (polling waits and the main loop), so a hang or a
+  stack-overflow HardFault ends in a reset after 8 s. Off because a single blocking step longer than that (Argon2, a signature, a
+  store compaction) would reset the device mid-command: measure the longest step on hardware first.
 * **set_pin with an unwipable older record:** the new record and the PIN metadata are both written, then an error is returned; the
   device then needs the older record wiped (next boot retries; with the PUF required the vault stays locked until then).
 * **Stack overflow:** the firmware is linked with `flip-link`, so the stack is the lowest RAM region and an overflow runs off the
-  bottom of RAM into a HardFault instead of corrupting the heap or the RAM-guard state. The fault stops the device (no reset, no
-  watchdog): unplug it. An overflow first passes through the 512 reserved PUF bytes, so a power cycle is needed before the PUF key
+  bottom of RAM into a HardFault instead of corrupting the heap or the RAM-guard state. The fault stops the device (no reset unless built
+  with the `watchdog` feature): unplug it. An overflow first passes through the 512 reserved PUF bytes, so a power cycle is needed before the PUF key
   works again. Peak stack use is measured with `--features stack_probe` (development builds; see README).
 * **Key-value store:** only a store reported as invalid (foreign, older layout or corrupt: indistinguishable) is formatted; flash I/O
   and other errors stop the boot without erasing credentials or a pending reset marker.
