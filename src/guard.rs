@@ -1,15 +1,22 @@
 //! Firmware side of `ram_guard`: the one protected secret (the 32-byte master seed), boot-time
-//! entropy seeding, and the 1 ms refresh task.
+//! entropy seeding, and the adaptive refresh task.
 //!
 //! The pool, the DRBG and the share table sit in one `static` behind a critical section, so the
 //! refresh task (interrupt executor) and the main thread can both touch them safely. Critical
-//! sections here are short: a refresh is ~7 ChaCha20 blocks plus 14 XORs of 32 bytes. Anything
-//! heavy (HMAC expansion, Argon2) happens OUTSIDE the lock, on a `Zeroizing` copy.
+//! sections here are short: a refresh is split in 7 independent pair steps, each one ChaCha20
+//! block plus two XORs of 32 bytes, each in its own critical section (interrupts, USB included,
+//! are served between the steps). Anything heavy (HMAC expansion, Argon2) happens OUTSIDE the
+//! lock, on a `Zeroizing` copy.
+//!
+//! Refresh scheduling (see `tick_task`): fast while the device is in use, slower when it is idle,
+//! hardly at all while it is locked (no seed, nothing to protect), so the spare CPU time is spent
+//! where it matters and the rest is left to sleep.
 use core::cell::RefCell;
 use embassy_rp::clocks::RoscRng;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
-use embassy_time::{Duration, Instant, Ticker};
+use embassy_time::{Duration, Instant, Timer};
+use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 use rand_core::RngCore;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -19,10 +26,73 @@ use crate::ram_guard::{Drbg, Masked, Pool};
 
 /// Shares per secret (compile-time checked to 4..=16).
 pub const SHARES: usize = 8;
-/// Background refresh period.
-const REFRESH_MS: u64 = 1;
-/// The DRBG is reseeded from the conditioned ROSC pool every this many ticks (~1 s).
-const RESEED_EVERY: u32 = 1000;
+/// Refresh period while the device is in use (a packet, a reveal or a seed store within the last
+/// `ACTIVE_WINDOW_MS`), idle with a seed, and locked (no seed: the task only keeps a slow
+/// heartbeat so a sleeping main thread is woken regularly).
+const ACTIVE_US: u64 = 500;
+const IDLE_US: u64 = 2_000;
+const LOCKED_US: u64 = 50_000;
+const ACTIVE_WINDOW_MS: u32 = 3_000;
+/// The DRBG is reseeded from the conditioned ROSC pool about this often (only with a seed).
+const RESEED_MS: u32 = 1_000;
+
+// ---- scheduling state and statistics (relaxed atomics: nothing here is secret) ------------
+static LAST_ACTIVITY_MS: AtomicU32 = AtomicU32::new(0);
+static TICKING: AtomicBool = AtomicBool::new(false);
+static REFRESHES: AtomicU32 = AtomicU32::new(0);
+static BUSY_US: AtomicU32 = AtomicU32::new(0);
+static MAX_CS_US: AtomicU32 = AtomicU32::new(0);
+static MAX_LATE_US: AtomicU32 = AtomicU32::new(0);
+static PERIOD_US: AtomicU32 = AtomicU32::new(0);
+
+fn now_ms() -> u32 {
+    Instant::now().as_millis() as u32
+}
+
+/// Marks "the device is in use": the refresh runs at the fast rate for the next few seconds.
+pub fn touch() {
+    LAST_ACTIVITY_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+fn active() -> bool {
+    now_ms().wrapping_sub(LAST_ACTIVITY_MS.load(Ordering::Relaxed)) < ACTIVE_WINDOW_MS
+}
+
+/// True once the refresh task runs; it keeps a timer interrupt pending at least every
+/// `LOCKED_US`, which is what makes `wfi` sleeps of the main thread safe.
+pub fn ticking() -> bool {
+    TICKING.load(Ordering::Relaxed)
+}
+
+/// Counters for the status display and the stress test.
+pub struct Snapshot {
+    /// Full refreshes since boot (wrapping).
+    pub refreshes: u32,
+    /// Time spent refreshing since boot, microseconds (wrapping).
+    pub busy_us: u32,
+    /// Longest single critical section of a refresh step, microseconds.
+    pub max_cs_us: u32,
+    /// Latest a refresh tick ran after its due time, microseconds.
+    pub max_late_us: u32,
+    /// Current refresh period, microseconds.
+    pub period_us: u32,
+}
+
+pub fn snapshot() -> Snapshot {
+    Snapshot {
+        refreshes: REFRESHES.load(Ordering::Relaxed),
+        busy_us: BUSY_US.load(Ordering::Relaxed),
+        max_cs_us: MAX_CS_US.load(Ordering::Relaxed),
+        max_late_us: MAX_LATE_US.load(Ordering::Relaxed),
+        period_us: PERIOD_US.load(Ordering::Relaxed),
+    }
+}
+
+fn max_update(a: &AtomicU32, v: u32) {
+    if v > a.load(Ordering::Relaxed) {
+        a.store(v, Ordering::Relaxed);
+    }
+}
 
 struct Guard {
     pool: Pool,
@@ -31,11 +101,27 @@ struct Guard {
 }
 
 impl Guard {
-    fn refresh(&mut self) {
+    /// One step of a refresh (see `Masked::refresh_pair`).
+    fn refresh_pair(&mut self, k: usize) {
         if let Some(m) = &self.seed {
-            m.refresh(&mut self.pool, &mut self.drbg);
+            m.refresh_pair(&mut self.pool, &mut self.drbg, k);
         }
     }
+}
+
+/// A full refresh, as `Masked::PAIRS` separate short critical sections so that interrupts (USB)
+/// are served in between. The secret stays valid after every single step.
+fn refresh_once() {
+    let mut busy = 0u32;
+    for k in 0..Masked::<SHARES>::PAIRS {
+        let t0 = Instant::now();
+        with(|g| g.refresh_pair(k));
+        let dt = Instant::now().as_micros().wrapping_sub(t0.as_micros()) as u32;
+        busy = busy.wrapping_add(dt);
+        max_update(&MAX_CS_US, dt);
+    }
+    BUSY_US.fetch_add(busy, Ordering::Relaxed);
+    REFRESHES.fetch_add(1, Ordering::Relaxed);
 }
 
 static GUARD: Mutex<CriticalSectionRawMutex, RefCell<Option<Guard>>> =
@@ -78,6 +164,7 @@ pub fn init(flash_uid: &[u8], mut adc_sample: impl FnMut() -> u16) {
 
 /// Stores (or replaces) the protected seed. `false` if `init` was not called or the pool is full.
 pub fn store_seed(secret: &[u8; 32]) -> bool {
+    touch();
     with(|g| {
         if let Some(old) = g.seed.take() {
             old.release(&mut g.pool, &mut g.drbg);
@@ -97,19 +184,30 @@ pub fn store_seed(secret: &[u8; 32]) -> bool {
 /// of the shares taken during the reveal is already stale when it returns. `false` = no seed
 /// (locked). `out` must be a `Zeroizing` owned by the caller.
 pub fn reveal_seed_into(out: &mut Zeroizing<[u8; 32]>) -> bool {
-    with(|g| {
-        g.refresh();
-        let ok = match &g.seed {
-            Some(m) => {
-                m.reveal_into(&g.pool, out);
-                true
-            }
-            None => false,
-        };
-        g.refresh();
-        ok
+    touch();
+    refresh_once();
+    // The reveal itself is one short critical section; the caller owns (and wipes) `out`.
+    let ok = with(|g| match &g.seed {
+        Some(m) => {
+            m.reveal_into(&g.pool, out);
+            true
+        }
+        None => false,
     })
-    .unwrap_or(false)
+    .unwrap_or(false);
+    refresh_once();
+    ok
+}
+
+/// Just-in-time use of the seed: reveals it into a local `Zeroizing`, runs `f`, wipes it on every
+/// exit path (return, `?`, unwinding is not used on this target). `None` = locked.
+#[allow(dead_code)]
+pub fn with_seed<R>(f: impl FnOnce(&[u8; 32]) -> R) -> Option<R> {
+    let mut s = Zeroizing::new([0u8; 32]);
+    if !reveal_seed_into(&mut s) {
+        return None;
+    }
+    Some(f(&s))
 }
 
 /// Forgets the seed (shares overwritten with decoys). Safe from any context, including the USB
@@ -128,7 +226,7 @@ pub fn has_seed() -> bool {
 
 /// Refresh now (before / after a signing, PIN check or key derivation).
 pub fn refresh_now() {
-    with(|g| g.refresh());
+    refresh_once();
 }
 
 fn reseed() {
@@ -139,17 +237,46 @@ fn reseed() {
 }
 
 /// Periodic refresh on the interrupt executor: it keeps running while the main thread is busy
-/// with a signature or waiting for the button.
+/// with a signature or waiting for the button. The period adapts: `ACTIVE_US` while in use,
+/// `IDLE_US` with a seed but no recent activity, `LOCKED_US` without a seed (nothing to refresh).
 #[embassy_executor::task]
 pub async fn tick_task() {
-    let mut t = Ticker::every(Duration::from_millis(REFRESH_MS));
-    let mut n = 0u32;
+    TICKING.store(true, Ordering::Relaxed);
+    let mut last_reseed = now_ms();
+    #[cfg(feature = "guard_log")]
+    let mut last_log = now_ms();
     loop {
-        t.next().await;
-        refresh_now();
-        n = n.wrapping_add(1);
-        if n.is_multiple_of(RESEED_EVERY) {
-            reseed();
+        let seed = has_seed();
+        let period = if !seed {
+            LOCKED_US
+        } else if active() {
+            ACTIVE_US
+        } else {
+            IDLE_US
+        };
+        PERIOD_US.store(period as u32, Ordering::Relaxed);
+        let due = Instant::now() + Duration::from_micros(period);
+        Timer::at(due).await;
+        let late = Instant::now().as_micros().saturating_sub(due.as_micros()) as u32;
+        max_update(&MAX_LATE_US, late);
+        if seed {
+            refresh_once();
+            if now_ms().wrapping_sub(last_reseed) >= RESEED_MS {
+                last_reseed = now_ms();
+                reseed();
+            }
+        }
+        #[cfg(feature = "guard_log")]
+        {
+            let t = now_ms();
+            if t.wrapping_sub(last_log) >= 5_000 {
+                last_log = t;
+                let s = snapshot();
+                defmt::info!(
+                    "guard: {} refreshes, period {} us, longest critical section {} us, latest tick {} us late",
+                    s.refreshes, s.period_us, s.max_cs_us, s.max_late_us
+                );
+            }
         }
     }
 }

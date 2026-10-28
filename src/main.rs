@@ -28,8 +28,12 @@ mod health;
 mod keys;
 mod puf;
 mod ram_guard;
+#[cfg(feature = "oled")]
+mod oled;
+mod scrub;
 #[cfg(feature = "stack_probe")]
 mod stack_probe;
+mod status;
 mod wdog;
 mod store;
 mod usb;
@@ -109,13 +113,20 @@ async fn usb_executor_init(parts: AssertSend<UsbParts>) {
     spawner.spawn(usb::run_usb(device)).unwrap();
     spawner.spawn(usb::usb_io(reader, writer)).unwrap();
     spawner.spawn(blinker(led)).unwrap();
-    // Share refresh every millisecond, also while the main thread signs or waits for the button.
+    // Adaptive share refresh (src/guard.rs), also while the main thread signs or waits for the button.
     spawner.spawn(guard::tick_task()).unwrap();
+}
+
+/// Heap in use, bytes (for the status display).
+pub fn heap_used() -> usize {
+    HEAP.used()
 }
 
 #[entry]
 fn main() -> ! {
     unsafe { HEAP.init(core::ptr::addr_of_mut!(HEAP_MEM) as usize, HEAP_SIZE) }
+    // A warm reset (watchdog, panic) keeps RAM: overwrite what the previous run left on the stack.
+    scrub::stack_boot();
     #[cfg(feature = "stack_probe")]
     stack_probe::paint();
     info!("Starting (OpenSK)");
@@ -123,6 +134,8 @@ fn main() -> ! {
     let p = embassy_rp::init(Default::default());
     #[cfg(feature = "watchdog")]
     wdog::start(embassy_rp::watchdog::Watchdog::new(p.WATCHDOG));
+    #[cfg(feature = "oled")]
+    oled::init(p.I2C0, p.PIN_17, p.PIN_16);
     let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
 
     // RAM guard: seed the mask DRBG once, before any secret is stored (ROSC, flash unique ID,
@@ -178,9 +191,22 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
     let mut winking = false;
     let mut u2f_armed = false;
     let mut seen = env::hid::epoch();
+    #[cfg(feature = "oled")]
+    let mut last_store_ms = 0u32;
     LED_SIGNAL.signal(LedState::Active);
     loop {
         wdog::feed();
+        // Key-value store figures for the display (reads the store: every 15 s at most).
+        #[cfg(feature = "oled")]
+        {
+            let t = embassy_time::Instant::now().as_millis() as u32;
+            if t.wrapping_sub(last_store_ms) >= 15_000 || last_store_ms == 0 {
+                last_store_ms = t.max(1);
+                if let Some((u, tot, lu, lt)) = ctap.env().persist().store_stats() {
+                    status::set_store(u, tot, lu, lt);
+                }
+            }
+        }
         #[cfg(feature = "stack_probe")]
         stack_probe::report();
         let wink = ctap.should_wink();
@@ -210,6 +236,8 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
             received = false;
             ctap.env().persist().lock();
             ctap.cancel_in_flight();
+            status::BUSY.store(false, portable_atomic::Ordering::Relaxed);
+            scrub::stack();
             u2f_armed = false;
             winking = false;
             LED_SIGNAL.signal(LedState::Active);
@@ -223,6 +251,9 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
         }
 
         if received {
+            guard::touch();
+            status::PKTS.fetch_add(1, portable_atomic::Ordering::Relaxed);
+            status::BUSY.store(true, portable_atomic::Ordering::Relaxed);
             // Stamp the operation: everything blocking inside it (user presence, sends) stops
             // as soon as a reset / suspend / unplug bumps the epoch.
             let op = env::hid::begin_op_at(seen);
@@ -244,6 +275,10 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
                 }
             }
             guard::refresh_now();
+            status::BUSY.store(false, portable_atomic::Ordering::Relaxed);
+            // Dead stack frames of the command (moved keys, hash/HMAC state) may still hold
+            // secret bytes: overwrite them now.
+            scrub::stack();
             if !u2f_armed && !winking {
                 LED_SIGNAL.signal(LedState::Active);
             }

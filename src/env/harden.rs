@@ -2,7 +2,7 @@
 //!
 //! * The 32-byte master seed lives in the vault (src/vault.rs), wrapped under the PIN with
 //!   Argon2id once a PIN is set. After a correct PIN the seed is kept in RAM ONLY as XOR shares
-//!   (src/ram_guard.rs, src/guard.rs), refreshed every millisecond and around every key use, until
+//!   (src/ram_guard.rs, src/guard.rs), refreshed (adaptively, every 0.5 to 2 ms while a seed is held) and around every key use, until
 //!   `lock_now()` (USB reset / suspend / unplug) or power-off. The 128 bytes OpenSK's key store
 //!   uses are derived from the seed on demand and wiped right after.
 //!   OpenSK's default key store (`key_store::Helper`) reads those bytes through
@@ -40,6 +40,11 @@ static WRAPPED: AtomicBool = AtomicBool::new(false);
 /// Forgets the seed immediately when a PIN protects it (no-op without a PIN). Callable from any
 /// context: the USB handler calls it on reset / suspend / disconnect, so an operation that is
 /// still running cannot start another key use.
+/// A PIN-wrapped vault is loaded (for the display).
+pub fn pin_set() -> bool {
+    WRAPPED.load(Ordering::Relaxed)
+}
+
 pub fn lock_now() {
     if WRAPPED.load(Ordering::Relaxed) {
         guard::clear_seed();
@@ -361,7 +366,10 @@ impl HardenPersist {
 
     /// Derives the 128-byte key-store master from the masked seed. The shares are refreshed
     /// before and right after the reveal, and every plaintext temporary is wiped on drop.
-    fn master(&self) -> CtapResult<Zeroizing<[u8; 128]>> {
+    ///
+    /// Writes into the caller's buffer instead of returning it: a by-value return of 128 bytes
+    /// can leave a copy in the callee's dead stack frame.
+    fn master_into(&self, m: &mut Zeroizing<[u8; 128]>) -> CtapResult<()> {
         if self.st.borrow().rec.is_none() {
             return Err(hw_fail());
         }
@@ -369,9 +377,13 @@ impl HardenPersist {
         if !guard::reveal_seed_into(&mut seed) {
             return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
         }
-        let mut m = Zeroizing::new([0u8; 128]);
-        wrap::expand_into(&seed, &mut m);
-        Ok(m)
+        wrap::expand_into(&seed, m);
+        Ok(())
+    }
+
+    /// Key-value store figures for the display: (used, total, erase budget used, total), words.
+    pub fn store_stats(&self) -> Option<(u32, u32, u32, u32)> {
+        self.raw.stats()
     }
 }
 
@@ -401,7 +413,8 @@ impl Persist for HardenPersist {
         let value = self.raw.find(key)?;
         match value {
             Some(blob) if keys::CREDENTIALS.contains(&key) => {
-                let m = self.master()?;
+                let mut m = Zeroizing::new([0u8; 128]);
+        self.master_into(&mut m)?;
                 Ok(Some(open(&m, key, &blob)?))
             }
             other => Ok(other),
@@ -410,7 +423,8 @@ impl Persist for HardenPersist {
 
     fn insert(&mut self, key: usize, value: &[u8]) -> CtapResult<()> {
         if keys::CREDENTIALS.contains(&key) {
-            let m = self.master()?;
+            let mut m = Zeroizing::new([0u8; 128]);
+        self.master_into(&mut m)?;
             let blob = seal(&m, key, value);
             self.raw.insert(key, &blob)
         } else {
@@ -429,7 +443,8 @@ impl Persist for HardenPersist {
     // ---- master key: served from RAM, never written to the key-value store -------------------
 
     fn key_store_bytes(&self) -> CtapResult<Option<Secret<[u8]>>> {
-        let m = self.master()?;
+        let mut m = Zeroizing::new([0u8; 128]);
+        self.master_into(&mut m)?;
         let mut s = Secret::new(128);
         s.copy_from_slice(&m[..]);
         Ok(Some(s))

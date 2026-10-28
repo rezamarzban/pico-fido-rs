@@ -234,7 +234,22 @@ impl Puf {
             "puf: status {}, helper slot {}, power-on reset {}",
             p.status, p.active, p.por
         );
+        p.publish();
         p
+    }
+
+    /// Publishes status and slot for the display.
+    fn publish(&self) {
+        use crate::status as st;
+        let v = match self.status {
+            Status::Disabled => st::PUF_OFF,
+            Status::Blank => st::PUF_BLANK,
+            Status::Damaged => st::PUF_DAMAGED,
+            Status::Noisy => st::PUF_NOISY,
+            Status::Ready => st::PUF_READY,
+        };
+        st::PUF.store(v, portable_atomic::Ordering::Relaxed);
+        st::PUF_SLOT.store(self.active as u8, portable_atomic::Ordering::Relaxed);
     }
 
     fn decode_status(&self) -> Status {
@@ -263,6 +278,7 @@ impl Puf {
             warn!("puf: the record's helper slot {} is not valid", i);
             self.status = Status::Damaged;
         }
+        self.publish();
     }
 
     /// The helper slot in use; stored in every PUF-bound vault record.
@@ -393,6 +409,7 @@ impl Puf {
         self.slots[target] = Some(slot);
         self.active = target;
         self.status = self.decode_status();
+        self.publish();
         if self.status == Status::Ready {
             info!("puf: enrolled, status {}", self.status);
             true

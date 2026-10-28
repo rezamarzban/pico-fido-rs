@@ -141,11 +141,74 @@ not a measurement). See `SECURITY.md`.
 `src/ram_guard.rs` (pure logic) and `src/guard.rs` (firmware singleton): the master seed is held as `N` = 8 XOR
 shares (`SHARES` in `guard.rs`, 4..=16, compile-time checked) in randomly chosen, non-adjacent slots of a 2 KiB
 static pool whose other slots are random decoys. Shares are re-randomised by XORing fresh masks into share 0 and
-share i (share refresh itself never reconstructs the secret; key use and PIN checks do, briefly, see `SECURITY.md`): every 1 ms by a task on the interrupt executor, and before and after
-every reveal / PIN check / HID packet. Masks come from a ChaCha20 DRBG seeded once at boot (ROSC, flash unique ID,
-ADC noise, timer jitter, conditioned pool -> SHA-256) and reseeded about once a second. Temporaries are
-`Zeroizing`; secret types have no `Debug`. A refresh is estimated at roughly 100 us inside a critical section (not measured on hardware): tune
-`REFRESH_MS`. See `SECURITY.md` for what this does and does not buy.
+share i (a refresh itself never reconstructs the secret; key use and PIN checks do, briefly, see `SECURITY.md`).
+Masks come from a ChaCha20 DRBG seeded once at boot (ROSC, flash unique ID, ADC noise, timer jitter, conditioned
+pool -> SHA-256) and reseeded about once a second. Temporaries are `Zeroizing`; secret types have no `Debug`.
+
+How the refresh uses the CPU (`guard::tick_task`, on the interrupt executor, so it also runs while the main thread
+signs or waits for the button):
+* **Adaptive rate:** every 0.5 ms while the device is in use (a packet, a seed store or a reveal in the last 3 s),
+  every 2 ms when it holds a seed but is idle, and only a 50 ms heartbeat without a seed (nothing to protect).
+* **Short critical sections:** a refresh is 7 independent pair steps, each in its own critical section (about one
+  ChaCha20 block and two 32-byte XORs). USB and the other interrupts are served between the steps, and the secret is
+  valid after every step. `guard_log` / the display show the longest section actually measured.
+* **Just in time:** the seed is revealed only inside `reveal_seed_into` / `with_seed` into a caller `Zeroizing`
+  buffer (refreshed right before and after); the derived 128-byte master is written into the caller's buffer
+  (`master_into`), not returned by value.
+* **Scrubbing:** after every command, on a cancel, and (32 KiB) at boot, `src/scrub.rs` overwrites the dead stack
+  frames below the caller with volatile stores, to remove copies left by moves and by the hash/HMAC code. Registers
+  are not touched.
+* **Idle:** the main thread sleeps in `wfi` between polls (`wdog::poll_wait`) instead of spinning; the guard task's
+  timer and the USB interrupts wake it. Time asleep is the idle share of the CPU load on the display.
+
+More frequent refreshing does not by itself make the secret safer; see `SECURITY.md` for what the guard does and
+does not buy, and the stress-test procedure below.
+
+### Stress test (hardware)
+Build with `--features guard_log,stack_probe` (defmt over RTT/probe) and run, each for several minutes:
+1. a loop of `fido2-token`/browser registrations and assertions (with and without PIN) while a CPU-heavy host
+   process runs: check that the logged `longest critical section` stays small and `latest tick ... late` stays
+   below the USB frame time, and that no operation fails or times out;
+2. USB reset / suspend / replug cycles during traffic (see "USB cancellation");
+3. a long idle period with the seed held (the period must settle at 2000 us, the CPU load near 0 %);
+4. with `--features watchdog`: the longest PIN derivation, signature and store compaction against the 8 s limit;
+5. current draw of the board idle (guard at 2 ms, `wfi` sleep) and under load, compared with the old build.
+Record the numbers in `REVIEW.md`; none of this has been measured yet.
+
+## Status display (SSD1306 OLED)
+Feature `oled` (on by default): a 128x64 SSD1306 on **I2C0, SDA = GP16, SCL = GP17, address 0x3C** (same wiring as
+the MicroPython `ssd1306.py` example), 3.3 V and GND. Without a display nothing happens (the write is not
+acknowledged; it is probed again every 5 s). The status is drawn from the main thread while it waits for packets
+or the button, one 128-byte page per step (about 12 ms at 100 kHz), so it never blocks USB:
+
+```
+FIDO OPEN USB OK           FIDO: LOCK / OPEN / BUSY / FAULT      USB: -- / OK / SLP
+PIN SET PUF OK S1          PIN set or not; SRAM PUF OFF / BLANK / BAD / NOISY / OK and helper slot
+CPU 12% UP 1:23:45         CPU load estimate (1 - time asleep, minus the guard refresh), uptime
+RAM 153K/264K HP 12K       RAM in use (statics incl. the 128 KiB heap + stack + PUF bytes), heap in use
+STK 1.2K PK 5.0K           stack now, peak (peak needs --features stack_probe)
+GRD 1990/S P500US          RAM-guard full refreshes per second, current period
+CS61US LT480US P1234       longest refresh critical section, latest tick lateness, packets handled
+FW214K ST12/70K W3%        firmware size, key-value store use, erase budget used
+```
+The display never shows secrets. It needs `GP16`/`GP17` free (the default board uses GP25 for the LED); build
+with `build.sh -O`, or `--no-default-features --features rp2040_board,flash_2m,sram_puf`, to leave it out.
+
+**Blank screen? Check in this order.**
+1. **The firmware has the feature.** `cargo build` enables `oled` by default, but `build.sh` (and any build with
+   `--no-default-features`) only has what it lists: since this fix `build.sh` adds `oled` unless you pass `-O`; the
+   build log prints `Cargo features: ...,oled`. Rebuild and reflash an older UF2. The RTT log then shows
+   `oled: display found at 0x3C` or `oled: no display answered ...`; no `oled:` line at all means it is not compiled in.
+2. **Pull-ups.** MicroPython's `machine.I2C` enables the RP2040's internal pull-ups, which is why the stock example works with
+   bare modules; embassy-rp does not. `oled::init` now switches them on for GP16/GP17 and runs the bus at 100 kHz
+   (`I2C_HZ`; use 400_000 only with external 4.7 kOhm pull-ups). Modules with their own pull-ups are unaffected.
+3. **Wiring.** SDA = GP16 (pin 21), SCL = GP17 (pin 22), 3V3 (pin 36), GND (pin 38). Swapped SDA/SCL gives the same
+   "no display answered" line. A module at address `0x3D` (some have a solder jumper) needs `ADDR` in `src/oled.rs`.
+4. **Start-up timing.** The module may not answer in the first milliseconds: the firmware waits 100 ms, probes once and
+   retries after 0.5 s, then every 5 s, so a late display appears by itself within a few seconds.
+5. **Controller.** A 1.3" module is often an SH1106 (132 columns), not an SSD1306: the picture is then shifted by 2
+   columns or garbled, but not blank. The status text appears about 0.5 s after the start.
+Not tested on hardware by the author of this fix: confirm with the RTT log if it is still blank.
 
 ## USB cancellation
 USB reset, suspend, disable and deconfigure call `env::hid::cancel_all()`: it bumps an epoch, forgets the seed

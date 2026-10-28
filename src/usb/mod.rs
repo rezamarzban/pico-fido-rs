@@ -98,6 +98,7 @@ impl Handler for UsbHandler {
 
     fn reset(&mut self) {
         self.configured.store(false, Ordering::Relaxed);
+        crate::status::USB.store(crate::status::USB_NONE, portable_atomic::Ordering::Relaxed);
         info!("USB reset");
         // The host starts over with a new CTAPHID_INIT: cancel the running operation, forget the
         // seed and drop stale packets.
@@ -110,6 +111,10 @@ impl Handler for UsbHandler {
 
     fn configured(&mut self, configured: bool) {
         self.configured.store(configured, Ordering::Relaxed);
+        crate::status::USB.store(
+            if configured { crate::status::USB_CONFIGURED } else { crate::status::USB_NONE },
+            portable_atomic::Ordering::Relaxed,
+        );
         if configured {
             info!("USB configured");
         } else {
@@ -119,6 +124,16 @@ impl Handler for UsbHandler {
     }
 
     fn suspended(&mut self, suspended: bool) {
+        crate::status::USB.store(
+            if suspended {
+                crate::status::USB_SUSPENDED
+            } else if self.configured.load(Ordering::Relaxed) {
+                crate::status::USB_CONFIGURED
+            } else {
+                crate::status::USB_NONE
+            },
+            portable_atomic::Ordering::Relaxed,
+        );
         if suspended {
             info!("USB suspended");
             crate::env::hid::cancel_all();
