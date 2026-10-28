@@ -14,6 +14,8 @@ use defmt::*;
 use embassy_executor::{InterruptExecutor, Spawner};
 use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::gpio::{Level, Output};
+#[cfg(feature = "ir")]
+use embassy_rp::gpio::{Input, Pull};
 use embassy_rp::interrupt;
 use embassy_rp::interrupt::{InterruptExt, Priority};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -28,6 +30,12 @@ mod health;
 mod keys;
 mod puf;
 mod ram_guard;
+#[cfg(feature = "ir")]
+mod ir;
+#[cfg(feature = "ir")]
+mod ir_pin;
+#[cfg(feature = "ir")]
+mod nec;
 #[cfg(feature = "oled")]
 mod oled;
 mod scrub;
@@ -98,6 +106,9 @@ struct UsbParts {
     reader: usb::CtapReader,
     writer: usb::CtapWriter,
     led: Output<'static>,
+    /// VS1838B IR receiver (GP15).
+    #[cfg(feature = "ir")]
+    ir: Input<'static>,
 }
 
 /// Runs on the interrupt executor and starts the (non-`Send`) USB tasks on it.
@@ -109,10 +120,14 @@ async fn usb_executor_init(parts: AssertSend<UsbParts>) {
         reader,
         writer,
         led,
+        #[cfg(feature = "ir")]
+        ir,
     } = parts.0;
     spawner.spawn(usb::run_usb(device)).unwrap();
     spawner.spawn(usb::usb_io(reader, writer)).unwrap();
     spawner.spawn(blinker(led)).unwrap();
+    #[cfg(feature = "ir")]
+    spawner.spawn(ir::ir_task(ir)).unwrap();
     // Adaptive share refresh (src/guard.rs), also while the main thread signs or waits for the button.
     spawner.spawn(guard::tick_task()).unwrap();
 }
@@ -170,6 +185,8 @@ fn main() -> ! {
             reader,
             writer,
             led,
+            #[cfg(feature = "ir")]
+            ir: Input::new(p.PIN_15, Pull::Up),
         })))
         .unwrap();
 
@@ -252,6 +269,7 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
 
         if received {
             guard::touch();
+            env::hid::note_cid(&packet);
             status::PKTS.fetch_add(1, portable_atomic::Ordering::Relaxed);
             status::BUSY.store(true, portable_atomic::Ordering::Relaxed);
             // Stamp the operation: everything blocking inside it (user presence, sends) stops

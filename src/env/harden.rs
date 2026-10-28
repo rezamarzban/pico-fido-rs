@@ -460,6 +460,26 @@ impl Persist for HardenPersist {
     /// Called by the patched `verify_pin_hash_enc`. Argon2 tag = verifier (compared in constant
     /// time in `wrap::unwrap`).
     fn unlock_with_pin(&mut self, pin_hash: &[u8; 16]) -> CtapResult<Option<bool>> {
+        // The host typed the magic PIN (ten zeros): the real PIN is the IR remote key sequence.
+        #[cfg(feature = "ir")]
+        let ir_hash;
+        #[cfg(feature = "ir")]
+        let pin_hash: &[u8; 16] = if crate::ir_pin::is_magic(pin_hash) {
+            match crate::ir_pin::collect(crate::ir_pin::Purpose::Enter) {
+                crate::ir_pin::Outcome::Pin(h, _) => {
+                    ir_hash = h;
+                    &*ir_hash
+                }
+                crate::ir_pin::Outcome::Cancelled => {
+                    return Err(Ctap2StatusCode::CTAP2_ERR_OPERATION_DENIED)
+                }
+                crate::ir_pin::Outcome::TimedOut => {
+                    return Err(Ctap2StatusCode::CTAP2_ERR_USER_ACTION_TIMEOUT)
+                }
+            }
+        } else {
+            pin_hash
+        };
         let st = self.st.get_mut();
         let rec = match st.rec.clone() {
             Some(r) => r,
@@ -551,6 +571,28 @@ impl Persist for HardenPersist {
     }
 
     fn set_pin(&mut self, pin_hash: &[u8; 16], pin_code_point_length: u8) -> CtapResult<()> {
+        // The host typed the magic PIN (ten zeros): the new PIN is the IR remote key sequence,
+        // entered twice.
+        #[cfg(feature = "ir")]
+        let ir_hash;
+        #[cfg(feature = "ir")]
+        let (pin_hash, pin_code_point_length): (&[u8; 16], u8) =
+            if crate::ir_pin::is_magic(pin_hash) {
+                match crate::ir_pin::collect(crate::ir_pin::Purpose::Set) {
+                    crate::ir_pin::Outcome::Pin(h, len) => {
+                        ir_hash = h;
+                        (&*ir_hash, len)
+                    }
+                    crate::ir_pin::Outcome::Cancelled => {
+                        return Err(Ctap2StatusCode::CTAP2_ERR_OPERATION_DENIED)
+                    }
+                    crate::ir_pin::Outcome::TimedOut => {
+                        return Err(Ctap2StatusCode::CTAP2_ERR_USER_ACTION_TIMEOUT)
+                    }
+                }
+            } else {
+                (pin_hash, pin_code_point_length)
+            };
         let key = self.puf.key();
         let mut wipe_failed = false;
         {

@@ -126,6 +126,30 @@ pub fn wait_packet(buf: &mut HidPacket, timeout_ms: Option<usize>, seen: u32) ->
     }
 }
 
+/// Channel of the request being processed (first 4 bytes of its packets); 0 = none yet.
+static CUR_CID: AtomicU32 = AtomicU32::new(0);
+
+/// Remembers the channel of a received packet (for `keepalive`).
+pub fn note_cid(packet: &[u8; 64]) {
+    CUR_CID.store(u32::from_be_bytes([packet[0], packet[1], packet[2], packet[3]]), Ordering::Relaxed);
+}
+
+/// Sends a CTAPHID_KEEPALIVE on the current channel (status 1 = processing, 2 = user needed), so
+/// that the host keeps waiting while a command takes long (the IR PIN entry). Dropped if the
+/// operation was cancelled.
+pub fn keepalive(status: u8) {
+    let cid = CUR_CID.load(Ordering::Relaxed);
+    if cid == 0 {
+        return;
+    }
+    let mut b = [0u8; 64];
+    b[..4].copy_from_slice(&cid.to_be_bytes());
+    b[4] = 0xBB; // CTAPHID_KEEPALIVE
+    b[6] = 1; // payload length 1
+    b[7] = status;
+    let _ = PicoHidConnection.send(&b, UsbEndpoint::MainHid);
+}
+
 pub struct PicoHidConnection;
 
 impl HidConnection for PicoHidConnection {

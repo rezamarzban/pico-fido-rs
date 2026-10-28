@@ -175,6 +175,33 @@ Build with `--features guard_log,stack_probe` (defmt over RTT/probe) and run, ea
 5. current draw of the board idle (guard at 2 ms, `wfi` sleep) and under load, compared with the old build.
 Record the numbers in `REVIEW.md`; none of this has been measured yet.
 
+## PIN entry with an IR remote (VS1838B)
+Feature `ir` (on by default; `build.sh -I` leaves it out). Wiring: VS1838B **OUT -> GP15**, VCC -> 3.3 V, GND (the
+same pin as the MicroPython reference). The receiver (`src/ir.rs`) is a port of its NEC decoder (same timings and
+check bytes) running as an interrupt-executor task; `src/nec.rs` holds the pure helpers (host-tested).
+
+How it is used: in the host's normal PIN dialog type the **magic PIN `0000000000` (ten zeros)**. The device then
+asks for the real PIN on the remote:
+* **Setting a PIN** (first use, or the new PIN of a PIN change): the OLED shows `SET PIN (IR REMOTE)`, the key count
+  and one `*` per key. Press at least **8** keys, confirm with a short press of **BOOTSEL**; then repeat the same
+  sequence (`STEP 2/2`) and confirm again. A different second sequence starts over.
+* **Using it** (every PIN prompt of the host, also when changing the PIN): type the ten zeros in the dialog, press the
+  same keys on the remote, confirm with BOOTSEL.
+* **Cancel:** hold BOOTSEL for 1.5 s. 60 s without any key or button, a USB reset or a cancel from the host also end
+  the entry. A cancelled or timed-out entry counts as a wrong PIN attempt (the attempt is counted before the PIN is
+  looked at; it cannot be refunded without forgiving earlier failures).
+* While waiting the device sends CTAPHID keepalives, so the host keeps waiting instead of timing out.
+
+The PIN hash is `SHA-256("pico-fido-ir-pin-v1" || key count || the full 32-bit NEC codes)[..16]`: every key counts
+with its whole 32-bit code, in order. **How strong that is:** a NEC code is `address, ~address, command, ~command`;
+only the command byte (and the fixed address of the remote) carries information, so a key is worth about
+log2(number of keys) bits, roughly 4.4 on a 21-key remote: 8 keys are about 35 bits, not 256. Use more keys if you
+can (up to 32). Codes are fixed per key and IR can be seen or filmed: anyone who watches you press the keys learns the
+PIN, as with a typed PIN. BOOTSEL is the physical confirmation: nobody can finish an entry from across the room with
+an IR blaster. The OLED never shows the codes.
+
+Typing `0000000000` as a normal PIN is no longer possible with this feature (it always means "use the remote").
+
 ## Status display (SSD1306 OLED)
 Feature `oled` (on by default): a 128x64 SSD1306 on **I2C0, SDA = GP16, SCL = GP17, address 0x3C** (same wiring as
 the MicroPython `ssd1306.py` example), 3.3 V and GND. Without a display nothing happens (the write is not
@@ -228,7 +255,7 @@ Re-check it whenever `OPENSK_REV` changes.
 
 ## Tests
     sh host-test/run.sh     # OpenSK's own library unit tests (the protocol logic), run on the host
-                            # + host-test/guard: ram_guard, vault (store.rs) and wrap (PIN wrap, Argon2 bounds, PUF-masked record) unit tests
+                            # + host-test/guard: ram_guard, vault (store.rs) and wrap (PIN wrap, Argon2 bounds, PUF-masked record) unit tests, and nec (IR frame checks, timing classes, PIN digest)
 
 The earlier host tests (custom CBOR, CTAPHID, PIN, key store, python-fido2 end-to-end) tested code that no longer
 exists and were removed. **Nothing in this repository tests `src/env/*`, the USB bridge or the executor split**:

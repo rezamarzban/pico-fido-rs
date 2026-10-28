@@ -22,6 +22,12 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   offline. If the PUF is disabled (`build.sh -P`) or its secret is obtained (code execution on the device: BOOTSEL, SWD), guessing
   is limited only by Argon2id (64 KiB), which the RP2040 can only afford at a small cost: a short PIN then falls quickly to a
   GPU/ASIC attacker. Use a long passphrase.
+* **IR remote PIN** (feature `ir`): a key press is about log2(number of keys) bits (about 4.4 on a 21-key remote), because a
+  NEC code is `address, ~address, command, ~command`: 8 keys are about 35 bits. The codes are fixed per key and IR can be
+  watched or recorded, exactly like a typed PIN seen over the shoulder. An attacker cannot complete an entry without
+  pressing BOOTSEL on the device (physical presence), cannot see the codes on the OLED (only `*`), and cannot guess faster
+  than the retry counter (8) allows. The magic PIN `0000000000` can never be a normal PIN while the feature is on.
+  Offline guessing needs the PUF secret as before. A cancelled entry counts as a failed attempt.
 * **Short PINs.** The firmware requires at least 10 code points because of the point above; use a long
   passphrase.
 * **Reading RAM** (debugger/SWD): the RP2040 has no debug lockout. The RAM guard (below) only raises the cost of

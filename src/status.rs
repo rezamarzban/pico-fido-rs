@@ -1,5 +1,6 @@
 //! Device status shared between the firmware parts and the OLED display (`src/oled.rs`). Plain
 //! atomics: written where the state changes, read by the display. Nothing here is secret.
+#![allow(dead_code)] // some items are only used with the `oled` / `ir` features
 use portable_atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 /// Time the main thread spent asleep in `wfi` (microseconds, wrapping). CPU load = 1 - idle.
@@ -34,3 +35,13 @@ pub fn set_store(used: u32, total: u32, life_used: u32, life_total: u32) {
     LIFE_USED.store(life_used, Ordering::Relaxed);
     LIFE_TOTAL.store(life_total, Ordering::Relaxed);
 }
+
+/// IR PIN entry screen (src/ir_pin.rs -> src/oled.rs): kind 0 = normal status screen,
+/// 1 = setting a PIN, 2 = entering it. Step 1/2 (set: enter, repeat), key count, message.
+pub static ENTRY_KIND: AtomicU8 = AtomicU8::new(0);
+pub static ENTRY_STEP: AtomicU8 = AtomicU8::new(1);
+pub static ENTRY_COUNT: AtomicU8 = AtomicU8::new(0);
+/// 0 none, 1 need more keys, 2 sequences differ.
+pub static ENTRY_MSG: AtomicU8 = AtomicU8::new(0);
+/// Draw the next frame now instead of waiting for the frame interval.
+pub static REDRAW: AtomicBool = AtomicBool::new(false);

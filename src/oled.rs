@@ -172,7 +172,50 @@ impl Oled {
         self.i2c.blocking_write(ADDR, &tx).map_err(|_| ())
     }
 
+    /// The IR PIN entry screen (see `ir_pin.rs`). Shows the key count and a `*` per key, never
+    /// the codes.
+    fn render_entry(&mut self) {
+        let kind = st::ENTRY_KIND.load(Ordering::Relaxed);
+        let step = st::ENTRY_STEP.load(Ordering::Relaxed);
+        let n = st::ENTRY_COUNT.load(Ordering::Relaxed) as usize;
+        let msg = st::ENTRY_MSG.load(Ordering::Relaxed);
+        self.buf.fill(0);
+        put_line(&mut self.buf, 0, if kind == 1 { "SET PIN (IR REMOTE)" } else { "ENTER PIN (IR)" });
+        put_line(
+            &mut self.buf,
+            1,
+            match (kind, step) {
+                (1, 2) => "STEP 2/2: REPEAT",
+                (1, _) => "STEP 1/2: ENTER",
+                _ => "PRESS REMOTE KEYS",
+            },
+        );
+        let mut s: String<32> = String::new();
+        let _ = write!(s, "KEYS {}  (MIN 8)", n);
+        put_line(&mut self.buf, 2, &s);
+        let mut stars: String<24> = String::new();
+        for _ in 0..n.min(COLS) {
+            let _ = stars.push('*');
+        }
+        put_line(&mut self.buf, 3, &stars);
+        put_line(
+            &mut self.buf,
+            5,
+            match msg {
+                1 => "NEED 8 KEYS",
+                2 => "DIFFERENT - AGAIN",
+                _ => "",
+            },
+        );
+        put_line(&mut self.buf, 6, "BOOTSEL: CONFIRM");
+        put_line(&mut self.buf, 7, "HOLD 1.5S: CANCEL");
+    }
+
     fn render(&mut self) {
+        if st::ENTRY_KIND.load(Ordering::Relaxed) != 0 {
+            self.render_entry();
+            return;
+        }
         // ---- rates since the last frame
         let wall = Instant::now().as_micros();
         let g = crate::guard::snapshot();
@@ -329,7 +372,9 @@ impl Oled {
                 self.next_page = if (p as usize) + 1 < PAGES { Some(p + 1) } else { None };
             }
             None => {
-                if now.wrapping_sub(self.last_frame_ms) >= FRAME_MS {
+                if st::REDRAW.swap(false, Ordering::Relaxed)
+                    || now.wrapping_sub(self.last_frame_ms) >= FRAME_MS
+                {
                     self.last_frame_ms = now;
                     self.render();
                     self.next_page = Some(0);
