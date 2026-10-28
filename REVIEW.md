@@ -62,6 +62,11 @@ available when the fixes were written): build, `cargo clippy`, `sh host-test/run
 | se4 puf2 | PUF helper was a single sector: a power cut inside a CTAP reset left the old record without its helper | Fixed: two helper slots, the record names its slot, the old helper is erased only after the new record is durable. Layout change (store 19 -> 18 pages): old images must be erased. Not compiled or power-cut tested. |
 | se4 ctr | PIN counter lost pending failures when its full sector was erased and rewritten | Fixed without a new sector: `finish_try` recycles the sector at the moment all failures are forgiven (host tests: never erased with failures pending). |
 | se4 setpin | A power cut between the vault commit and the PIN metadata needed a CTAP reset | Fixed: metadata first, `init` reconciles both inconsistent states. Not power-cut tested. |
+| se4 guard | Refresh used a fixed 1 ms tick in one long critical section, and the idle main thread spun | Adaptive period (0.5 ms active, 2 ms idle, 50 ms locked), 7 short critical sections, `wfi` sleep in the waits. Not built, not measured. |
+| se4 guard | Copies of secrets left in dead stack frames (by-value returns, hash/HMAC state) | `master_into` instead of a by-value return, `scrub::stack()` after every command / cancel, `scrub::stack_boot()` at boot. |
+| se4 oled | No device status | SSD1306 status screen (`src/oled.rs`, feature `oled`): FIDO, USB, PIN/PUF, CPU, RAM, stack, guard rate, flash. Not built or run. |
+| se4 oled2 | OLED stayed blank although the MicroPython example works | Two causes found by reading the code against `ssd1306.py`: (1) `build.sh` builds with `--no-default-features`, so the `oled` feature was never compiled in: now added by default (`-O` omits it). (2) embassy-rp leaves the I2C pull-ups off while MicroPython turns them on: now enabled on GP16/GP17 after the driver setup, bus at 100 kHz, 100 ms power-up wait, first retry after 0.5 s, init failures logged. Not built or run here (no toolchain). |
+| open | Stress test (USB latency, authentication reliability, power, watchdog under load) | Procedure in README.md ("Stress test"); `guard_log` feature logs the numbers. Not run. |
 | open | No `Cargo.lock` | Needs a successful build to generate. |
 
 ## Status and open items

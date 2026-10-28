@@ -4,7 +4,7 @@
 //! read) is only useful if it covers all N shares of ONE refresh epoch.
 //!
 //! This file is pure logic (no hardware, no statics) so it can be unit-tested on the host. The
-//! firmware singleton, entropy seeding and the 1 ms refresh task are in `guard.rs`.
+//! firmware singleton, entropy seeding and the adaptive refresh task are in `guard.rs`.
 //!
 //! * `Masked<N>` holds only slot INDICES, never secret bytes; the shares live in the [`Pool`].
 //! * `refresh` XORs a fresh mask into share 0 and share i, for every i >= 1: the secret is never
@@ -99,19 +99,30 @@ impl<const N: usize> Masked<N> {
         Some(Masked { idx })
     }
 
-    /// Re-randomises all shares without reconstructing the secret: for every i >= 1 a fresh mask
-    /// is XORed into share 0 and into share i.
-    pub fn refresh<R: RngCore + CryptoRng>(&self, pool: &mut Pool, rng: &mut R) {
+    /// Number of independent steps of one full refresh (`refresh_pair(0..PAIRS)`).
+    pub const PAIRS: usize = N - 1;
+
+    /// One step of a refresh: a fresh mask is XORed into share 0 and into share `k + 1`. After
+    /// every single step the XOR of all shares is still the secret, so the steps may be run in
+    /// separate short critical sections (other code, even a reveal, can run in between) without
+    /// ever exposing a half-updated secret. The secret is never reconstructed here.
+    pub fn refresh_pair<R: RngCore + CryptoRng>(&self, pool: &mut Pool, rng: &mut R, k: usize) {
         let mut r = Zeroizing::new([0u8; 32]);
         let s0 = self.idx[0] as usize;
-        for &i in &self.idx[1..] {
-            rng.fill_bytes(&mut r[..]);
-            for (b, m) in pool.slots[s0].iter_mut().zip(r.iter()) {
-                *b ^= m;
-            }
-            for (b, m) in pool.slots[i as usize].iter_mut().zip(r.iter()) {
-                *b ^= m;
-            }
+        let i = self.idx[1 + k] as usize;
+        rng.fill_bytes(&mut r[..]);
+        for (b, m) in pool.slots[s0].iter_mut().zip(r.iter()) {
+            *b ^= m;
+        }
+        for (b, m) in pool.slots[i].iter_mut().zip(r.iter()) {
+            *b ^= m;
+        }
+    }
+
+    /// Re-randomises all shares without reconstructing the secret (all `PAIRS` steps in a row).
+    pub fn refresh<R: RngCore + CryptoRng>(&self, pool: &mut Pool, rng: &mut R) {
+        for k in 0..Self::PAIRS {
+            self.refresh_pair(pool, rng, k);
         }
     }
 
@@ -213,6 +224,21 @@ mod tests {
             assert_ne!(snap[k], pool.slots[i as usize], "share {k} unchanged by refresh");
         }
         assert_eq!(*m.reveal(&pool), secret);
+    }
+
+    #[test]
+    fn the_secret_is_intact_after_every_single_refresh_step() {
+        // A reveal may run between two steps (separate critical sections in guard.rs).
+        let mut r = rng();
+        let mut pool = Pool::new(&mut r);
+        let secret = [0x5Au8; 32];
+        let m = Masked::<8>::new(&mut pool, &secret, &mut r).unwrap();
+        for _round in 0..20 {
+            for k in 0..Masked::<8>::PAIRS {
+                m.refresh_pair(&mut pool, &mut r, k);
+                assert_eq!(*m.reveal(&pool), secret, "step {k}");
+            }
+        }
     }
 
     #[test]

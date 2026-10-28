@@ -67,6 +67,16 @@ fn convert(error: StoreError) -> Ctap2StatusCode {
     }
 }
 
+impl PicoPersist {
+    /// (used, total, erase budget used, erase budget total) in store words, for the display.
+    /// Reads the store: call rarely.
+    pub fn stats(&self) -> Option<(u32, u32, u32, u32)> {
+        let c = self.store.capacity().ok()?;
+        let l = self.store.lifetime().ok()?;
+        Some((c.used() as u32, c.total() as u32, l.used() as u32, l.total() as u32))
+    }
+}
+
 impl Persist for PicoPersist {
     fn find(&self, key: usize) -> CtapResult<Option<Vec<u8>>> {
         self.store.find(key).map_err(convert)

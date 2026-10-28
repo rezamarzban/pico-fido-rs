@@ -43,6 +43,12 @@ pub fn paint() {
     info!("stack: {} of {} bytes painted", end - BOTTOM, top() - BOTTOM);
 }
 
+/// Peak stack use in bytes seen so far (updated by `report`).
+#[allow(dead_code)]
+pub fn peak() -> usize {
+    PEAK.load(Ordering::Relaxed)
+}
+
 /// Logs the stack use when it exceeds the previous peak.
 pub fn report() {
     let mut a = BOTTOM;

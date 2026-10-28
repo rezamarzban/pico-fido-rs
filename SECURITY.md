@@ -150,7 +150,7 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
 
 ## RAM guard (`src/ram_guard.rs`, `src/guard.rs`)
 **What it is.** The master seed exists in RAM as 8 XOR shares in scattered, non-adjacent slots of a decoy-filled
-pool, re-randomised every millisecond and around each key use, with masks from a ChaCha20 DRBG (seeded at boot, reseeded
+pool, re-randomised adaptively (0.5 to 2 ms while a seed is held, in 7 short critical sections) and around each key use, with masks from a ChaCha20 DRBG (seeded at boot, reseeded
 about once a second). Plaintext temporaries are `Zeroizing`.
 
 **What it buys.** A RAM read that is not a consistent snapshot of all shares (cold boot decay, a slow or partial
@@ -167,7 +167,13 @@ combined.
 * The DRBG state is plain RAM (`rand_chacha` does not zeroize). It only protects the masks, not the seed.
 * Entropy: the flash unique ID is not secret, and the ROSC/ADC inputs are as weak as described above. Hashing them
   does not add entropy.
-* The refresh costs CPU time (about 10 % at 1 ms; measure it) and briefly masks interrupts.
+* The refresh costs CPU time (up to about 10 % at the fast 0.5 ms rate while the device is in use; measure it) and
+  briefly masks interrupts. Each of the 7 steps is its own critical section, so the longest interrupt-off time is one
+  step, not a whole refresh (`guard_log` reports it).
+* Refreshing faster does not make a snapshot of all shares any less useful: it only shortens the time during which
+  a slow or partial read stays consistent. Against code running on the device it buys nothing.
+* Stack scrubbing (`src/scrub.rs`) clears dead stack frames, not CPU registers or the internal state of live
+  library objects, and a 4 KiB scrub does not reach residue deeper than that (the boot scrub covers 32 KiB).
 * `secrecy` is not used: it only adds `Debug` redaction and `ExposeSecret` ergonomics, and none of these types
   derive `Debug` at all.
 

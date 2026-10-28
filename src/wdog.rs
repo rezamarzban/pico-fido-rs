@@ -14,7 +14,8 @@
 //! A watchdog reset is a warm reset: the SRAM PUF still decodes (nothing writes the reserved bytes),
 //! only a (re-)enrolment needs a real power-on reset.
 
-use embassy_time::{block_for, Duration};
+use embassy_time::{block_for, Duration, Instant};
+use portable_atomic::Ordering;
 
 /// The RP2040 watchdog counts at most ~8.3 s.
 #[cfg(feature = "watchdog")]
@@ -54,8 +55,24 @@ pub use imp::{feed, start};
 #[cfg(not(feature = "watchdog"))]
 pub fn feed() {}
 
-/// One step of a polling wait on the main thread: feed, then busy-wait `d`.
+/// One step of a polling wait on the main thread: feed the watchdog, give the status display a
+/// turn, then wait.
+///
+/// With the guard task running (`guard::ticking`) the core sleeps in `wfi` until the next
+/// interrupt: the refresh task keeps a timer interrupt due at least every 50 ms (every 0.5 to
+/// 2 ms while a seed is held), and USB interrupts wake it at once, so a wait is never longer than
+/// that and the idle main thread burns no power spinning. Before the task runs, `d` is
+/// busy-waited as before. The time slept is booked as idle time for the CPU-load display.
 pub fn poll_wait(d: Duration) {
     feed();
-    block_for(d);
+    #[cfg(feature = "oled")]
+    crate::oled::poll();
+    if crate::guard::ticking() {
+        let t0 = Instant::now();
+        cortex_m::asm::wfi();
+        let dt = Instant::now().as_micros().wrapping_sub(t0.as_micros()) as u32;
+        crate::status::IDLE_US.fetch_add(dt, Ordering::Relaxed);
+    } else {
+        block_for(d);
+    }
 }

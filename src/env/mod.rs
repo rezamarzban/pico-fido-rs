@@ -7,6 +7,7 @@
 mod clock;
 mod flash_store;
 mod harden;
+pub use harden::pin_set;
 pub mod hid;
 mod persist;
 mod rng;

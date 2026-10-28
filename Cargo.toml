@@ -6,7 +6,7 @@ authors = ["sawyer bristol <sawyerbristol@gmail.com>"]
 
 [features]
 # Default: board + 2MiB flash. USB serial is OFF (privacy); enable with --features usb_serial.
-default = ["rp2040_board", "flash_2m", "sram_puf"]
+default = ["rp2040_board", "flash_2m", "sram_puf", "oled"]
 rp2040_board = []
 flash_2m = []
 flash_4m = []
@@ -19,6 +19,10 @@ sram_puf = []
 stack_probe = []
 # Hardware watchdog fed by the main thread only (src/wdog.rs). Off until the longest blocking step is measured.
 watchdog = []
+# Status display: SSD1306 128x64 on I2C0 (SDA GP16, SCL GP17, 0x3C), src/oled.rs. Harmless without a display.
+oled = []
+# Development: log the RAM-guard refresh statistics (rate, longest critical section, tick lateness) every 5 s.
+guard_log = []
 
 [dependencies]
 cortex-m = { version = "0.7.7", features = ["inline-asm"] }
