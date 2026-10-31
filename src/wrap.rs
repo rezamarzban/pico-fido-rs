@@ -1,26 +1,43 @@
-//! Wrapping of the 32-byte master seed under a key derived from the PIN.
+//! Wrapping of the 32-byte master seed ("the private key") under the PINs and the SRAM PUF.
 //!
-//! KEK material = Argon2id(password = LEFT(SHA-256(PIN), 16), salt = random 16 bytes, m, t, p = 1),
-//! 64 bytes: the first 32 are the encryption key, the last 32 the MAC key.
-//! Encrypt-then-MAC with HMAC-SHA-256 only:
-//!   keystream = HMAC(enc_key, "fido-wrap-ks" || salt)      (one block = 32 bytes = the seed size)
-//!   body      = seed XOR keystream
-//!   tag       = HMAC(mac_key, "fido-wrap-tag" || m_kib || t || salt || body)
-//! A wrong PIN is detected by the tag; no PIN verifier is stored.
+//! ```text
+//! host PIN + IR PIN + SRAM-PUF secret --> Argon2id --> 256-bit key --> AES-256-GCM --> encrypted seed
+//! ```
+//!
+//! Two stages, because the host dialog and the IR remote are separate PINs that are asked at different
+//! moments (the host PIN in the host's PIN dialog, the IR PIN while the device waits for the physical
+//! button):
+//!
+//! * **Stage 1, host PIN.** `pw1 = HMAC(K_puf, "puf-pin" || host_hash)` (or the bare 16-byte hash without a PUF)
+//!   goes through Argon2id (salt = the record's random salt) and gives 64 bytes: `k1[..32]` and `k1[32..]`.
+//!   `k1[32..]` makes the **host verifier** (16 bytes, stored in the record) that tells a right host PIN
+//!   from a wrong one without the IR PIN. A record that has no IR PIN yet (`rec.ir == false`) is
+//!   encrypted directly with `k1[..32]`.
+//! * **Stage 2, IR PIN.** `pw2 = HMAC(K_puf, "puf-pin-ir" || host_hash || ir_digest)` (SHA-256 of the same
+//!   input without a PUF) goes through Argon2id again; the first 32 bytes of the output are the
+//!   AES-256-GCM key of an `rec.ir` record. A wrong IR PIN is detected by the GCM tag.
+//!
+//! Record: `body` = ciphertext (32 bytes), `tag[..16]` = GCM tag, `tag[16..]` = host verifier. The
+//! GCM nonce is the first 12 bytes of the record's random salt: the key is derived from that salt, so every
+//! key is used for exactly one encryption. The associated data binds the flags, the Argon2 parameters
+//! and the salt. No PIN or IR hash is stored anywhere.
 //!
 //! Argon2 works in a static 64 KiB buffer, so it never touches the OpenSK heap. It is only called
 //! from the main thread, one call at a time.
+use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce, Tag};
 use argon2::{Algorithm, Argon2, Block, Params, Version};
 use core::mem::MaybeUninit;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::store::Record;
 
 /// Argon2 memory in KiB / passes for new wraps. NOT measured on hardware: check the logged
-/// time of a PIN check and tune `T_COST` (target about 0.5 - 1 s per guess).
+/// time of a PIN check and tune `T_COST` (target about 0.5 - 1 s per Argon2 run; a PIN check with
+/// an IR PIN runs Argon2 twice).
 pub const M_KIB: u32 = 64;
 pub const T_COST: u8 = 24;
 /// Largest memory cost a stored record may ask for: the size of the static buffer.
@@ -37,21 +54,41 @@ static mut ARGON_MEM: [MaybeUninit<Block>; BLOCKS] = {
     [U; BLOCKS]
 };
 
-/// The Argon2 password: the 16-byte PIN hash, or - for PUF-bound records - an HMAC of it under
-/// the SRAM-PUF key (so a flash dump alone cannot be used to test PIN guesses).
-fn password(pin_hash: &[u8; 16], puf: Option<&[u8; 32]>) -> (Zeroizing<[u8; 32]>, usize) {
+/// The Argon2 password of stage 1: the 16-byte host PIN hash, or - for PUF-bound records - an HMAC
+/// of it under the SRAM-PUF key (so a flash dump alone cannot be used to test PIN guesses).
+fn password_host(host: &[u8; 16], puf: Option<&[u8; 32]>) -> (Zeroizing<[u8; 32]>, usize) {
     let mut pw = Zeroizing::new([0u8; 32]);
     match puf {
         Some(k) => {
-            let h = hmac_of(k, &[b"puf-pin", pin_hash]).finalize().into_bytes();
+            let h = hmac_of(k, &[b"puf-pin", host]).finalize().into_bytes();
             pw.copy_from_slice(&h);
             (pw, 32)
         }
         None => {
-            pw[..16].copy_from_slice(pin_hash);
+            pw[..16].copy_from_slice(host);
             (pw, 16)
         }
     }
+}
+
+/// The Argon2 password of stage 2: host PIN hash + IR PIN digest (+ the PUF key).
+fn password_full(host: &[u8; 16], ir: &[u8; 32], puf: Option<&[u8; 32]>) -> Zeroizing<[u8; 32]> {
+    let mut pw = Zeroizing::new([0u8; 32]);
+    match puf {
+        Some(k) => {
+            let h = hmac_of(k, &[b"puf-pin-ir", host, ir]).finalize().into_bytes();
+            pw.copy_from_slice(&h);
+        }
+        None => {
+            let mut h = Sha256::new();
+            h.update(b"pin-ir-v2");
+            h.update(host);
+            h.update(ir);
+            let d = h.finalize();
+            pw.copy_from_slice(&d);
+        }
+    }
+    pw
 }
 
 fn kdf(password: &[u8], salt: &[u8; 16], m_kib: u32, t: u8) -> Option<[u8; 64]> {
@@ -92,40 +129,60 @@ fn hmac_of(key: &[u8], parts: &[&[u8]]) -> Hmac<Sha256> {
     m
 }
 
-fn tag_of(mac_key: &[u8], m_kib: u32, t: u8, salt: &[u8; 16], body: &[u8; 32]) -> Hmac<Sha256> {
-    hmac_of(
-        mac_key,
-        &[b"fido-wrap-tag", &m_kib.to_le_bytes(), &[t], salt, body],
-    )
+// ---- AES-256-GCM record ------------------------------------------------------------------------
+
+const AAD_LEN: usize = 35;
+
+/// Associated data: binds the flags, the Argon2 parameters and the salt to the ciphertext.
+fn aad(puf: bool, ir: bool, m_kib: u32, t: u8, salt: &[u8; 16]) -> [u8; AAD_LEN] {
+    let mut a = [0u8; AAD_LEN];
+    a[..12].copy_from_slice(b"fido-wrap-v2");
+    a[12] = puf as u8;
+    a[13] = ir as u8;
+    a[14..18].copy_from_slice(&m_kib.to_le_bytes());
+    a[18] = t;
+    a[19..].copy_from_slice(salt);
+    a
 }
 
-/// Wraps `seed` under the PIN (and the PUF key if given). `None` only if the key derivation fails.
-pub fn wrap(
+/// The key is derived from the salt, so it is used once: the nonce can be taken from the salt.
+fn nonce_of(salt: &[u8; 16]) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n.copy_from_slice(&salt[..12]);
+    n
+}
+
+/// 16-byte verifier of the host PIN from the MAC half of the stage-1 output.
+fn verifier(k_mac: &[u8], a: &[u8; AAD_LEN]) -> [u8; 16] {
+    let h = hmac_of(k_mac, &[b"fido-host-verify", a]).finalize().into_bytes();
+    let mut v = [0u8; 16];
+    v.copy_from_slice(&h[..16]);
+    v
+}
+
+fn seal_record(
     seed: &[u8; 32],
-    pin_hash: &[u8; 16],
+    aes_key: &[u8],
+    host_verifier: [u8; 16],
     salt: [u8; 16],
-    puf: Option<&[u8; 32]>,
+    puf: bool,
+    ir: bool,
 ) -> Option<Record> {
-    let (pw, n) = password(pin_hash, puf);
-    let mut k = kdf(&pw[..n], &salt, M_KIB, T_COST)?;
-    let mut ks: [u8; 32] = hmac_of(&k[..32], &[b"fido-wrap-ks", &salt])
-        .finalize()
-        .into_bytes()
-        .into();
-    let mut body = [0u8; 32];
-    for ((b, m), s) in body.iter_mut().zip(seed).zip(&ks) {
-        *b = m ^ s;
-    }
-    ks.zeroize();
-    let tag: [u8; 32] = tag_of(&k[32..], M_KIB, T_COST, &salt, &body)
-        .finalize()
-        .into_bytes()
-        .into();
-    k.zeroize();
+    let cipher = Aes256Gcm::new_from_slice(aes_key).ok()?;
+    let a = aad(puf, ir, M_KIB, T_COST, &salt);
+    let nonce = nonce_of(&salt);
+    let mut body = *seed;
+    let gcm_tag = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(&nonce), &a, &mut body)
+        .ok()?;
+    let mut tag = [0u8; 32];
+    tag[..16].copy_from_slice(&gcm_tag);
+    tag[16..].copy_from_slice(&host_verifier);
     Some(Record {
         wrapped: true,
-        puf: puf.is_some(),
+        puf,
         puf_slot: 0, // the caller sets the real slot (`bind_slot` in env/harden.rs)
+        ir,
         m_kib: M_KIB,
         t_cost: T_COST,
         salt,
@@ -134,37 +191,98 @@ pub fn wrap(
     })
 }
 
-/// Recovers the seed. `None` = wrong PIN (or damaged / unsupported record). The tag comparison is
-/// constant-time (`subtle`), the result is wiped on drop.
-///
-/// `puf` must be `Some` exactly when `rec.puf` is set.
-pub fn unwrap(
+fn open_with(aes_key: &[u8], rec: &Record, a: &[u8; AAD_LEN]) -> Option<Zeroizing<[u8; 32]>> {
+    let cipher = Aes256Gcm::new_from_slice(aes_key).ok()?;
+    let nonce = nonce_of(&rec.salt);
+    let mut buf = Zeroizing::new(rec.body);
+    let gcm_tag = Tag::from_slice(&rec.tag[..16]);
+    cipher
+        .decrypt_in_place_detached(Nonce::from_slice(&nonce), a, &mut buf[..], gcm_tag)
+        .ok()?;
+    Some(buf)
+}
+
+/// Wraps `seed` under the host PIN (and the PUF key if given) only: stage 1 decrypts it. Used when a
+/// PIN is set and the IR PIN is not enrolled yet. `None` only if the key derivation fails.
+pub fn wrap_host(
+    seed: &[u8; 32],
+    host: &[u8; 16],
+    salt: [u8; 16],
+    puf: Option<&[u8; 32]>,
+) -> Option<Record> {
+    let (pw, n) = password_host(host, puf);
+    let k1 = Zeroizing::new(kdf(&pw[..n], &salt, M_KIB, T_COST)?);
+    let a = aad(puf.is_some(), false, M_KIB, T_COST, &salt);
+    seal_record(seed, &k1[..32], verifier(&k1[32..], &a), salt, puf.is_some(), false)
+}
+
+/// Wraps `seed` under host PIN + IR PIN digest (+ the PUF key if given): two Argon2id runs, the
+/// first only for the host verifier, the second for the AES-256-GCM key.
+pub fn wrap_full(
+    seed: &[u8; 32],
+    host: &[u8; 16],
+    ir: &[u8; 32],
+    salt: [u8; 16],
+    puf: Option<&[u8; 32]>,
+) -> Option<Record> {
+    let (pw1, n1) = password_host(host, puf);
+    let k1 = Zeroizing::new(kdf(&pw1[..n1], &salt, M_KIB, T_COST)?);
+    let a = aad(puf.is_some(), true, M_KIB, T_COST, &salt);
+    let pw2 = password_full(host, ir, puf);
+    let k2 = Zeroizing::new(kdf(&pw2[..], &salt, M_KIB, T_COST)?);
+    seal_record(seed, &k2[..32], verifier(&k1[32..], &a), salt, puf.is_some(), true)
+}
+
+/// Result of stage 1.
+pub enum Host {
+    /// Wrong host PIN (or damaged / unsupported record).
+    Wrong,
+    /// Right host PIN; the record needs the IR PIN too (`rec.ir`): nothing is decrypted yet.
+    Verified,
+    /// Right host PIN and the record has no IR PIN: the seed is open.
+    Seed(Zeroizing<[u8; 32]>),
+}
+
+/// Stage 1: checks the host PIN against the record's verifier (constant time). `puf` must be `Some`
+/// exactly when `rec.puf` is set.
+pub fn host_stage(rec: &Record, host: &[u8; 16], puf: Option<&[u8; 32]>) -> Host {
+    if !rec.wrapped || rec.puf != puf.is_some() {
+        return Host::Wrong;
+    }
+    let (pw, n) = password_host(host, puf);
+    let Some(k1) = kdf(&pw[..n], &rec.salt, rec.m_kib, rec.t_cost) else {
+        return Host::Wrong;
+    };
+    let k1 = Zeroizing::new(k1);
+    let a = aad(rec.puf, rec.ir, rec.m_kib, rec.t_cost, &rec.salt);
+    let v = verifier(&k1[32..], &a);
+    if !bool::from(v[..].ct_eq(&rec.tag[16..])) {
+        return Host::Wrong;
+    }
+    if rec.ir {
+        return Host::Verified;
+    }
+    match open_with(&k1[..32], rec, &a) {
+        Some(seed) => Host::Seed(seed),
+        None => Host::Wrong,
+    }
+}
+
+/// Stage 2: opens the seed of an IR record with host PIN + IR PIN digest (+ PUF key). `None` = wrong
+/// IR PIN (the GCM tag does not match) or a damaged / unsupported record.
+pub fn open_ir(
     rec: &Record,
-    pin_hash: &[u8; 16],
+    host: &[u8; 16],
+    ir: &[u8; 32],
     puf: Option<&[u8; 32]>,
 ) -> Option<Zeroizing<[u8; 32]>> {
-    if !rec.wrapped || rec.puf != puf.is_some() {
+    if !rec.wrapped || !rec.ir || rec.puf != puf.is_some() {
         return None;
     }
-    let (pw, n) = password(pin_hash, puf);
-    let mut k = Zeroizing::new(kdf(&pw[..n], &rec.salt, rec.m_kib, rec.t_cost)?);
-    let expect = tag_of(&k[32..], rec.m_kib, rec.t_cost, &rec.salt, &rec.body)
-        .finalize()
-        .into_bytes();
-    if !bool::from(expect.as_slice().ct_eq(&rec.tag)) {
-        k.zeroize();
-        return None;
-    }
-    let mut ks: [u8; 32] = hmac_of(&k[..32], &[b"fido-wrap-ks", &rec.salt])
-        .finalize()
-        .into_bytes()
-        .into();
-    let mut m = Zeroizing::new([0u8; 32]);
-    for ((o, b), s) in m.iter_mut().zip(&rec.body).zip(&ks) {
-        *o = b ^ s;
-    }
-    ks.zeroize();
-    Some(m)
+    let pw2 = password_full(host, ir, puf);
+    let k2 = Zeroizing::new(kdf(&pw2[..], &rec.salt, rec.m_kib, rec.t_cost)?);
+    let a = aad(rec.puf, rec.ir, rec.m_kib, rec.t_cost, &rec.salt);
+    open_with(&k2[..32], rec, &a)
 }
 
 /// Expands the 32-byte seed to the 128 bytes OpenSK's key store expects: encryption key,

@@ -23,7 +23,7 @@ impl Sectors for Mock {
         self.t = [0xFF; TRIES_PAGES]; Ok(())
     }
 }
-fn wrapped() -> Record { Record { wrapped: true, puf: false, puf_slot: 0, m_kib: 64, t_cost: 3, salt: [5; 16], body: [6; 32], tag: [7; 32] } }
+fn wrapped() -> Record { Record { wrapped: true, puf: false, puf_slot: 0, ir: false, m_kib: 64, t_cost: 3, salt: [5; 16], body: [6; 32], tag: [7; 32] } }
 
 #[test]
 fn old_plain_record_wiped_normally() {
@@ -106,4 +106,66 @@ fn eight_failures_block_even_after_recycling() {
     for _ in 0..TRIES_MAX { begin_try(&mut m).unwrap(); }
     assert_eq!(count_tries(&mut m).unwrap() as usize, TRIES_MAX);
     assert!(begin_try(&mut m).is_err());
+}
+
+#[test]
+fn ir_flag_survives_a_save_and_load() {
+    let mut m = Mock::new();
+    let mut rec = wrapped();
+    rec.ir = true;
+    rec.puf = true;
+    assert!(matches!(replace_record(&mut m, &rec), Replaced::New(_)));
+    match load(&mut m) {
+        Ok(Loaded::Rec(r, _)) => { assert!(r.wrapped && r.puf && r.ir); }
+        r => panic!("{:?}", r),
+    }
+    // and a record without it stays without it
+    rec.ir = false;
+    assert!(matches!(replace_record(&mut m, &rec), Replaced::New(_)));
+    match load(&mut m) {
+        Ok(Loaded::Rec(r, _)) => { assert!(r.wrapped && !r.ir); }
+        r => panic!("{:?}", r),
+    }
+}
+
+/// A raw record in the older "FK03" layout (flags: bit 0 wrapped, bit 1 PUF, bit 2 slot).
+fn fk03(flags: u8) -> [u8; REC_LEN] {
+    use sha2::{Digest, Sha256};
+    let mut r = [0u8; REC_LEN];
+    r[..4].copy_from_slice(b"FK03");
+    r[4..8].copy_from_slice(&1u32.to_le_bytes());
+    r[8] = flags;
+    r[30..62].copy_from_slice(&[0x42; 32]);
+    let h = Sha256::digest(&r[..94]);
+    r[94..].copy_from_slice(&h[..16]);
+    r
+}
+
+#[test]
+fn old_fk03_plain_records_are_read_but_its_pin_records_are_refused() {
+    // plain / PUF-masked FK03 records are still understood (and replaced on the next write)
+    let mut m = Mock::new();
+    m.s[0] = fk03(0b010);
+    match load(&mut m) {
+        Ok(Loaded::Rec(r, _)) => { assert!(!r.wrapped && r.puf && !r.ir); assert_eq!(r.body, [0x42; 32]); }
+        r => panic!("{:?}", r),
+    }
+    // an FK03 PIN record used the old one-factor HMAC wrapping: it must not be accepted, and the
+    // vault must report "damaged" (never "blank"), so nothing re-keys it silently
+    let mut m = Mock::new();
+    m.s[0] = fk03(0b001);
+    assert!(matches!(load(&mut m), Ok(Loaded::Corrupt)));
+}
+
+#[test]
+fn ir_bit_without_a_pin_record_is_refused() {
+    use sha2::{Digest, Sha256};
+    let mut m = Mock::new();
+    let mut r = fk03(0);
+    r[..4].copy_from_slice(b"FK04");
+    r[8] = 0b1000; // IR bit, not wrapped
+    let h = Sha256::digest(&r[..94]);
+    r[94..].copy_from_slice(&h[..16]);
+    m.s[0] = r;
+    assert!(matches!(load(&mut m), Ok(Loaded::Corrupt)));
 }

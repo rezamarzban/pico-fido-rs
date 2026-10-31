@@ -180,13 +180,21 @@ impl Oled {
         let n = st::ENTRY_COUNT.load(Ordering::Relaxed) as usize;
         let msg = st::ENTRY_MSG.load(Ordering::Relaxed);
         self.buf.fill(0);
-        put_line(&mut self.buf, 0, if kind == 1 { "SET PIN (IR REMOTE)" } else { "ENTER PIN (IR)" });
+        put_line(
+            &mut self.buf,
+            0,
+            match kind {
+                1 => "SET IR PIN",
+                3 => "NEW IR PIN",
+                _ => "ENTER IR PIN",
+            },
+        );
         put_line(
             &mut self.buf,
             1,
             match (kind, step) {
-                (1, 2) => "STEP 2/2: REPEAT",
-                (1, _) => "STEP 1/2: ENTER",
+                (1 | 3, 2) => "STEP 2/2: REPEAT",
+                (1 | 3, _) => "STEP 1/2: ENTER",
                 _ => "PRESS REMOTE KEYS",
             },
         );
@@ -204,10 +212,11 @@ impl Oled {
             match msg {
                 1 => "NEED 8 KEYS",
                 2 => "DIFFERENT - AGAIN",
+                _ if kind == 3 && step == 1 => "BUTTON ALONE: KEEP",
                 _ => "",
             },
         );
-        put_line(&mut self.buf, 6, "BOOTSEL: CONFIRM");
+        put_line(&mut self.buf, 6, "BUTTON: CONFIRM");
         put_line(&mut self.buf, 7, "HOLD 1.5S: CANCEL");
     }
 

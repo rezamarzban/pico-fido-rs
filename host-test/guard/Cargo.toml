@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
-# Host-side tests of src/ram_guard.rs, src/store.rs and src/wrap.rs (no hardware, no Embassy).
+# Host-side tests of src/ram_guard.rs, src/store.rs, src/wrap.rs and src/nec.rs (no hardware, no Embassy).
 [workspace]
 
 [dependencies]
@@ -14,5 +14,6 @@ sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 zeroize_derive = "=1.4.2"  # only needed with Cargo < 1.85 (1.5 needs edition 2024)

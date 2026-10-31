@@ -8,16 +8,26 @@
 //!   OpenSK's default key store (`key_store::Helper`) reads those bytes through
 //!   `key_store_bytes()`, which is overridden here: the master is never written to the
 //!   key-value store, and while locked every credential-ID operation fails.
-//! * Resident credentials (CREDENTIALS key range) are encrypted + authenticated under keys
+//! * Resident credentials (CREDENTIALS key range) are encrypted + authenticated (AES-256-GCM) under keys
 //!   derived from the master. Everything else (RP IDs of non-resident credentials are never
 //!   stored; counters, large blobs, settings) stays in clear.
-//! * PIN verification: the Argon2 tag is the verifier. The stored PIN "hash" is all zeros. The
-//!   patched `verify_pin_hash_enc` (third_party/opensk-harden.patch) calls `unlock_with_pin`.
-//! * The PIN retry counter is the vault's power-cut-safe counter, not OpenSK's.
+//! * PIN verification in TWO STAGES, because the host PIN and the IR PIN are separate:
+//!   1. host PIN, in the host's own PIN dialog (`unlock_with_pin`, called by the patched
+//!      `verify_pin_hash_enc`): checked against the host verifier in the vault record (Argon2id), nothing else
+//!      is asked, the host gets its PIN token at once. The hash is kept (RAM guard) for stage 2.
+//!   2. IR PIN, at the physical-button stage of the first command that needs the key: the IR PIN entry
+//!      and the button press are one step (`ir_pin.rs`, `user_presence.rs`, or `ir_stage` below when the
+//!      key is needed first). Host PIN + IR PIN + PUF secret -> Argon2id -> 256-bit key -> AES-256-GCM
+//!      opens the seed. A wrong IR PIN is detected by the GCM tag. Afterwards EVERY physical-button
+//!      confirmation of the session needs the IR PIN again (compared with the proven digest in RAM).
+//!   The stored PIN "hash" in OpenSK's storage is all zeros.
+//! * The PIN retry counter is the vault's power-cut-safe counter, not OpenSK's. Both stages count.
+use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce, Tag};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use defmt::{error, warn};
-use portable_atomic::{AtomicBool, Ordering};
+use portable_atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use hmac::{Hmac, Mac};
 use opensk::api::persist::{keys, Persist, PersistIter};
 use opensk::ctap::secret::Secret;
@@ -26,6 +36,8 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(feature = "ir")]
+use super::hid;
 use super::PicoPersist;
 use crate::guard;
 use crate::puf::{self, Puf, Status as PufStatus};
@@ -37,29 +49,168 @@ use crate::wrap;
 /// True while the vault record is PIN-wrapped, i.e. while forgetting the seed is a real lock.
 static WRAPPED: AtomicBool = AtomicBool::new(false);
 
-/// Forgets the seed immediately when a PIN protects it (no-op without a PIN). Callable from any
-/// context: the USB handler calls it on reset / suspend / disconnect, so an operation that is
-/// still running cannot start another key use.
+/// Where the IR PIN stands (see `ir_mode`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IrMode {
+    /// No IR PIN involved: no PIN set, or built without the `ir` feature.
+    None,
+    /// A PIN is set but protected by the host PIN alone: the IR PIN is enrolled at the next
+    /// physical-button stage.
+    Enroll,
+    /// An IR PIN protects the seed and it has not been entered in this session yet.
+    Verify,
+    /// The IR PIN was proven in this session: every physical-button confirmation asks for it again and
+    /// compares it with the proven one.
+    Session,
+}
+
+static IR_MODE: AtomicU8 = AtomicU8::new(0);
+
+fn set_mode(m: IrMode) {
+    IR_MODE.store(
+        match m {
+            IrMode::None => 0,
+            IrMode::Enroll => 1,
+            IrMode::Verify => 2,
+            IrMode::Session => 3,
+        },
+        Ordering::Release,
+    );
+}
+
+pub fn ir_mode() -> IrMode {
+    match IR_MODE.load(Ordering::Acquire) {
+        1 => IrMode::Enroll,
+        2 => IrMode::Verify,
+        3 => IrMode::Session,
+        _ => IrMode::None,
+    }
+}
+
+/// The mode of a freshly loaded / written PIN record.
+fn mode_of(rec: &Record) -> IrMode {
+    if !rec.wrapped || !cfg!(feature = "ir") {
+        IrMode::None
+    } else if rec.ir {
+        IrMode::Verify
+    } else {
+        IrMode::Enroll
+    }
+}
+
 /// A PIN-wrapped vault is loaded (for the display).
 pub fn pin_set() -> bool {
     WRAPPED.load(Ordering::Relaxed)
 }
 
+/// Forgets the seed, the host PIN hash and the IR PIN digest immediately when a PIN protects the
+/// seed (no-op without a PIN). Callable from any context: the USB handler calls it on reset /
+/// suspend / disconnect, so an operation that is still running cannot start another key use.
 pub fn lock_now() {
     if WRAPPED.load(Ordering::Relaxed) {
         guard::clear_seed();
+        guard::clear_host();
+        guard::clear_ir();
+        // A session that had proven the IR PIN needs it again.
+        let _ = IR_MODE.compare_exchange(3, 2, Ordering::AcqRel, Ordering::Acquire);
     }
 }
 
-const NONCE: usize = 16;
-const TAG: usize = 32;
+// ---- IR PIN helpers shared with the physical-button stage (user_presence.rs) ----------------------
 
+/// Wrong IR PINs entered in a row at the physical-button stage of an open session.
+#[allow(dead_code)]
+static SESSION_FAILS: AtomicU8 = AtomicU8::new(0);
+/// A wrong IR PIN three times in a row locks the session (the host PIN and the counted IR stage are needed
+/// again).
+#[allow(dead_code)]
+const SESSION_FAILS_MAX: u8 = 3;
+/// When the candidate IR digest was stored (ms, 0 = none) and how long it stays valid.
+#[allow(dead_code)]
+static CAND_MS: AtomicU32 = AtomicU32::new(0);
+#[allow(dead_code)]
+const CAND_VALID_MS: u32 = 15_000;
+
+#[allow(dead_code)]
+fn now_ms() -> u32 {
+    embassy_time::Instant::now().as_millis() as u32
+}
+
+/// Open session: does the IR PIN just entered match the proven one? (constant time)
+#[cfg(feature = "ir")]
+pub fn session_matches(d: &[u8; 32]) -> bool {
+    let mut proven = Zeroizing::new([0u8; 32]);
+    if !guard::reveal_ir_into(&mut proven) {
+        return false;
+    }
+    bool::from(proven[..].ct_eq(&d[..]))
+}
+
+#[cfg(feature = "ir")]
+pub fn session_ok() {
+    SESSION_FAILS.store(0, Ordering::Relaxed);
+}
+
+/// A wrong IR PIN in an open session; the third one in a row locks it.
+#[cfg(feature = "ir")]
+pub fn session_fail() {
+    let n = SESSION_FAILS.load(Ordering::Relaxed).saturating_add(1);
+    if n >= SESSION_FAILS_MAX {
+        SESSION_FAILS.store(0, Ordering::Relaxed);
+        warn!("ir: wrong IR PIN {} times - session locked", n);
+        lock_now();
+    } else {
+        SESSION_FAILS.store(n, Ordering::Relaxed);
+    }
+}
+
+/// Physical-button stage came first: keeps the IR digest entered there until the key is used (the
+/// next `ir_stage` verifies it with the counted attempt).
+#[cfg(feature = "ir")]
+pub fn store_candidate(d: &[u8; 32]) -> bool {
+    let ok = guard::store_ir(d);
+    CAND_MS.store(now_ms().max(1), Ordering::Release);
+    ok
+}
+
+#[allow(dead_code)]
+fn take_candidate() -> Option<Zeroizing<[u8; 32]>> {
+    let t = CAND_MS.swap(0, Ordering::AcqRel);
+    if t == 0 {
+        return None;
+    }
+    let mut d = Zeroizing::new([0u8; 32]);
+    let fresh = now_ms().wrapping_sub(t) <= CAND_VALID_MS;
+    let ok = fresh && guard::reveal_ir_into(&mut d);
+    guard::clear_ir();
+    if ok {
+        Some(d)
+    } else {
+        None
+    }
+}
+
+const NONCE: usize = 12;
+const TAG: usize = 16;
+
+#[allow(dead_code)] // the IR fields are only used with the `ir` feature
 struct State {
     vault: FlashVault,
     /// `None`: the vault is unusable (damaged / unreadable) until a CTAP reset.
     rec: Option<Record>,
     /// Retry-counter page of the PIN attempt in progress.
     pending: Option<usize>,
+    /// The last host PIN check (stage 1) was right but the IR PIN is still to be proven: the attempt
+    /// stays counted, `reset_pin_retries` must not forgive earlier failures (they may be IR failures).
+    partial: bool,
+    /// Wrong IR PINs of the current USB session, and the session (epoch) they belong to.
+    ir_fails: u8,
+    ir_fail_epoch: u32,
+    /// While `hid::epoch()` equals this, the IR stage refuses (three wrong IR PINs: reset / replug).
+    blocked_epoch: Option<u32>,
+    /// Serial of the operation in which an IR entry failed or was cancelled: the same operation does
+    /// not ask again (OpenSK may try several credentials).
+    denied_serial: u32,
 }
 
 pub struct HardenPersist {
@@ -83,51 +234,46 @@ fn sub_key(master: &[u8; 128], label: &[u8]) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(mac(master, &[label]).finalize().into_bytes().into())
 }
 
-fn xor_stream(k_enc: &[u8; 32], nonce: &[u8], data: &mut [u8]) {
-    for (i, chunk) in data.chunks_mut(32).enumerate() {
-        let mut ks: [u8; 32] = mac(k_enc, &[nonce, &(i as u32).to_le_bytes()])
-            .finalize()
-            .into_bytes()
-            .into();
-        for (d, k) in chunk.iter_mut().zip(ks.iter()) {
-            *d ^= k;
-        }
-        ks.zeroize();
-    }
+fn internal() -> Ctap2StatusCode {
+    Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR
 }
 
-fn tag(k_mac: &[u8; 32], key: usize, nonce: &[u8], ct: &[u8]) -> Hm {
-    mac(k_mac, &[b"cred", &(key as u32).to_le_bytes(), nonce, ct])
+/// Associated data of a resident credential: the key-value store key it lives under.
+fn cred_aad(key: usize) -> [u8; 8] {
+    let mut a = [0u8; 8];
+    a[..4].copy_from_slice(b"cred");
+    a[4..].copy_from_slice(&(key as u32).to_le_bytes());
+    a
 }
 
-fn seal(master: &[u8; 128], key: usize, plain: &[u8]) -> Vec<u8> {
-    let k_enc = sub_key(master, b"harden-cred-enc");
-    let k_mac = sub_key(master, b"harden-cred-mac");
+/// AES-256-GCM: `nonce(12) || ciphertext || tag(16)`, key derived from the master.
+fn seal(master: &[u8; 128], key: usize, plain: &[u8]) -> CtapResult<Vec<u8>> {
+    let k = sub_key(master, b"harden-cred-aead-v2");
+    let cipher = Aes256Gcm::new_from_slice(&k[..]).map_err(|_| internal())?;
     let mut nonce = [0u8; NONCE];
     fill_random(&mut nonce);
     let mut out = Vec::with_capacity(NONCE + plain.len() + TAG);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(plain);
-    xor_stream(&k_enc, &nonce, &mut out[NONCE..]);
-    let t = tag(&k_mac, key, &nonce, &out[NONCE..]).finalize().into_bytes();
-    out.extend_from_slice(&t);
-    out
+    let tag = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(&nonce), &cred_aad(key), &mut out[NONCE..])
+        .map_err(|_| internal())?;
+    out.extend_from_slice(&tag);
+    Ok(out)
 }
 
 fn open(master: &[u8; 128], key: usize, blob: &[u8]) -> CtapResult<Vec<u8>> {
     if blob.len() < NONCE + TAG {
-        return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR);
+        return Err(internal());
     }
-    let k_enc = sub_key(master, b"harden-cred-enc");
-    let k_mac = sub_key(master, b"harden-cred-mac");
+    let k = sub_key(master, b"harden-cred-aead-v2");
+    let cipher = Aes256Gcm::new_from_slice(&k[..]).map_err(|_| internal())?;
     let (nonce, rest) = blob.split_at(NONCE);
     let (ct, t) = rest.split_at(rest.len() - TAG);
-    let expect = tag(&k_mac, key, nonce, ct).finalize().into_bytes();
-    if !bool::from(expect.as_slice().ct_eq(t)) {
-        return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR);
-    }
     let mut plain = ct.to_vec();
-    xor_stream(&k_enc, nonce, &mut plain);
+    cipher
+        .decrypt_in_place_detached(Nonce::from_slice(nonce), &cred_aad(key), &mut plain, Tag::from_slice(t))
+        .map_err(|_| internal())?;
     Ok(plain)
 }
 
@@ -135,6 +281,7 @@ fn hw_fail() -> Ctap2StatusCode {
     Ctap2StatusCode::CTAP2_ERR_VENDOR_HARDWARE_FAILURE
 }
 
+#[allow(dead_code)]
 /// Marks a PIN attempt as done (forgives earlier failures). A failure is logged; the attempt then
 /// simply stays counted, which is the safe direction.
 fn finish_try_logged(v: &mut FlashVault, page: usize) {
@@ -171,6 +318,66 @@ fn bind_slot(mut rec: Record, puf: &Puf) -> Record {
         rec.puf_slot = puf.slot();
     }
     rec
+}
+
+/// Before an IR stage: refuses while three wrong IR PINs blocked this USB session, and (when the attempt
+/// will be counted) when the retry counter is used up.
+#[cfg(feature = "ir")]
+fn ir_precheck(st: &mut State, count: bool) -> CtapResult<()> {
+    if st.blocked_epoch == Some(hid::epoch()) {
+        return Err(Ctap2StatusCode::CTAP2_ERR_PIN_AUTH_BLOCKED);
+    }
+    if count && st.vault.tries_used().map_err(|_| hw_fail())? as usize >= TRIES_MAX {
+        return Err(Ctap2StatusCode::CTAP2_ERR_PIN_BLOCKED);
+    }
+    Ok(())
+}
+
+/// Evaluates an IR PIN against an IR record: one counted attempt (written before the evaluation), forgiven
+/// only by a right IR PIN. Needs the host PIN hash of this session (guard). Returns the seed.
+#[cfg(feature = "ir")]
+fn ir_check(
+    st: &mut State,
+    rec: &Record,
+    kref: Option<&[u8; 32]>,
+    digest: &[u8; 32],
+    serial: u32,
+) -> CtapResult<Zeroizing<[u8; 32]>> {
+    let mut host = Zeroizing::new([0u8; 16]);
+    if !guard::reveal_host_into(&mut host) {
+        return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
+    }
+    let page = st.vault.begin_try().map_err(|_| hw_fail())?;
+    guard::refresh_now();
+    let res = wrap::open_ir(rec, &host, digest, kref);
+    guard::refresh_now();
+    match res {
+        Some(seed) => {
+            finish_try_logged(&mut st.vault, page);
+            st.ir_fails = 0;
+            Ok(seed)
+        }
+        None => {
+            // Stays counted. Three in a row end the USB session's chance (like OpenSK's 3 mismatches).
+            let e = hid::epoch();
+            if st.ir_fail_epoch != e {
+                st.ir_fail_epoch = e;
+                st.ir_fails = 0;
+            }
+            st.ir_fails = st.ir_fails.saturating_add(1);
+            if st.ir_fails >= 3 {
+                st.blocked_epoch = Some(e);
+            }
+            st.denied_serial = serial;
+            guard::clear_ir();
+            crate::LED_FLASH.signal(crate::LedFlash::Bad);
+            if st.vault.tries_used().map_or(false, |u| u as usize >= TRIES_MAX) {
+                Err(Ctap2StatusCode::CTAP2_ERR_PIN_BLOCKED)
+            } else {
+                Err(Ctap2StatusCode::CTAP2_ERR_PIN_INVALID)
+            }
+        }
+    }
 }
 
 impl HardenPersist {
@@ -210,7 +417,13 @@ impl HardenPersist {
             vault,
             rec: None,
             pending: None,
+            partial: false,
+            ir_fails: 0,
+            ir_fail_epoch: 0,
+            blocked_epoch: None,
+            denied_serial: 0,
         };
+        set_mode(IrMode::None);
         // A PUF-bound record names the helper slot it belongs to (two can be valid until a
         // re-enrolment is committed).
         if let Some(r) = rec.as_ref() {
@@ -339,7 +552,14 @@ impl HardenPersist {
                         puf::set_fault(true);
                     }
                 }
+            } else if puf.required() && !r.puf {
+                // A PIN record written by a build without the PUF: opening it would need its PIN(s),
+                // and binding it to the PUF needs both PINs. Not supported: do a CTAP reset.
+                error!("vault: PIN record without PUF binding while the PUF is required - CTAP reset needed");
+                WRAPPED.store(false, Ordering::Relaxed);
+                puf::set_sec_fault(true);
             } else {
+                set_mode(mode_of(&r));
                 st.rec = Some(scrubbed(r));
             }
         } else if !blank {
@@ -373,11 +593,121 @@ impl HardenPersist {
         if self.st.borrow().rec.is_none() {
             return Err(hw_fail());
         }
+        self.ensure_unlocked()?;
         let mut seed = Zeroizing::new([0u8; 32]);
         if !guard::reveal_seed_into(&mut seed) {
             return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
         }
         wrap::expand_into(&seed, m);
+        Ok(())
+    }
+
+    /// The key may be used: the seed is open and, if an IR PIN protects it, the IR PIN has been
+    /// proven in this session. If only the IR PIN is missing (the host PIN was checked in the host's
+    /// dialog), the IR stage runs now: entry of the IR PIN and the physical-button press are one step.
+    fn ensure_unlocked(&self) -> CtapResult<()> {
+        let mode = ir_mode();
+        if guard::has_seed() && matches!(mode, IrMode::None | IrMode::Session) {
+            return Ok(());
+        }
+        #[cfg(feature = "ir")]
+        {
+            if matches!(mode, IrMode::Enroll | IrMode::Verify) && guard::has_host() {
+                return self.ir_stage(mode);
+            }
+        }
+        Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED)
+    }
+
+    /// Stage 2 of the PIN check, see the module header. `Enroll`: the record has no IR PIN yet, the
+    /// seed is open (stage 1 opened it): the IR PIN is entered twice and the record is rewritten with
+    /// the IR PIN as part of the key. `Verify`: the IR PIN opens the seed (one counted attempt).
+    #[cfg(feature = "ir")]
+    fn ir_stage(&self, mode: IrMode) -> CtapResult<()> {
+        use crate::ir_pin::{self, Outcome, Purpose};
+        let mut cell = self.st.borrow_mut();
+        let st = &mut *cell;
+        let serial = hid::op_serial();
+        let enroll = mode == IrMode::Enroll;
+        ir_precheck(st, !enroll)?;
+        if serial != 0 && st.denied_serial == serial {
+            return Err(Ctap2StatusCode::CTAP2_ERR_OPERATION_DENIED);
+        }
+        let rec = st.rec.clone().ok_or_else(hw_fail)?;
+        if !rec.wrapped {
+            return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
+        }
+        if enroll && !guard::has_seed() {
+            return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
+        }
+        let key = self.puf.key();
+        if rec.puf && key.is_none() {
+            puf::set_fault(true);
+            error!("puf: key unavailable - unplug for 10 s and retry (not counted as a wrong PIN)");
+            return Err(hw_fail());
+        }
+        let kref = if rec.puf { key.as_ref().map(|k| &**k) } else { None };
+        // The IR digest: already entered at the physical-button stage, or entered now (the confirming
+        // press is then the user presence of this command).
+        let (digest, pressed_now) = match take_candidate() {
+            Some(d) => (d, false),
+            None => match ir_pin::collect(if enroll { Purpose::Enroll } else { Purpose::Verify }) {
+                Outcome::Pin(d, _) => (d, true),
+                Outcome::TimedOut => {
+                    st.denied_serial = serial;
+                    return Err(Ctap2StatusCode::CTAP2_ERR_USER_ACTION_TIMEOUT);
+                }
+                Outcome::Cancelled | Outcome::Keep => {
+                    st.denied_serial = serial;
+                    return Err(Ctap2StatusCode::CTAP2_ERR_OPERATION_DENIED);
+                }
+            },
+        };
+        if enroll {
+            let mut host = Zeroizing::new([0u8; 16]);
+            if !guard::reveal_host_into(&mut host) {
+                return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
+            }
+            let mut seed = Zeroizing::new([0u8; 32]);
+            if !guard::reveal_seed_into(&mut seed) {
+                return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
+            }
+            let mut salt = [0u8; 16];
+            fill_random(&mut salt);
+            let new = bind_slot(
+                wrap::wrap_full(&seed, &host, &digest, salt, kref).ok_or_else(hw_fail)?,
+                &self.puf,
+            );
+            guard::refresh_now();
+            match st.vault.replace(&new) {
+                Replaced::New(saved) => {
+                    st.rec = Some(new);
+                    if !st.old_gone(saved.old_wiped) {
+                        // The host-only record (without the IR PIN) is still readable: lock until it
+                        // is gone (every boot retries the wipe).
+                        error!("ir: the record without the IR PIN could not be wiped - device locked");
+                        st.fail_closed();
+                        return Err(hw_fail());
+                    }
+                }
+                Replaced::Kept(_) => return Err(hw_fail()),
+                Replaced::NoKey | Replaced::Unknown => {
+                    st.fail_closed();
+                    return Err(hw_fail());
+                }
+            }
+        } else {
+            let seed = ir_check(st, &rec, kref, &digest, serial)?;
+            if !guard::store_seed(&seed) {
+                return Err(hw_fail());
+            }
+        }
+        guard::store_ir(&digest);
+        set_mode(IrMode::Session);
+        SESSION_FAILS.store(0, Ordering::Relaxed);
+        if pressed_now {
+            super::user_presence::grant_credit();
+        }
         Ok(())
     }
 
@@ -403,8 +733,12 @@ impl State {
         puf::set_sec_fault(true);
         self.rec = None;
         self.pending = None;
+        self.partial = false;
         WRAPPED.store(false, Ordering::Relaxed);
         guard::clear_seed();
+        guard::clear_host();
+        guard::clear_ir();
+        set_mode(IrMode::None);
     }
 }
 
@@ -414,7 +748,7 @@ impl Persist for HardenPersist {
         match value {
             Some(blob) if keys::CREDENTIALS.contains(&key) => {
                 let mut m = Zeroizing::new([0u8; 128]);
-        self.master_into(&mut m)?;
+                self.master_into(&mut m)?;
                 Ok(Some(open(&m, key, &blob)?))
             }
             other => Ok(other),
@@ -424,8 +758,8 @@ impl Persist for HardenPersist {
     fn insert(&mut self, key: usize, value: &[u8]) -> CtapResult<()> {
         if keys::CREDENTIALS.contains(&key) {
             let mut m = Zeroizing::new([0u8; 128]);
-        self.master_into(&mut m)?;
-            let blob = seal(&m, key, value);
+            self.master_into(&mut m)?;
+            let blob = seal(&m, key, value)?;
             self.raw.insert(key, &blob)
         } else {
             self.raw.insert(key, value)
@@ -457,29 +791,10 @@ impl Persist for HardenPersist {
 
     // ---- PIN ---------------------------------------------------------------------------------
 
-    /// Called by the patched `verify_pin_hash_enc`. Argon2 tag = verifier (compared in constant
-    /// time in `wrap::unwrap`).
+    /// Stage 1 of the PIN check: the host PIN, called by the patched `verify_pin_hash_enc`. The host
+    /// verifier in the vault record (Argon2id, PUF-bound) tells right from wrong; the IR PIN is NOT asked
+    /// here: the host gets its answer at once and the IR PIN is part of the physical-button stage.
     fn unlock_with_pin(&mut self, pin_hash: &[u8; 16]) -> CtapResult<Option<bool>> {
-        // The host typed the magic PIN (ten zeros): the real PIN is the IR remote key sequence.
-        #[cfg(feature = "ir")]
-        let ir_hash;
-        #[cfg(feature = "ir")]
-        let pin_hash: &[u8; 16] = if crate::ir_pin::is_magic(pin_hash) {
-            match crate::ir_pin::collect(crate::ir_pin::Purpose::Enter) {
-                crate::ir_pin::Outcome::Pin(h, _) => {
-                    ir_hash = h;
-                    &*ir_hash
-                }
-                crate::ir_pin::Outcome::Cancelled => {
-                    return Err(Ctap2StatusCode::CTAP2_ERR_OPERATION_DENIED)
-                }
-                crate::ir_pin::Outcome::TimedOut => {
-                    return Err(Ctap2StatusCode::CTAP2_ERR_USER_ACTION_TIMEOUT)
-                }
-            }
-        } else {
-            pin_hash
-        };
         let st = self.st.get_mut();
         let rec = match st.rec.clone() {
             Some(r) => r,
@@ -503,96 +818,35 @@ impl Persist for HardenPersist {
         }
         let kref = if rec.puf { key.as_ref().map(|k| &**k) } else { None };
         guard::refresh_now();
-        let ok = match wrap::unwrap(&rec, pin_hash, kref) {
-            Some(seed) => {
-                if !guard::store_seed(&seed) {
+        st.partial = false;
+        let ok = match wrap::host_stage(&rec, pin_hash, kref) {
+            wrap::Host::Wrong => false,
+            wrap::Host::Verified => {
+                // The record also needs the IR PIN: keep the host PIN hash for stage 2.
+                if !guard::store_host(pin_hash) {
                     return Err(hw_fail());
                 }
-                // Record not yet PUF-bound but a key exists: bind it now that the PIN is at hand.
-                if !rec.puf {
-                    if let Some(k) = key.as_ref() {
-                        let mut salt = [0u8; 16];
-                        fill_random(&mut salt);
-                        let Some(up) = wrap::wrap(&seed, pin_hash, salt, Some(&**k)) else {
-                            // The PIN was right, but the PUF-bound record cannot be built: do not
-                            // report an unlock of a record that is still unbound.
-                            error!("puf: could not build the PUF-bound PIN record - not unlocking");
-                            puf::set_fault(true);
-                            guard::clear_seed();
-                            if let Some(page) = st.pending.take() {
-                                finish_try_logged(&mut st.vault, page);
-                            }
-                            return Err(hw_fail());
-                        };
-                        let up = bind_slot(up, &self.puf);
-                        {
-                            match st.vault.replace(&up) {
-                                Replaced::New(s) => {
-                                    if !st.old_gone(s.old_wiped) {
-                                        // The old record (PIN verifier without the PUF input) is
-                                        // still readable: lock until it is gone.
-                                        error!("puf: the unbound PIN record could not be wiped - device locked");
-                                        if let Some(page) = st.pending.take() {
-                                            finish_try_logged(&mut st.vault, page);
-                                        }
-                                        st.fail_closed();
-                                        return Err(hw_fail());
-                                    }
-                                    st.rec = Some(up);
-                                }
-                                // The PIN was right but the record is still unbound: with the PUF
-                                // required it is not used. Forget the seed and report; the PIN
-                                // was correct, so the attempt is marked DONE (forgiving earlier
-                                // failures is right here); the next PIN entry retries the binding.
-                                Replaced::Kept(_) => {
-                                    error!("puf: could not bind the PIN record - not unlocking");
-                                    puf::set_fault(true);
-                                    guard::clear_seed();
-                                    if let Some(page) = st.pending.take() {
-                                        finish_try_logged(&mut st.vault, page);
-                                    }
-                                    return Err(hw_fail());
-                                }
-                                Replaced::NoKey | Replaced::Unknown => {
-                                    puf::set_fault(true);
-                                    st.fail_closed();
-                                    return Err(hw_fail());
-                                }
-                            }
-                        }
-                    }
+                if ir_mode() != IrMode::Session {
+                    set_mode(IrMode::Verify);
+                    st.partial = true;
                 }
                 true
             }
-            None => false,
+            wrap::Host::Seed(seed) => {
+                // No IR PIN yet: the host PIN opened the seed. With the `ir` feature the IR PIN is
+                // enrolled at the next physical-button stage.
+                if !guard::store_seed(&seed) || !guard::store_host(pin_hash) {
+                    return Err(hw_fail());
+                }
+                set_mode(if cfg!(feature = "ir") { IrMode::Enroll } else { IrMode::None });
+                true
+            }
         };
         guard::refresh_now();
         Ok(Some(ok))
     }
 
     fn set_pin(&mut self, pin_hash: &[u8; 16], pin_code_point_length: u8) -> CtapResult<()> {
-        // The host typed the magic PIN (ten zeros): the new PIN is the IR remote key sequence,
-        // entered twice.
-        #[cfg(feature = "ir")]
-        let ir_hash;
-        #[cfg(feature = "ir")]
-        let (pin_hash, pin_code_point_length): (&[u8; 16], u8) =
-            if crate::ir_pin::is_magic(pin_hash) {
-                match crate::ir_pin::collect(crate::ir_pin::Purpose::Set) {
-                    crate::ir_pin::Outcome::Pin(h, len) => {
-                        ir_hash = h;
-                        (&*ir_hash, len)
-                    }
-                    crate::ir_pin::Outcome::Cancelled => {
-                        return Err(Ctap2StatusCode::CTAP2_ERR_OPERATION_DENIED)
-                    }
-                    crate::ir_pin::Outcome::TimedOut => {
-                        return Err(Ctap2StatusCode::CTAP2_ERR_USER_ACTION_TIMEOUT)
-                    }
-                }
-            } else {
-                (pin_hash, pin_code_point_length)
-            };
         let key = self.puf.key();
         let mut wipe_failed = false;
         {
@@ -606,11 +860,47 @@ impl Persist for HardenPersist {
                 error!("set_pin: PUF key unavailable - PIN not set");
                 return Err(hw_fail());
             }
+            // 0. PIN CHANGE of an IR-protected record: the old host PIN was just verified by OpenSK (stage 1,
+            //    its hash is in the guard). Now prove the current IR PIN (counted attempt) and take the new
+            //    IR PIN (the button alone keeps the current one). A first PIN (no record yet) and a
+            //    host-only record need nothing here: the IR PIN is enrolled at the next button stage.
+            #[cfg(feature = "ir")]
+            let ir_digest: Option<Zeroizing<[u8; 32]>> =
+                match st.rec.clone().filter(|r| r.wrapped && r.ir) {
+                    Some(old) => {
+                        use crate::ir_pin::{self, Outcome, Purpose};
+                        ir_precheck(st, true)?;
+                        let serial = hid::op_serial();
+                        let old_key = if old.puf { key.as_ref().map(|k| &**k) } else { None };
+                        let current = match ir_pin::collect(Purpose::Verify) {
+                            Outcome::Pin(d, _) => d,
+                            Outcome::TimedOut => {
+                                return Err(Ctap2StatusCode::CTAP2_ERR_USER_ACTION_TIMEOUT)
+                            }
+                            Outcome::Cancelled | Outcome::Keep => {
+                                return Err(Ctap2StatusCode::CTAP2_ERR_OPERATION_DENIED)
+                            }
+                        };
+                        // Proves the current IR PIN; the opened seed is not needed (it is in the guard).
+                        let _ = ir_check(st, &old, old_key, &current, serial)?;
+                        match ir_pin::collect(Purpose::Change) {
+                            Outcome::Pin(d, _) => Some(d),
+                            Outcome::Keep => Some(current),
+                            Outcome::TimedOut => {
+                                return Err(Ctap2StatusCode::CTAP2_ERR_USER_ACTION_TIMEOUT)
+                            }
+                            Outcome::Cancelled => {
+                                return Err(Ctap2StatusCode::CTAP2_ERR_OPERATION_DENIED)
+                            }
+                        }
+                    }
+                    None => None,
+                };
             // 1. Counter first. The caller is authenticated (no PIN yet, or the old PIN was just
             //    verified), so clearing it early gives nothing away, and a failure here changes
             //    nothing at all.
             clear_tries_checked(&mut st.vault)?;
-            // 2. Wrap the seed under the new PIN.
+            // 2. Wrap the seed under the new host PIN (and the IR PIN of a PIN change).
             let rec = {
                 let mut seed = Zeroizing::new([0u8; 32]);
                 if !guard::reveal_seed_into(&mut seed) {
@@ -618,10 +908,15 @@ impl Persist for HardenPersist {
                 }
                 let mut salt = [0u8; 16];
                 fill_random(&mut salt);
-                bind_slot(
-                    wrap::wrap(&seed, pin_hash, salt, key.as_ref().map(|k| &**k)).ok_or_else(hw_fail)?,
-                    &self.puf,
-                )
+                let kref = key.as_ref().map(|k| &**k);
+                #[cfg(feature = "ir")]
+                let built = match &ir_digest {
+                    Some(d) => wrap::wrap_full(&seed, pin_hash, d, salt, kref),
+                    None => wrap::wrap_host(&seed, pin_hash, salt, kref),
+                };
+                #[cfg(not(feature = "ir"))]
+                let built = wrap::wrap_host(&seed, pin_hash, salt, kref);
+                bind_slot(built.ok_or_else(hw_fail)?, &self.puf)
             };
             guard::refresh_now();
             // 3. PIN metadata BEFORE the vault commit. The only inconsistent states a power cut can
@@ -629,7 +924,7 @@ impl Persist for HardenPersist {
             //    seed is untouched) and "old PIN record + new length" (harmless). The reverse
             //    (PIN-wrapped vault, no metadata) cannot be produced any more.
             let was_wrapped = st.rec.as_ref().is_some_and(|r| r.wrapped);
-            // The stored PIN "hash" is zeros: the real check is the Argon2 tag in the vault.
+            // The stored PIN "hash" is zeros: the real check is the verifier / GCM tag in the vault.
             let mut props = [0u8; 17];
             props[0] = pin_code_point_length;
             self.raw.insert(keys::PIN_PROPERTIES, &props)?;
@@ -637,9 +932,34 @@ impl Persist for HardenPersist {
             //    counts as success.
             match st.vault.replace(&rec) {
                 Replaced::New(saved) => {
+                    let mode = mode_of(&rec);
                     st.rec = Some(rec);
                     st.pending = None;
+                    st.partial = false;
                     WRAPPED.store(true, Ordering::Relaxed);
+                    // Session after the change: the new host PIN hash stays for stage 2 / the next
+                    // change; a record with an IR PIN has just had it proven, a host-only one asks
+                    // for the IR PIN at the next button stage.
+                    if !guard::store_host(pin_hash) {
+                        warn!("set_pin: host PIN hash not kept - the host PIN is asked again");
+                    }
+                    #[cfg(feature = "ir")]
+                    {
+                        match &ir_digest {
+                            Some(d) => {
+                                guard::store_ir(d);
+                                set_mode(IrMode::Session);
+                            }
+                            None => {
+                                guard::clear_ir();
+                                set_mode(mode);
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "ir"))]
+                    {
+                        set_mode(mode);
+                    }
                     if !st.old_gone(saved.old_wiped) {
                         // The new record wins on every boot, but the previous (plain or
                         // old-PIN) record may still be readable: do NOT report success. The seed
@@ -702,11 +1022,20 @@ impl Persist for HardenPersist {
         // Written BEFORE the PIN is evaluated, so cutting power cannot undo the attempt.
         let page = st.vault.begin_try().map_err(|_| hw_fail())?;
         st.pending = Some(page);
+        st.partial = false;
         Ok(())
     }
 
     fn reset_pin_retries(&mut self) -> CtapResult<()> {
         let st = self.st.get_mut();
+        if st.partial {
+            // Host PIN right, IR PIN still to prove: nothing is forgiven now. The attempt stays counted
+            // and is wiped by the right IR PIN (`ir_check`), so earlier IR failures cannot be reset by
+            // typing the (possibly well-known) host PIN.
+            st.partial = false;
+            st.pending = None;
+            return Ok(());
+        }
         match st.pending.take() {
             Some(page) => st.vault.finish_try(page).map_err(|_| hw_fail()),
             None => st.vault.clear_tries().map_err(|_| hw_fail()),
@@ -776,7 +1105,12 @@ impl Persist for HardenPersist {
                     let wiped = saved.old_wiped || matches!(st.vault.purge_stale(), Ok(true));
                     st.rec = Some(scrubbed(rec));
                     st.pending = None;
+                    st.partial = false;
+                    st.blocked_epoch = None;
                     WRAPPED.store(false, Ordering::Relaxed);
+                    guard::clear_host();
+                    guard::clear_ir();
+                    set_mode(IrMode::None);
                     if !guard::store_seed(&seed) {
                         st.fail_closed();
                         return Err(hw_fail());

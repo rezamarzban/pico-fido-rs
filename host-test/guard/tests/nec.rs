@@ -32,12 +32,21 @@ fn digest_depends_on_every_code_and_the_order() {
     c[7] = 0x00FF_09F6;
     assert_ne!(d, digest(&c), "every code matters");
     assert_ne!(d, digest(&a[..7]), "the length matters");
-    assert_eq!(pin_hash(&d)[..], d[..16]);
 }
 
 #[test]
-fn magic_pin_hash_is_the_hash_of_ten_zeros() {
+fn digest_is_domain_separated_v2() {
     use sha2::{Digest, Sha256};
-    assert_eq!(MAGIC_PIN.len(), 10);
-    assert_eq!(magic_hash()[..], Sha256::digest(b"0000000000")[..16]);
+    let a = [0x00FF_45BAu32, 0x00FF_46B9];
+    let mut h = Sha256::new();
+    h.update(b"pico-fido-ir-pin-v2");
+    h.update([2u8]);
+    for c in a { h.update(c.to_be_bytes()); }
+    let want: [u8; 32] = h.finalize().into();
+    assert_eq!(digest(&a), want);
+}
+
+#[test]
+fn pin_length_limits() {
+    assert!(MIN_PRESSES >= 8 && MIN_PRESSES <= MAX_PRESSES);
 }

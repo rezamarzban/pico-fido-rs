@@ -224,3 +224,13 @@ Fixes the issue that a PUF failure could silently produce a plain / unbound seed
 * LED: 3 short blinks + pause while `puf::fault()`.
 * [ ] Build and test: blank first boot, enrolment failure (non-POR first boot), noisy sample with an unbound record,
   noisy sample with a PUF-bound record, reset with and without a power-on reset, a flash write failure during binding.
+
+
+## se6: separate host / IR PIN, GP14 key, LED feedback, AES-256-GCM (NOT compiled, NOT tested)
+Written without a Rust toolchain. What to check first:
+* `cargo test` in `host-test/guard` (known answers in `tests/wrap.rs` come from an independent Python implementation).
+* Compile: `aes-gcm` 0.10 API (`encrypt_in_place_detached`), `cortex_m::interrupt::free` in `hid::cancel_requested`, `Signal::wait` + `with_timeout` in the LED task.
+* OpenSK behaviour assumed, not read (OpenSK is not part of the archive): key-store use may come before the user-presence wait (handled: the IR stage runs at the first key use as well, and the press then counts as user presence); `wait_with_timeout` is called once per user-presence wait (the IR entry blocks inside it, with keepalives).
+* Retry counter: stage 1 success does not forgive (`partial`), the right IR PIN does (`finish_try`); the host PIN typed again in an open session does.
+* Argon2 time: two runs per unlock (`T_COST`), against the 8 s watchdog if enabled.
+* Known limits: U2F confirmation uses the same IR step but is polled from the main loop (blocking); a CTAP reset needs no IR PIN only if the host PIN was not entered in that session.

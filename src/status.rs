@@ -37,7 +37,9 @@ pub fn set_store(used: u32, total: u32, life_used: u32, life_total: u32) {
 }
 
 /// IR PIN entry screen (src/ir_pin.rs -> src/oled.rs): kind 0 = normal status screen,
-/// 1 = setting a PIN, 2 = entering it. Step 1/2 (set: enter, repeat), key count, message.
+/// 1 = enrolling the IR PIN (twice), 2 = entering it, 3 = new IR PIN during a PIN change (button alone
+/// keeps the current one). Step 1/2, key count, message. Nothing depends on the display: the LED shows
+/// the same progress.
 pub static ENTRY_KIND: AtomicU8 = AtomicU8::new(0);
 pub static ENTRY_STEP: AtomicU8 = AtomicU8::new(1);
 pub static ENTRY_COUNT: AtomicU8 = AtomicU8::new(0);

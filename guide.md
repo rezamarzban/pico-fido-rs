@@ -36,7 +36,7 @@ The maintainer reports this branch working on a Pico with Linux, Windows and And
 
 ## 4. Sign in
 1. Choose "Sign in with security key" and enter the PIN if asked.
-2. **Press BOOTSEL** when the LED is almost solid.
+2. **Press BOOTSEL** (or the external key on GP14) when the LED is almost solid. With the IR remote: type your IR PIN keys first (the LED flashes once per key), then press the button (see step 6).
 
 Every registration and every sign-in needs a **new** press. Holding the button before the request does not count:
 release it, then press again.
@@ -65,3 +65,12 @@ key is locked** (unplug it for about 10 seconds and plug it in again; if it pers
   second key cannot be a clone. Register **two** devices on every account. Flashing firmware that changes the flash
   layout, or erasing the flash, loses every credential.
 - **If a site does not recognise the key:** the USB IDs are prototype placeholders; test on webauthn.io first.
+
+## 6. IR PIN (remote) and the button
+- The host PIN is entered in the browser / `fido2-token` as usual. The **IR PIN** is a second PIN typed on the remote *at the button step*.
+- **First time after setting the host PIN:** at the first registration the LED goes dark with a short blip every second. Press at
+  least 8 keys on the remote (every key flashes the LED once), press the button, repeat the same keys, press the button. Done.
+- **Every plug-in, and every later registration / sign-in:** press the remote keys of your IR PIN, then the button (BOOTSEL or GP14 key).
+  A wrong or cancelled entry flashes the LED twice, long. Hold the button 1.5 s to cancel.
+- Wiring: VS1838B OUT -> GP15; optional external key GP14 -> GND. The OLED is optional.
+- **Forgot the IR PIN?** Unplug, plug in, run the reset without entering the host PIN (deletes all credentials).

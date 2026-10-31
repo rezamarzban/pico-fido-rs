@@ -6,6 +6,9 @@
 //! 32-bit codes are queued ONLY while a PIN entry is armed (`arm`); everything else is dropped, so
 //! stray IR traffic is never buffered. Level waits are used (not edge waits) so an edge that
 //! happens between two awaits cannot be missed.
+//!
+//! Every valid key press received while an entry is armed also flashes the LED once (`LedFlash::Key`),
+//! so the user sees that the device heard the remote even without a display.
 use embassy_rp::gpio::Input;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -66,6 +69,7 @@ pub async fn ir_task(mut pin: Input<'static>) {
         if let Some(code) = frame(&mut pin).await {
             if ARMED.load(Ordering::Relaxed) {
                 let _ = FRAMES.try_send(code);
+                crate::LED_FLASH.signal(crate::LedFlash::Key);
             }
         }
         // Resynchronise: a pause of 6 ms with the line high is longer than anything inside a

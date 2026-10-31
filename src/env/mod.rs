@@ -19,6 +19,7 @@ pub use harden::HardenPersist;
 pub use persist::PicoPersist;
 use rng::PicoRng;
 pub use user_presence::PicoUserPresence;
+pub use user_presence::U2fPress;
 
 use core::fmt;
 use opensk::api::crypto::software_crypto::SoftwareCrypto;

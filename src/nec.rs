@@ -8,14 +8,14 @@
 //! Entropy: of those 32 bits only the command byte (and the address, which is constant for one
 //! remote) carries information, so one key press is about log2(number of keys) bits, roughly 4.4
 //! bits on a 21-key remote, not 32.
+//!
+//! The IR PIN is separate from the PIN typed in the host dialog: the digest below is one of the inputs of
+//! the Argon2id key derivation (src/wrap.rs), together with the host PIN hash and the SRAM-PUF secret.
 use sha2::{Digest, Sha256};
 
 /// Keys needed for a PIN (about 35 bits on a 21-key remote) and the most that are kept.
 pub const MIN_PRESSES: usize = 8;
 pub const MAX_PRESSES: usize = 32;
-
-/// What the host types to say "use the IR remote": ten zeros (10 is the minimum PIN length).
-pub const MAGIC_PIN: &[u8] = b"0000000000";
 
 pub fn leader_mark_ok(us: u32) -> bool {
     (7_000..11_000).contains(&us)
@@ -54,28 +54,14 @@ pub fn valid(bits: u32) -> bool {
     addr == !inv_addr && cmd == !inv_cmd
 }
 
-/// Digest of a key sequence (order matters, every full 32-bit code is used).
+/// Digest of a key sequence (order matters, every full 32-bit code is used). The IR PIN input of
+/// the key derivation.
 pub fn digest(codes: &[u32]) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"pico-fido-ir-pin-v1");
+    h.update(b"pico-fido-ir-pin-v2");
     h.update([codes.len() as u8]);
     for c in codes {
         h.update(c.to_be_bytes());
     }
     h.finalize().into()
-}
-
-/// The 16-byte PIN hash OpenSK works with (the first 16 bytes of the digest).
-pub fn pin_hash(digest: &[u8; 32]) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest[..16]);
-    out
-}
-
-/// PIN hash of `MAGIC_PIN`, as the host sends it (`SHA-256(PIN)[..16]`).
-pub fn magic_hash() -> [u8; 16] {
-    let d = Sha256::digest(MAGIC_PIN);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&d[..16]);
-    out
 }

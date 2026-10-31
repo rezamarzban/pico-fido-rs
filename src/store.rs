@@ -1,15 +1,20 @@
 //! Crash-safe storage of the master-key record in two flash sectors (slots 0 and 1) plus a PIN
 //! retry counter in a third sector.
 //!
-//! Record (110 bytes, "FK03"):
-//!   magic[4] | seq u32 LE | wrapped u8 | argon2 m_kib u32 LE | argon2 t u8 | salt[16] |
+//! Record (110 bytes, "FK04"):
+//!   magic[4] | seq u32 LE | flags u8 | argon2 m_kib u32 LE | argon2 t u8 | salt[16] |
 //!   body[32] | tag[32] | first 16 bytes of SHA-256 over the previous 94 bytes
+//! * flags: bit 0 = PIN-wrapped, bit 1 = bound to the SRAM PUF, bit 2 = PUF helper slot,
+//!   bit 3 = the IR PIN is part of the key (only with bit 0).
 //! * `wrapped = 0`: `body` is the plain master key (no PIN set), salt/params are zero. With the PUF bit set
 //!   `body` is masked with the PUF key and `tag` authenticates it (all-zero tag = older record without it).
-//! * `wrapped = 1`: `body` is the master key encrypted under a key derived from the PIN
-//!   (wrap.rs), `tag` authenticates it. The plain key is NOT in flash.
+//! * `wrapped = 1`: `body` is the master seed encrypted with AES-256-GCM under a key derived with
+//!   Argon2id from (host PIN [+ IR PIN] + PUF secret), see wrap.rs. `tag[..16]` is the GCM tag,
+//!   `tag[16..]` the verifier of the host PIN (stage 1). The plain key is NOT in flash.
 //!
-//! The older 56-byte "FK02" record (plain key only) is still read, and replaced on the next write.
+//! The older 56-byte "FK02" record (plain key only) and the "FK03" plain / PUF-masked records are still
+//! read, and replaced on the next write. An "FK03" PIN-wrapped record (HMAC stream, one factor) cannot be
+//! read any more: the vault then counts as damaged and a CTAP reset is needed.
 //!
 //! Rules:
 //! * The newest valid record wins. "Newest" uses wrap-around (serial number) arithmetic on `seq`.
@@ -35,7 +40,8 @@ pub const TRIES_MAX: usize = 8;
 pub const TRIES_PAGES: usize = 16;
 const T_START: u8 = 0x7F;
 const T_DONE: u8 = 0x00;
-const MAGIC: [u8; 4] = *b"FK03";
+const MAGIC: [u8; 4] = *b"FK04";
+const MAGIC_V3: [u8; 4] = *b"FK03";
 const MAGIC_V2: [u8; 4] = *b"FK02";
 
 pub trait Sectors {
@@ -78,6 +84,9 @@ pub struct Record {
     /// Only meaningful with `puf`. Written into the record so that a re-enrolment is committed by
     /// the record itself: both helpers can exist until the new record is durable.
     pub puf_slot: u8,
+    /// The IR PIN is part of the key (two-factor record). Only with `wrapped`. A PIN record without
+    /// it is protected by the host PIN alone until the IR PIN is enrolled (first use of the key).
+    pub ir: bool,
     pub m_kib: u32,
     pub t_cost: u8,
     pub salt: [u8; 16],
@@ -108,6 +117,7 @@ impl Record {
             wrapped: false,
             puf: false,
             puf_slot: 0,
+            ir: false,
             m_kib: 0,
             t_cost: 0,
             salt: [0; 16],
@@ -164,7 +174,7 @@ fn encode(rec: &Record, seq: u32) -> [u8; REC_LEN] {
     let mut r = [0u8; REC_LEN];
     r[..4].copy_from_slice(&MAGIC);
     r[4..8].copy_from_slice(&seq.to_le_bytes());
-    r[8] = rec.wrapped as u8 | (rec.puf as u8) << 1 | (rec.puf_slot & 1) << 2;
+    r[8] = rec.wrapped as u8 | (rec.puf as u8) << 1 | (rec.puf_slot & 1) << 2 | (rec.ir as u8) << 3;
     r[9..13].copy_from_slice(&rec.m_kib.to_le_bytes());
     r[13] = rec.t_cost;
     r[14..30].copy_from_slice(&rec.salt);
@@ -177,18 +187,27 @@ fn encode(rec: &Record, seq: u32) -> [u8; REC_LEN] {
 
 fn decode(r: &[u8; REC_LEN]) -> Option<(Record, u32)> {
     let seq = u32::from_le_bytes(r[4..8].try_into().unwrap());
-    if r[..4] == MAGIC && Sha256::digest(&r[..94])[..16] == r[94..] {
-        // bit 0: PIN-wrapped, bit 1: PUF-bound, bit 2: PUF helper slot
-        if r[8] > 7 {
+    let v4 = r[..4] == MAGIC;
+    if (v4 || r[..4] == MAGIC_V3) && Sha256::digest(&r[..94])[..16] == r[94..] {
+        // bit 0: PIN-wrapped, bit 1: PUF-bound, bit 2: PUF helper slot, bit 3: IR PIN (FK04 only)
+        let max_flags: u8 = if v4 { 15 } else { 7 };
+        if r[8] > max_flags {
             return None;
         }
         let wrapped = r[8] & 1 != 0;
+        let ir = r[8] & 8 != 0;
+        // An FK03 PIN record used the old one-factor HMAC wrapping: it cannot be opened any more.
+        // The IR bit makes no sense without a PIN record.
+        if (!v4 && wrapped) || (ir && !wrapped) {
+            return None;
+        }
         let puf = r[8] & 2 != 0;
         return Some((
             Record {
                 wrapped,
                 puf,
                 puf_slot: (r[8] >> 2) & 1,
+                ir,
                 m_kib: u32::from_le_bytes(r[9..13].try_into().unwrap()),
                 t_cost: r[13],
                 salt: r[14..30].try_into().unwrap(),

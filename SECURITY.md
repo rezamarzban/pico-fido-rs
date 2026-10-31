@@ -7,7 +7,7 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
 * A lost device that is never opened: the USB interface does not export the private keys or the master key
   material. It answers ordinary CTAP requests, and which of them need a fresh BOOTSEL press is decided by
   OpenSK following the CTAP rules (see below). **Without a PIN, whoever holds the device can use it to sign in.**
-* User presence is a **fresh press of BOOTSEL** (`src/env/user_presence.rs`): the button must be seen released
+* User presence is a **fresh press of BOOTSEL or of the external key on GP14** (`src/env/user_presence.rs`, `src/button.rs`; with a PIN set the IR PIN entry is part of it): the button must be seen released
   after the check started and then pressed, so a button already held down when a request arrives does not count.
   Which operations ask for presence is decided by OpenSK following the CTAP rules.
 
@@ -22,12 +22,19 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   offline. If the PUF is disabled (`build.sh -P`) or its secret is obtained (code execution on the device: BOOTSEL, SWD), guessing
   is limited only by Argon2id (64 KiB), which the RP2040 can only afford at a small cost: a short PIN then falls quickly to a
   GPU/ASIC attacker. Use a long passphrase.
-* **IR remote PIN** (feature `ir`): a key press is about log2(number of keys) bits (about 4.4 on a 21-key remote), because a
-  NEC code is `address, ~address, command, ~command`: 8 keys are about 35 bits. The codes are fixed per key and IR can be
-  watched or recorded, exactly like a typed PIN seen over the shoulder. An attacker cannot complete an entry without
-  pressing BOOTSEL on the device (physical presence), cannot see the codes on the OLED (only `*`), and cannot guess faster
-  than the retry counter (8) allows. The magic PIN `0000000000` can never be a normal PIN while the feature is on.
-  Offline guessing needs the PUF secret as before. A cancelled entry counts as a failed attempt.
+* **IR remote PIN** (feature `ir`): a second PIN, separate from the host PIN, entered with the remote together with the
+  confirmation button (BOOTSEL or an external key on GP14) at every physical-button step once a PIN is set. A key press is about
+  log2(number of keys) bits (about 4.4 on a 21-key remote), because a NEC code is `address, ~address, command, ~command`: 8 keys
+  are about 35 bits. The codes are fixed per key and IR can be watched or recorded, exactly like a typed PIN seen over the
+  shoulder. An attacker cannot complete an entry without pressing the button on the device (physical presence), cannot see the
+  codes on the OLED (only `*`; the display is optional), and cannot guess faster than the retry counter (8, both PIN stages
+  count) allows. **Offline**, the host PIN has its own verifier in the vault record, so an attacker who holds the PUF secret
+  can attack the two PINs one after the other (the cost adds up instead of multiplying); the PUF-bound Argon2id makes each
+  guess cost one run. Without the PUF secret neither can be tested offline. The host PIN hash and (in an open session) the IR
+  digest are kept in RAM as XOR shares until USB reset / unplug, like the seed. In an open session the IR PIN is compared
+  in constant time; three wrong ones lock the session. A PIN change needs the current IR PIN. A cancelled entry is not counted
+  (nothing was evaluated); a wrong evaluated one is. A forgotten IR PIN is recovered only by a CTAP reset.
+  `ten zeros` is an ordinary PIN now; the magic PIN mechanism no longer exists.
 * **Short PINs.** The firmware requires at least 10 code points because of the point above; use a long
   passphrase.
 * **Reading RAM** (debugger/SWD): the RP2040 has no debug lockout. The RAM guard (below) only raises the cost of
@@ -72,8 +79,9 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
 ## Hardened key storage (vault + HardenPersist)
 
 * The master seed (32 bytes) lives in a dual-slot, power-cut-safe vault in the last 12 KiB of flash.
-  With a PIN set it is wrapped with Argon2id (64 KiB, `T_COST` passes) + HMAC-SHA-256; the PIN
-  check is the wrap tag, no PIN hash is stored (the OpenSK PIN record holds zeros and the length).
+  With a PIN set it is encrypted with AES-256-GCM under a 256-bit Argon2id key (64 KiB, `T_COST` passes) derived from
+  host PIN + IR PIN + SRAM-PUF secret; the host PIN has a 16-byte verifier, the IR PIN is checked by the GCM tag, no PIN hash
+  is stored (the OpenSK PIN record holds zeros and the length).
 * From the seed, 128 bytes of OpenSK master keys are derived in RAM. Non-resident credentials
   (credential IDs) and cred-random depend on them; resident credentials are additionally encrypted
   and authenticated before they reach the key-value store. Metadata (counters, large blobs,

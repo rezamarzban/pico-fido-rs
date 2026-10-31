@@ -10,8 +10,8 @@ around it (USB, flash store, button, RNG). This branch adds a PIN-wrapped master
 | CTAP2 / CTAP1 (U2F), CTAPHID, ClientPIN, credential logic | OpenSK, `third_party/OpenSK/libraries/opensk` (git submodule; commit in `third_party/OPENSK_REV`) |
 | `opensk::env::Env` for the Pico | `src/env/mod.rs` (`PicoEnv`; customization: minimum PIN length 10, batch attestation off) |
 | Persistent store (credentials, metadata, PIN length) | `src/env/persist.rs` + `src/env/flash_store.rs`, on the `wasefire-store` crate (cleartext backend) |
-| Hardening: master key + resident-credential encryption, PIN check (Argon2id tag, no stored PIN hash), retry counter | `src/env/harden.rs` (`HardenPersist`), `src/vault.rs`, `src/store.rs`, `src/wrap.rs`; PIN hook in `third_party/opensk-harden.patch` |
-| User presence = fresh BOOTSEL press | `src/env/user_presence.rs` |
+| Hardening: master key + resident-credential encryption (AES-256-GCM), two-stage PIN check (host PIN, then IR PIN with the button; Argon2id, no stored PIN hash), retry counter | `src/env/harden.rs` (`HardenPersist`), `src/vault.rs`, `src/store.rs`, `src/wrap.rs`; PIN hook in `third_party/opensk-harden.patch` |
+| User presence = fresh press of BOOTSEL **or** the external key on GP14; with an IR PIN the IR entry is part of this step | `src/env/user_presence.rs`, `src/button.rs`, `src/ir_pin.rs` |
 | Packet bridge between USB (async) and OpenSK (blocking) | `src/env/hid.rs` (two queues) |
 | Random numbers | `src/env/rng.rs` -> `src/keys.rs` (ring oscillator + SHA-256, `src/health.rs` health tests) |
 | Clock | `src/env/clock.rs` |
@@ -93,15 +93,33 @@ U2F registration needs an attestation key and certificate, which this firmware d
 `use_batch_attestation` is off, so FIDO2 registrations use self attestation.
 
 ## PIN and key protection
-At least **10 code points** (`default_min_pin_length` in `src/env/mod.rs`). Set it with any FIDO2 client
-(`fido2-token -S`, `ykman fido access change-pin`, Chrome/Windows security-key settings).
+At least **10 code points** for the host PIN (`default_min_pin_length` in `src/env/mod.rs`). Set it with any FIDO2 client
+(`fido2-token -S`, `ykman fido access change-pin`, Chrome/Windows security-key settings). **Ten zeros are an ordinary PIN now**
+(the old "magic PIN" that redirected to the remote is gone); you may choose them, the real secret is then the IR PIN.
 
-With a PIN set, the 32-byte master seed is wrapped with **Argon2id** (64 KiB static buffer; `M_KIB` = 64, `T_COST` = 24 in
-`src/wrap.rs`) and no PIN hash is stored; a wrong PIN is detected by the record's HMAC-SHA-256 tag (keys derived with Argon2id), so no separate PIN
-verifier exists. The 128 bytes of OpenSK master keys
-are derived on demand from the seed, which after a correct PIN lives in RAM only as XOR shares (see **RAM
-guard** below) and is dropped on USB reset / suspend / unplug. Resident
-credentials are encrypted under keys derived from the master. The PIN retry counter (8 tries) is the vault's.
+The private key material (the 32-byte master seed; credential keys derive from it) is encrypted like this:
+
+    host PIN + IR PIN + SRAM-PUF secret  ->  Argon2id  ->  256-bit key  ->  AES-256-GCM  ->  encrypted seed (vault)
+
+Two separate PINs, checked at two different moments (`src/wrap.rs`, `src/env/harden.rs`):
+
+1. **Stage 1, host PIN, in the host's own dialog.** Checked at once against a 16-byte verifier in the vault record (one
+   Argon2id run over `HMAC(K_puf, host PIN hash)`); right or wrong is answered like for any FIDO2 key, the host never
+   waits for the remote. The host PIN hash stays in RAM (RAM guard) for stage 2.
+2. **Stage 2, IR PIN, together with the physical button.** At the button step of the first command that needs the key
+   (the IR entry and the button press are one step, see below) a second Argon2id run over
+   `HMAC(K_puf, host PIN hash || IR PIN digest)` gives the AES-256-GCM key; a wrong IR PIN fails the GCM tag. Both stages
+   count against the retry counter (8) in the vault, written before the guess is evaluated.
+
+No PIN hash is stored. A PIN set from the host starts as a *host-only* record (host PIN + PUF, AES-GCM); the IR PIN is
+**enrolled** at the next button step (entered twice) and the record is rewritten with the IR PIN as part of the key.
+Resident credentials are AES-256-GCM encrypted under keys derived from the master (key index as associated data).
+After a correct PIN the seed lives in RAM only as XOR shares (see **RAM guard**) and is dropped on USB reset / suspend /
+unplug. `M_KIB` = 64, `T_COST` = 24 (`src/wrap.rs`) are untuned: a PIN check runs Argon2 once in stage 1 and once in
+stage 2, time both on your hardware. Without the `ir` feature only stage 1 exists (host PIN + PUF -> Argon2id -> AES-GCM).
+
+**Upgrading:** PIN records of earlier branches (HMAC-stream wrapping, one factor) cannot be read: the vault is reported as
+damaged and a CTAP reset (deletes credentials) is needed. Plain / PUF-masked records (no PIN) are still read.
 
 ## SRAM PUF
 `src/puf.rs`. The power-up pattern of 496 reserved RAM bytes is turned into a device-bound key by a fuzzy extractor
@@ -175,32 +193,36 @@ Build with `--features guard_log,stack_probe` (defmt over RTT/probe) and run, ea
 5. current draw of the board idle (guard at 2 ms, `wfi` sleep) and under load, compared with the old build.
 Record the numbers in `REVIEW.md`; none of this has been measured yet.
 
-## PIN entry with an IR remote (VS1838B)
-Feature `ir` (on by default; `build.sh -I` leaves it out). Wiring: VS1838B **OUT -> GP15**, VCC -> 3.3 V, GND (the
-same pin as the MicroPython reference). The receiver (`src/ir.rs`) is a port of its NEC decoder (same timings and
-check bytes) running as an interrupt-executor task; `src/nec.rs` holds the pure helpers (host-tested).
+## IR PIN with a remote (VS1838B) and the confirmation button
+Feature `ir` (on by default; `build.sh -I` leaves it out). Wiring: VS1838B **OUT -> GP15**, VCC -> 3.3 V, GND. The receiver
+(`src/ir.rs`) decodes NEC frames on the interrupt executor; `src/nec.rs` holds the pure helpers (host-tested).
 
-How it is used: in the host's normal PIN dialog type the **magic PIN `0000000000` (ten zeros)**. The device then
-asks for the real PIN on the remote:
-* **Setting a PIN** (first use, or the new PIN of a PIN change): the OLED shows `SET PIN (IR REMOTE)`, the key count
-  and one `*` per key. Press at least **8** keys, confirm with a short press of **BOOTSEL**; then repeat the same
-  sequence (`STEP 2/2`) and confirm again. A different second sequence starts over.
-* **Using it** (every PIN prompt of the host, also when changing the PIN): type the ten zeros in the dialog, press the
-  same keys on the remote, confirm with BOOTSEL.
-* **Cancel:** hold BOOTSEL for 1.5 s. 60 s without any key or button, a USB reset or a cancel from the host also end
-  the entry. A cancelled or timed-out entry counts as a wrong PIN attempt (the attempt is counted before the PIN is
-  looked at; it cannot be refunded without forgiving earlier failures).
-* While waiting the device sends CTAPHID keepalives, so the host keeps waiting instead of timing out.
+**Confirmation button:** the Pico's **BOOTSEL** button *or* an **external key between GP14 (pin 19) and GND**. They do exactly
+the same, everywhere (`src/button.rs`); without the key GP14 is simply ignored.
 
-The PIN hash is `SHA-256("pico-fido-ir-pin-v1" || key count || the full 32-bit NEC codes)[..16]`: every key counts
-with its whole 32-bit code, in order. **How strong that is:** a NEC code is `address, ~address, command, ~command`;
-only the command byte (and the fixed address of the remote) carries information, so a key is worth about
-log2(number of keys) bits, roughly 4.4 on a 21-key remote: 8 keys are about 35 bits, not 256. Use more keys if you
-can (up to 32). Codes are fixed per key and IR can be seen or filmed: anyone who watches you press the keys learns the
-PIN, as with a typed PIN. BOOTSEL is the physical confirmation: nobody can finish an entry from across the room with
-an IR blaster. The OLED never shows the codes.
+**Host PIN and IR PIN are separate.** The host dialog is normal: type the PIN, press OK, done. The IR PIN belongs to the
+**physical-button step**: whenever the device waits for the button and a PIN is set, the user types the IR PIN on the
+remote and **confirms with the button**; that press is the user presence. A press without the right IR PIN is no user presence.
+* **First use after the host PIN was set (enrol):** press at least **8** keys, confirm with the button, repeat the same
+  sequence (`STEP 2/2`), confirm again. A different second sequence starts over. Done once.
+* **First command of every session (after plug-in / USB reset):** keys + button; the entry opens the seed (Argon2id +
+  AES-GCM), a wrong IR PIN is a counted attempt (`PIN_INVALID`). Three wrong ones in a row end the session's chance until the
+  next USB reset.
+* **Every later confirmation of the session** (each registration, each sign-in, reset excluded): keys + button again; the
+  entry is compared with the proven digest in RAM. Three wrong ones in a row lock the session (host PIN + counted IR stage again).
+* **PIN change:** after the host PIN dialog the device asks for the *current* IR PIN (counted), then for a *new* one; the
+  button alone with no key keeps the current IR PIN.
+* **Cancel:** hold the button for 1.5 s, or let the host cancel. 60 s without any key or button, a USB reset also end the entry.
+* **Forgotten IR PIN:** unplug, plug in, run the CTAP reset *without* typing the host PIN (reset needs only a button press).
+* While waiting, CTAPHID keepalives keep the host waiting.
 
-Typing `0000000000` as a normal PIN is no longer possible with this feature (it always means "use the remote").
+**LED (no display needed):** while the IR PIN is awaited the LED is dark with a short blip about once a second; **every key
+received from the remote flashes it once**; a cancelled / timed-out / wrong entry flashes it twice, long. After success it flickers
+(busy). The IR PIN input is `SHA-256("pico-fido-ir-pin-v2" || key count || the 32-bit NEC codes)`. **How strong that is:** a NEC
+code is `address, ~address, command, ~command`; only the command byte carries information, so a key is worth about log2(number
+of keys) bits, roughly 4.4 on a 21-key remote: 8 keys are about 35 bits. Use more keys (up to 32), and a long host PIN. IR can
+be seen or filmed, like a typed PIN; the button is the physical confirmation: nobody can finish an entry from across the room.
+The OLED never shows the codes. The U2F path (polled in the main loop) uses the same button step.
 
 ## Status display (SSD1306 OLED)
 Feature `oled` (on by default): a 128x64 SSD1306 on **I2C0, SDA = GP16, SCL = GP17, address 0x3C** (same wiring as
@@ -218,7 +240,7 @@ GRD 1990/S P500US          RAM-guard full refreshes per second, current period
 CS61US LT480US P1234       longest refresh critical section, latest tick lateness, packets handled
 FW214K ST12/70K W3%        firmware size, key-value store use, erase budget used
 ```
-The display never shows secrets. It needs `GP16`/`GP17` free (the default board uses GP25 for the LED); build
+**The display is optional**: without one nothing happens (no IR or PIN step depends on it, the LED shows the progress), the bus is probed every 5 s and costs microseconds. The display never shows secrets. It needs `GP16`/`GP17` free (the default board uses GP25 for the LED); build
 with `build.sh -O`, or `--no-default-features --features rp2040_board,flash_2m,sram_puf`, to leave it out.
 
 **Blank screen? Check in this order.**
@@ -255,13 +277,19 @@ Re-check it whenever `OPENSK_REV` changes.
 
 ## Tests
     sh host-test/run.sh     # OpenSK's own library unit tests (the protocol logic), run on the host
-                            # + host-test/guard: ram_guard, vault (store.rs) and wrap (PIN wrap, Argon2 bounds, PUF-masked record) unit tests, and nec (IR frame checks, timing classes, PIN digest)
+                            # + host-test/guard: ram_guard, vault (store.rs, incl. the FK04 record and the IR flag), wrap (two-stage Argon2id + AES-256-GCM known answers, wrong factor / PUF / damage, Argon2 bounds, PUF-masked record) and nec (IR frame checks, timing classes, IR digest)
 
 The earlier host tests (custom CBOR, CTAPHID, PIN, key store, python-fido2 end-to-end) tested code that no longer
 exists and were removed. **Nothing in this repository tests `src/env/*`, the USB bridge or the executor split**:
 they are checked on hardware only.
 
 ## Verification status (be honest about it)
+**This branch (se6: separate host / IR PIN, GP14 key, LED feedback, AES-256-GCM) was written without a Rust toolchain at hand: it
+was NOT compiled, NOT flashed and its host tests were NOT run.** The crypto layout of `src/wrap.rs` has known-answer tests
+(`host-test/guard/tests/wrap.rs`) whose expected values were produced by an independent Python implementation (Argon2id, AES-GCM,
+HMAC-SHA-256); run them first (`cargo test` in `host-test/guard`). Expect to fix compile errors on the first build, then test on
+hardware: enrol, session unlock, every-confirmation IR entry, PIN change, reset, LED patterns, GP14 key.
+
 Reported by the maintainer (not independently verified): this branch was built and flashed to a Raspberry Pi Pico and tested on hardware, and
 the OpenSK-based firmware family (this branch included) **works on Linux, Windows and Android**. The base firmware was built with the Colab script
 (`nightly-2026-06-03`, `flash_2m`, no `usb_serial`, size-optimised release profile), flashed to a Pico, and

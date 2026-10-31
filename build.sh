@@ -9,7 +9,7 @@
 #   -I  build WITHOUT the IR remote PIN entry (default: with; the `ir` feature, VS1838B on GP15)
 #   -t  Rust nightly to use (default: nightly-2026-06-03, the one OpenSK pins, then `nightly`)
 #   -r  repository URL   (default https://github.com/rezamarzban/pico-fido-rs)
-#   -b  branch           (default openSK-based-se4)
+#   -b  branch           (default openSK-based-se6)
 #   -o  output directory (default ./out)
 # Environment: OPENSK_URL / OPENSK_REV override where and which OpenSK commit is fetched
 #   (default: google/OpenSK at the commit in third_party/OPENSK_REV).
@@ -23,7 +23,7 @@ OLED=1
 IR=1
 TOOLCHAIN=""
 REPO="https://github.com/rezamarzban/pico-fido-rs"
-BRANCH="openSK-based-se7"
+BRANCH="openSK-based-se6"
 OUT_DIR="$PWD/out"
 OPENSK_URL="${OPENSK_URL:-https://github.com/google/OpenSK.git}"
 

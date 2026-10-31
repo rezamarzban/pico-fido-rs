@@ -39,6 +39,10 @@ static SEND_LOCK: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
 
 static CANCEL_EPOCH: AtomicU32 = AtomicU32::new(0);
 static OP_EPOCH: AtomicU32 = AtomicU32::new(0);
+/// Counts the operations started by `begin_op_at` (0 = none yet). Lets code tell "the same operation"
+/// from a later one: the button press that confirms an IR PIN entry counts as user presence for the
+/// operation it happened in, and for no other.
+static OP_SERIAL: AtomicU32 = AtomicU32::new(0);
 
 /// Current cancellation epoch.
 pub fn epoch() -> u32 {
@@ -51,7 +55,20 @@ pub fn epoch() -> u32 {
 /// new epoch.
 pub fn begin_op_at(e: u32) -> u32 {
     OP_EPOCH.store(e, Ordering::Release);
+    // Never 0: 0 means "no operation".
+    let n = OP_SERIAL.load(Ordering::Relaxed).wrapping_add(1);
+    OP_SERIAL.store(if n == 0 { 1 } else { n }, Ordering::Release);
     e
+}
+
+/// Milliseconds since boot (wrapping), for the main loop's short timers.
+pub fn epoch_ms() -> u32 {
+    Instant::now().as_millis() as u32
+}
+
+/// Serial number of the operation being processed (see `OP_SERIAL`).
+pub fn op_serial() -> u32 {
+    OP_SERIAL.load(Ordering::Acquire)
 }
 
 /// True once the operation started by the last `begin_op_at` has been cancelled.
@@ -148,6 +165,32 @@ pub fn keepalive(status: u8) {
     b[6] = 1; // payload length 1
     b[7] = status;
     let _ = PicoHidConnection.send(&b, UsbEndpoint::MainHid);
+}
+
+/// Has the host sent CTAPHID_CANCEL on the current channel? Used by the blocking IR PIN entry, which
+/// runs inside a CTAP command and so cannot hand packets to OpenSK (the user-presence wait can).
+///
+/// The queue is drained into a local buffer, the cancel packet is dropped and every other packet is put
+/// back in its original order, all with interrupts off (a few microseconds), so the USB task cannot
+/// interleave a packet and reorder them.
+pub fn cancel_requested() -> bool {
+    let cid = CUR_CID.load(Ordering::Relaxed);
+    cortex_m::interrupt::free(|_| {
+        let mut keep: heapless::Vec<HidPacket, QUEUE> = heapless::Vec::new();
+        let mut cancel = false;
+        while let Ok(p) = IN_CH.try_receive() {
+            let is_cancel = u32::from_be_bytes([p[0], p[1], p[2], p[3]]) == cid && p[4] == 0x91; // CTAPHID_CANCEL
+            if is_cancel {
+                cancel = true;
+            } else {
+                let _ = keep.push(p);
+            }
+        }
+        for p in keep {
+            let _ = IN_CH.try_send(p);
+        }
+        cancel
+    })
 }
 
 pub struct PicoHidConnection;
