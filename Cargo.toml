@@ -1,29 +1,21 @@
 [package]
-edition = "2021"
 name = "pico-fido-rs"
-version = "0.1.0"
-authors = ["sawyer bristol <sawyerbristol@gmail.com>"]
+version = "0.2.0"
+edition = "2021"
 
 [features]
-# Default: board + 2MiB flash. USB serial is OFF (privacy); enable with --features usb_serial.
-default = ["rp2040_board", "flash_2m", "sram_puf", "oled", "ir"]
+default = ["rp2040_board", "flash_2m", "sram_puf", "ir"]
 rp2040_board = []
 flash_2m = []
 flash_4m = []
 flash_8m = []
 flash_16m = []
 usb_serial = []
-# Device-bound key from the SRAM power-up state (src/puf.rs). Reserves 512 bytes of RAM.
 sram_puf = []
-# Development only: paint the stack and log its peak use (src/stack_probe.rs). Needs flip-link.
 stack_probe = []
-# Hardware watchdog fed by the main thread only (src/wdog.rs). Off until the longest blocking step is measured.
 watchdog = []
-# Status display: SSD1306 128x64 on I2C0 (SDA GP16, SCL GP17, 0x3C), src/oled.rs. Harmless without a display.
 oled = []
-# IR remote PIN entry: VS1838B on GP15, NEC codes, magic PIN 0000000000 (src/ir.rs, src/ir_pin.rs).
 ir = []
-# Development: log the RAM-guard refresh statistics (rate, longest critical section, tick lateness) every 5 s.
 guard_log = []
 
 [dependencies]
@@ -31,43 +23,21 @@ cortex-m = { version = "0.7.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7.3"
 embassy-embedded-hal = { version = "0.2.0", features = ["defmt"] }
 embassy-sync = { version = "0.6.0", features = ["defmt"] }
-embassy-executor = { version = "0.6.0", features = [
-  "arch-cortex-m",
-  "executor-thread",
-  "executor-interrupt",
-  "defmt",
-  "integrated-timers",
-  "nightly",
-] }
-embassy-time = { version = "0.3.2", features = [
-  "defmt",
-  "defmt-timestamp-uptime",
-] }
-embassy-rp = { version = "0.2.0", features = [
-  "defmt",
-  "unstable-pac",
-  "time-driver",
-  "critical-section-impl",
-  "intrinsics",
-] }
+embassy-executor = { version = "0.6.0", features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt", "integrated-timers", "nightly"] }
+embassy-time = { version = "0.3.2", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-rp = { version = "0.2.0", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "intrinsics"] }
 embassy-futures = { version = "0.1.0" }
 embassy-usb = { version = "0.3.0", features = ["defmt"] }
-
 defmt = "0.3"
 defmt-rtt = "0.4"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
-futures = { version = "0.3.17", default-features = false, features = [
-  "async-await",
-  "cfg-target-has-atomic",
-  "unstable",
-] }
-
+futures = { version = "0.3.17", default-features = false, features = ["async-await", "cfg-target-has-atomic", "unstable"] }
 embedded-storage = { version = "0.3" }
 static_cell = "2"
 rand = { version = "0.8.5", default-features = false }
 rand_core = { version = "0.6", default-features = false }
-rand_chacha = { version = "0.3", default-features = false } # ChaCha20 DRBG for the share-refresh masks (src/ram_guard.rs)
-subtle = { version = "2", default-features = false }                   # constant-time tag / PIN comparisons
+rand_chacha = { version = "0.3", default-features = false }
+subtle = { version = "2", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
@@ -75,28 +45,5 @@ zeroize = { version = "1", default-features = false, features = ["alloc", "deriv
 heapless = "0.8.0"
 portable-atomic = { version = "1.7.0", features = ["critical-section"] }
 embedded-alloc = "0.5.1"
-once_cell = { version = "1.19.0", default-features = false, features = [
-  "portable-atomic",
-  "critical-section",
-] }
-
-# Key-value store used by the Persist implementation (src/env/flash_store.rs). OpenSK only pulls
-# this crate in with its `std` feature, so it is a direct dependency here (same version as OpenSK).
-wasefire-store = { version = "0.2.4", default-features = false }
-
-# Google OpenSK CTAP core, as a git submodule (see .gitmodules):
-#   git submodule add https://github.com/google/OpenSK.git third_party/OpenSK
-# Do NOT init OpenSK's own nested submodules (third_party/wasefire): this library does not use them.
-# `ctap1` = U2F (needs an attestation key, provisioned with OpenSK's tools/configure.py),
-# `config_command` = vendor/authenticatorConfig commands used by that tool.
-opensk = { path = "third_party/OpenSK/libraries/opensk", default-features = false, features = ["ctap1", "config_command", "software_crypto"] }
-
-[profile.release]
-debug = false
-lto = true
-opt-level = "s"
-codegen-units = 1
-strip = "symbols"
-
-[profile.dev.package."*"]
-opt-level = 3
+once_cell = { version = "1.19.0", default-features = false, features = ["portable-atomic", "critical-section"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
