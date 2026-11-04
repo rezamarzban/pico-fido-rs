@@ -24,9 +24,9 @@ oled = []
 # ATECC608A secure element on I2C1 (SDA GP14, SCL GP15): credential keys, ECDSA signing, the
 # signature budget (chip counter) and extra entropy live in the chip (src/se/, atecc608a/CONFIG.md).
 se_atecc = []
-# Use all 16 chip slots for credential keys instead of 8 (only if your chip accepts private keys
-# in slots 8-15; verify with atecc608a/tools/gen_atecc_config.py --check on the real chip first).
-se_slots_16 = []
+# Chip-side PIN: credential slots need the PIN authorisation (provision with --pin-gate and
+# atecc608a/tools/pin_key.py; the PIN set from the browser must equal the provisioned one).
+se_pin = ["se_atecc"]
 # Development: log the RAM-guard refresh statistics (rate, longest critical section, tick lateness) every 5 s.
 guard_log = []
 

@@ -546,6 +546,16 @@ impl Persist for HardenPersist {
             }
             None => false,
         };
+        // Optional chip-side PIN (feature `se_pin`): the PIN must also open the ATECC608A, which then
+        // authorises every signing session. The chip PIN key is set at provisioning
+        // (atecc608a/tools/pin_key.py): use the same PIN here.
+        #[cfg(feature = "se_pin")]
+        let ok = if ok && crate::se::pin::verify(pin_hash).is_err() {
+            guard::clear_seed();
+            false
+        } else {
+            ok
+        };
         guard::refresh_now();
         Ok(Some(ok))
     }
