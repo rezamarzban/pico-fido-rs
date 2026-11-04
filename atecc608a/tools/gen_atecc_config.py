@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """ATECC608A configuration for the FIDO key (pico-fido-rs, feature `se_atecc`).
 
-  gen_atecc_config.py --slots 8 --budget 500 -o out/        build a config image
-  gen_atecc_config.py --slots 8 --budget 500 --base cfg.bin  patch your own `read-config` dump
+  gen_atecc_config.py --slots 7 --budget 500 -o out/        build a config image
+  gen_atecc_config.py --slots 7 --budget 500 --base cfg.bin  patch your own `read-config` dump
+  gen_atecc_config.py --slots 7 --budget 500 --pin-gate      also require the chip PIN (slot 11)
   gen_atecc_config.py --check cfg.bin                        decode + verify a dumped config
   gen_atecc_config.py --selftest
 
@@ -34,6 +35,15 @@ SLOT_CRED = bytes([0x80 | 0x20 | 0x01, 0x20])   # secret, limited use, external 
 # KeyConfig, low byte first: bit0 Private, bit1 PubInfo, bits4:2 KeyType (4 = P256)
 KEY_CRED = bytes([0x01 | 0x02 | (4 << 2), 0x00])  # 0x13 0x00
 # unused slots: general data slot, never readable / writable by commands, no ECC
+# attestation key (slot right after the credential slots): same, but NOT limited-use, so the
+# signature budget is not spent on U2F/packed attestation
+SLOT_ATTEST = bytes([0x80 | 0x01, 0x20])
+# PIN slot (with --pin-gate): secret 32-byte key used only by CheckMac (NoMac), LimitedUse (every
+# attempt spends budget), never readable, never writable once the data zone is locked.
+PIN_SLOT = 11
+SLOT_PIN = bytes([0x80 | 0x20 | 0x10 | 0x0F, 0x8F])
+KEY_PIN = bytes([0x1C, 0x00])                     # key type 7 (SHA / secret data)
+KEY_CRED_AUTH = bytes([0x13 | 0x80, PIN_SLOT])    # + ReqAuth, AuthKey = PIN slot
 SLOT_UNUSED = bytes([0x8F, 0x8F])
 KEY_UNUSED = bytes([0x3C, 0x00])
 
@@ -60,16 +70,23 @@ def default_base():
     return c
 
 
-def build(slots, budget, base=None):
-    if not 1 <= slots <= 16:
-        raise ValueError("slots must be 1..16")
+def build(slots, budget, base=None, pin_gate=False):
+    if not 1 <= slots <= 15:
+        raise ValueError("slots must be 1..15 (one more slot is the attestation key)")
     if not 1 <= budget <= COUNTER_MAX:
         raise ValueError("budget must be 1..%d" % COUNTER_MAX)
     c = bytearray(base) if base else default_base()
     if len(c) != CFG_LEN:
         raise ValueError("base config must be 128 bytes")
     for i in range(16):
-        s, k = (SLOT_CRED, KEY_CRED) if i < slots else (SLOT_UNUSED, KEY_UNUSED)
+        if pin_gate and i == PIN_SLOT:
+            s, k = SLOT_PIN, KEY_PIN
+        elif i < slots:
+            s, k = SLOT_CRED, (KEY_CRED_AUTH if pin_gate else KEY_CRED)
+        elif i == slots:
+            s, k = SLOT_ATTEST, KEY_CRED
+        else:
+            s, k = SLOT_UNUSED, KEY_UNUSED
         c[SLOT_CFG + 2 * i:SLOT_CFG + 2 * i + 2] = s
         c[KEY_CFG + 2 * i:KEY_CFG + 2 * i + 2] = k
     # Counter 0 / 1 as they should be after counter-init (atecc write-config resets them to 0).
@@ -96,8 +113,13 @@ def describe(c):
             flags.append("PrivWrite" if (s[1] >> 4) & 4 else "no-PrivWrite")
             flags.append("pubkey-derivable" if k[0] & 2 else "NO-PUBKEY")
             out.append("slot %2d: ECC P-256 private key, %s" % (i, ", ".join(flags)))
-            if s != SLOT_CRED or k != KEY_CRED:
+            if k not in (KEY_CRED, KEY_CRED_AUTH) or s not in (SLOT_CRED, SLOT_ATTEST):
                 ok = False
+            if k[0] & 0x80:
+                flags.append("ReqAuth(slot %d)" % k[1])
+                out[-1] = "slot %2d: ECC P-256 private key, %s" % (i, ", ".join(flags))
+        elif s == SLOT_PIN and k == KEY_PIN:
+            out.append("slot %2d: PIN key (CheckMac only, limited-use, never readable/writable after lock)" % i)
         else:
             out.append("slot %2d: not a private-key slot (SlotConfig %02X %02X, KeyConfig %02X %02X)" % (i, s[0], s[1], k[0], k[1]))
     out.append("I2C address byte: 0x%02X, ChipMode 0x%02X" % (c[I2C_ADDR], c[CHIP_MODE]))
@@ -120,8 +142,9 @@ Then, ON HARDWARE, verify before relying on it (see CONFIG.md "Acceptance test")
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--slots", type=int, default=8, help="credential slots, 8 (default) or 16")
+    ap.add_argument("--slots", type=int, default=7, help="credential slots (default 7); the next slot is the attestation key")
     ap.add_argument("--budget", type=int, help="total signatures the chip will allow (1..2097151)")
+    ap.add_argument("--pin-gate", action="store_true", help="credential slots require the chip PIN (ReqAuth, PIN key in slot 11)")
     ap.add_argument("--base", help="existing 128-byte config dump to patch (atecc read-config)")
     ap.add_argument("-o", "--out", default=".", help="output directory")
     ap.add_argument("--check", metavar="CONFIG.BIN", help="decode and verify a config blob")
@@ -140,9 +163,9 @@ def main():
     if a.budget is None:
         ap.error("--budget is required")
     base = open(a.base, "rb").read() if a.base else None
-    c = build(a.slots, a.budget, base)
+    c = build(a.slots, a.budget, base, a.pin_gate)
     os.makedirs(a.out, exist_ok=True)
-    stem = os.path.join(a.out, "atecc608a_fido_config")
+    stem = os.path.join(a.out, "atecc608a_fido_config" + ("_pingate" if a.pin_gate else ""))
     open(stem + ".bin", "wb").write(c)
     open(stem + ".hex", "w").write("\n".join(c[i:i + 16].hex(" ").upper() for i in range(0, 128, 16)) + "\n")
     lines, _ = describe(c)
@@ -158,12 +181,13 @@ def selftest():
     # counter encoding is the cryptoauthlib one: spot-check against values computed by its C code
     # (see tests/test_gen_config.py for the cross-check).
     assert counter_bytes(0) == bytes([0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0])
-    c = build(8, 500)
+    c = build(7, 500)
     lines, ok = describe(c)
     assert ok and len(c) == 128
     assert c[SLOT_CFG:SLOT_CFG + 2] == bytes([0xA1, 0x20])
     assert c[KEY_CFG:KEY_CFG + 2] == bytes([0x13, 0x00])
-    assert c[SLOT_CFG + 16:SLOT_CFG + 18] == SLOT_UNUSED
+    assert c[SLOT_CFG + 14:SLOT_CFG + 16] == SLOT_ATTEST
+    assert c[SLOT_CFG + 18:SLOT_CFG + 20] == SLOT_UNUSED
     print("selftest ok")
     return 0
 

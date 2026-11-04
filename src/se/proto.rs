@@ -12,6 +12,7 @@ pub const WORD_SLEEP: u8 = 0x01;
 pub const WORD_IDLE: u8 = 0x02;
 pub const WORD_COMMAND: u8 = 0x03;
 
+pub const OP_CHECKMAC: u8 = 0x28;
 pub const OP_COUNTER: u8 = 0x24;
 pub const OP_GENKEY: u8 = 0x40;
 pub const OP_INFO: u8 = 0x30;
@@ -22,8 +23,8 @@ pub const OP_READ: u8 = 0x02;
 pub const OP_SELFTEST: u8 = 0x77;
 pub const OP_SIGN: u8 = 0x41;
 
-/// Largest command frame we build: Nonce pass-through (32 bytes data) = 1+1+1+1+2+32+2 = 40.
-pub const MAX_CMD: usize = 48;
+/// Largest command frame we build: CheckMac (77 bytes data) = 1+1+1+1+2+77+2 = 85.
+pub const MAX_CMD: usize = 96;
 /// Largest response we accept: GenKey/Sign = 1 + 64 + 2 = 67.
 pub const MAX_RESP: usize = 67;
 
@@ -103,8 +104,11 @@ pub fn parse_response(frame: &[u8]) -> Result<&[u8], Error> {
 /// Slot bit-fields used by this firmware. See atecc608a/CONFIG.md for the chip configuration.
 pub const GENKEY_CREATE: u8 = 0x04; // create a new random private key in the slot, return pub key
 pub const GENKEY_PUBLIC: u8 = 0x00; // compute the public key of the slot's private key
+pub const NONCE_RANDOM: u8 = 0x00; // NumIn (20 bytes) + chip RNG -> TempKey; returns the chip random
 pub const NONCE_PASSTHROUGH: u8 = 0x03; // load 32 bytes into TempKey unchanged
 pub const SIGN_EXTERNAL: u8 = 0x80; // sign the message digest held in TempKey
+pub const READ_CONFIG_32: u8 = 0x80; // config zone, 32-byte block
+pub const CHECKMAC_MODE_TEMPKEY: u8 = 0x01; // block 1 = slot key, block 2 = TempKey (random nonce)
 pub const COUNTER_READ: u8 = 0x00;
 pub const COUNTER_INC: u8 = 0x01;
 pub const RANDOM_MODE: u8 = 0x00; // update the EEPROM seed (normal use)
@@ -121,6 +125,7 @@ pub fn counter_value(payload: &[u8]) -> Result<u32, Error> {
 /// rounded up. Used as the poll timeout; the chip is polled earlier.
 pub fn max_exec_ms(opcode: u8) -> u32 {
     match opcode {
+        OP_CHECKMAC => 40,
         OP_COUNTER => 25,
         OP_GENKEY => 115,
         OP_INFO => 5,
@@ -136,6 +141,7 @@ pub fn max_exec_ms(opcode: u8) -> u32 {
 /// Typical execution time (ms): sleep this long before the first poll.
 pub fn typ_exec_ms(opcode: u8) -> u32 {
     match opcode {
+        OP_CHECKMAC => 5,
         OP_COUNTER => 20,
         OP_GENKEY => 59,
         OP_NONCE => 7,

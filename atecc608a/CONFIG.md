@@ -4,11 +4,14 @@ All credential private keys are created, stored and used **inside the ATECC608A*
 never sees them. The chip also enforces a **hard signature budget** and adds its TRNG to the RNG.
 
 ## Wiring
-| ATECC608A | Pico / RP2040-Zero |
-|---|---|
-| SDA | GP14 (I2C1 SDA) |
-| SCL | GP15 (I2C1 SCL) |
-| VCC / GND | 3V3 / GND |
+Part: ATECC608A-**SSHDA**-B = 8-lead SOIC, I2C, tube (datasheet DS40001977B, pins seen from the top).
+| ATECC608A SOIC-8 pin | Signal | Pico / RP2040-Zero |
+|---|---|---|
+| 5 | SDA | GP14 (I2C1 SDA) |
+| 6 | SCL | GP15 (I2C1 SCL) |
+| 8 | VCC | 3V3 |
+| 4 | GND | GND |
+| 1, 2, 3, 7 | NC | not connected |
 
 I2C address 0x60 (config byte 0xC0), 100 kHz. Internal pull-ups are enabled; most breakouts have their own.
 The SSD1306 display stays on I2C0 (GP16/GP17), so the two never share a bus.
@@ -30,23 +33,25 @@ OpenSK encrypted/authenticated wrapper. `import()` rejects a handle whose slot w
 Every credential slot: SlotConfig `A1 20`, KeyConfig `13 00`
 = ECC P-256 private key, secret, **LimitedUse**, external signatures only, no ECDH, no PrivWrite,
 **GenKey allowed** (so keys can be regenerated after the zones are locked), public key derivable.
-Default: slots 0-7 (8 credentials). Slots 8-15 are left as unused data slots.
-`se_slots_16` uses all 16: **only after you confirmed on your chip** that GenKey works in slots 8-15
-(`ecc-gen 8` after configuring; if it fails the slot cannot hold a P-256 private key).
+Slots 0-6: credential keys (7 credentials). Slot 7: attestation key (same, but **not** limited-use,
+so attestation does not spend the signature budget). Slots 8-15: reserved, left as unused data slots
+for the next phase (AES key, HMAC/KDF key, PIN key, 416-byte data slot 8: PIN verifier, metadata,
+resident-credential table). The datasheet summary does not say which slots may hold P-256 keys:
+the ECC slots are kept in 0-7 on purpose.
 
 Registrations beyond the slot count **evict the oldest credential** (round robin). Evicted
 credentials stop working ("no credential"); the key is overwritten in the chip.
 
 ## Provisioning
 ```
-python3 tools/gen_atecc_config.py --slots 8 --budget 500 -o out     # or --base your_read_config.bin
+python3 tools/gen_atecc_config.py --slots 7 --budget 500 -o out     # or --base your_read_config.bin
 atecc ... write-config out/atecc608a_fido_config.bin
 atecc ... counter-init 0 -500        # AFTER write-config (it resets counters). 500 signatures left.
 atecc ... counter-read 0 -r          # must show 500
 atecc ... lock-config                # irreversible
 atecc ... lock-data                  # irreversible; GenKey stays enabled on the key slots
 ```
-`out/atecc608a_fido_config.bin` is a ready 8-slot image (budget text inside is only documentation:
+`out/atecc608a_fido_config.bin` is a ready 7+1-slot image (budget text inside is only documentation:
 the budget is whatever you set with `counter-init`). Check any dumped chip with `--check cfg.bin`.
 
 ## Signature budget
@@ -55,11 +60,33 @@ chip refuses. The counter is **shared by all credential slots** (a device-wide t
 reset or raised once the config zone is locked. When it reaches zero the firmware refuses user
 presence (LED/timeout) and any signature that still reaches the chip is rejected by the chip.
 
+## Chip-side PIN (`--pin-gate`, firmware feature `se_pin`)
+With `--pin-gate` every credential slot has ReqAuth with AuthKey = slot 11. Slot 11 holds a 32-byte
+PIN key (`tools/pin_key.py`: SHA-256 over a fixed label, the chip serial and LEFT(SHA-256(PIN),16)),
+used only by CheckMac, limited-use, never readable and never writable after `lock-data`. Signing
+(and registering = GenKey) then needs, in the same wake session: Nonce (random) + CheckMac with the
+PIN key + the normal Nonce/Sign. The firmware (`se/pin.rs`) keeps the PIN key in RAM after a correct
+PIN and replays this in every session; a wrong PIN is refused by the chip itself.
+
+Costs against the shared Counter 0 budget (modelled in the host tests, **verify on hardware**):
+a PIN check = 1 unit (right or wrong), a signature = 1 unit + 1 unit for its authorisation, a
+registration = 1 unit for its authorisation. So attackers guessing PINs burn the owner's budget (they
+cannot extract anything), and the budget is no longer "signatures" but "signatures x 2 + PIN checks".
+
+Limits of this first slice:
+- The PIN key is written at provisioning and **cannot be changed on the device**: the chip slot is
+  write-protected after `lock-data`. With `se_pin` the PIN set from the browser must be the one you
+  provisioned (the vault still keeps its own copy of the PIN check). A changeable PIN needs an encrypted
+  write (GenDig + MAC) with the old PIN key: not implemented.
+- The authorisation key stays in RAM until power-off. Nothing is written to the Pico flash for it,
+  but the seed/KeyStore/vault are still on the Pico: "nothing on the Pico" is not reached yet.
+- `tools/hw_test_pin_gate.sh` checks the chip behaviour this relies on, on your unlocked chip.
+
 ## Acceptance test on real hardware (do this before locking a chip you care about)
 1. `counter-read 0` equals the budget you set; sign 3 times through a browser/`fido2` tool; it drops by 3
    (if GenKey/public-key calls also consume budget you will see it here: adjust N).
 2. Set a tiny budget on a spare chip (e.g. 3), confirm the 4th signature is refused.
-3. Register 9 credentials: the first one must stop working, the rest must still work.
+3. Register 8 credentials: the first one must stop working, the rest must still work.
 4. Unplug/replug: the slot cursor (Counter 1) and budget must persist.
 
 ## Not done yet (still software, still protected as before by PIN/PUF/RAM guard)
@@ -70,4 +97,4 @@ presence (LED/timeout) and any signature that still reaches the chip is rejected
 - Chip-side PIN authentication (ReqAuth/CheckMac) and IO-protection-key encryption of the I2C bus:
   a bus-level attacker could still ask the chip to sign (until the budget runs out).
 - U2F attestation key in the chip (needs a certificate for a chip-resident key).
-- The 8 credential limit is a hardware limit of the chip.
+- The 7-credential limit comes from one chip key slot per credential (16 slots total, shared with the AES/HMAC/PIN/data slots).

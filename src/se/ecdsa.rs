@@ -17,14 +17,13 @@ use opensk::api::crypto::EC_FIELD_SIZE;
 use opensk::api::rng::Rng;
 use sha2::{Digest, Sha256};
 
-use super::chip::ChipOps;
+use super::chip::{Auth, ChipOps};
 use super::proto::Error;
 
-/// Number of chip slots used for credential keys (feature `se_slots_16`: all sixteen).
-#[cfg(feature = "se_slots_16")]
-pub const SLOTS: u8 = 16;
-#[cfg(not(feature = "se_slots_16"))]
-pub const SLOTS: u8 = 8;
+/// Chip slots 0..SLOTS hold credential keys (LimitedUse). Slot SLOTS is the attestation key
+/// (not limited-use); the remaining slots are reserved for the AES/HMAC/PIN/data work.
+pub const SLOTS: u8 = 7;
+pub const ATTEST_SLOT: u8 = SLOTS;
 
 const HANDLE_VERSION: u8 = 1;
 const HANDLE_LEN: usize = 32;
@@ -35,6 +34,7 @@ pub const COUNTER_MAX: u32 = 2_097_151;
 type Chip = &'static mut (dyn ChipOps + Send);
 
 static CHIP: Mutex<RefCell<Option<Chip>>> = Mutex::new(RefCell::new(None));
+static AUTH: Mutex<RefCell<Option<Auth>>> = Mutex::new(RefCell::new(None));
 static PUBKEYS: Mutex<RefCell<[Option<[u8; 64]>; 16]>> = Mutex::new(RefCell::new([None; 16]));
 
 /// Registers the chip driver. Call once at start-up.
@@ -47,7 +47,28 @@ pub fn uninstall() {
     critical_section::with(|cs| {
         *CHIP.borrow(cs).borrow_mut() = None;
         *PUBKEYS.borrow(cs).borrow_mut() = [None; 16];
+        *AUTH.borrow(cs).borrow_mut() = None;
     });
+}
+
+/// PIN authorisation replayed in every signing session (set by `se::pin::verify`).
+pub fn set_auth(a: Option<Auth>) {
+    critical_section::with(|cs| *AUTH.borrow(cs).borrow_mut() = a);
+}
+
+/// Wipes the key before dropping it.
+pub fn clear_auth() {
+    critical_section::with(|cs| {
+        let mut g = AUTH.borrow(cs).borrow_mut();
+        if let Some(a) = g.as_mut() {
+            a.key = [0u8; 32];
+        }
+        *g = None;
+    });
+}
+
+fn current_auth() -> Option<Auth> {
+    critical_section::with(|cs| AUTH.borrow(cs).borrow().clone())
 }
 
 pub fn installed() -> bool {
@@ -130,7 +151,9 @@ impl EcSecretKey for SeSecretKey {
         // Round-robin slot from Counter 1 (first registration: counter 1 -> slot 0).
         let n = with_chip(|c| c.counter_inc(1)).unwrap_or_else(|_| panic!("se: counter 1"));
         let slot = (n.wrapping_sub(1) % SLOTS as u32) as u8;
-        let pubkey = with_chip(|c| c.gen_key(slot)).unwrap_or_else(|_| panic!("se: GenKey failed"));
+        let auth = current_auth();
+        let pubkey = with_chip(|c| c.gen_key_auth(slot, auth.as_ref()))
+            .unwrap_or_else(|_| panic!("se: GenKey failed (no PIN authorisation?)"));
         critical_section::with(|cs| PUBKEYS.borrow(cs).borrow_mut()[slot as usize] = Some(pubkey));
         SeSecretKey { slot, pubkey }
     }
@@ -145,7 +168,8 @@ impl EcSecretKey for SeSecretKey {
 
     fn sign(&self, message: &[u8]) -> SeSignature {
         let digest: [u8; 32] = Sha256::digest(message).into();
-        match with_chip(|c| c.sign(self.slot, &digest)) {
+        let auth = current_auth();
+        match with_chip(|c| c.sign_auth(self.slot, &digest, auth.as_ref())) {
             Ok(sig) => {
                 let mut r = [0u8; 32];
                 let mut s = [0u8; 32];
