@@ -28,6 +28,9 @@ impl RngCore for PicoRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         // Reuse the existing conditioned ROSC RNG from keys.rs.
         crate::keys::fill_random(dest);
+        // XOR the ATECC608A TRNG into the output: at least as good as the better of the two.
+        #[cfg(feature = "se_atecc")]
+        crate::se::ecdsa::mix_random(dest);
     }
 
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {

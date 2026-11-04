@@ -30,6 +30,8 @@ mod puf;
 mod ram_guard;
 #[cfg(feature = "oled")]
 mod oled;
+#[cfg(feature = "se_atecc")]
+mod se;
 mod scrub;
 #[cfg(feature = "stack_probe")]
 mod stack_probe;
@@ -136,6 +138,9 @@ fn main() -> ! {
     wdog::start(embassy_rp::watchdog::Watchdog::new(p.WATCHDOG));
     #[cfg(feature = "oled")]
     oled::init(p.I2C0, p.PIN_17, p.PIN_16);
+    // ATECC608A: all credential keys, signing and the signature budget live in this chip.
+    #[cfg(feature = "se_atecc")]
+    se::i2c::init(p.I2C1, p.PIN_15, p.PIN_14);
     let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
 
     // RAM guard: seed the mask DRBG once, before any secret is stored (ROSC, flash unique ID,

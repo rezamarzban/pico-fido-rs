@@ -6,7 +6,7 @@ authors = ["sawyer bristol <sawyerbristol@gmail.com>"]
 
 [features]
 # Default: board + 2MiB flash. USB serial is OFF (privacy); enable with --features usb_serial.
-default = ["rp2040_board", "flash_2m", "sram_puf", "oled"]
+default = ["rp2040_board", "flash_2m", "sram_puf", "oled", "se_atecc"]
 rp2040_board = []
 flash_2m = []
 flash_4m = []
@@ -21,6 +21,12 @@ stack_probe = []
 watchdog = []
 # Status display: SSD1306 128x64 on I2C0 (SDA GP16, SCL GP17, 0x3C), src/oled.rs. Harmless without a display.
 oled = []
+# ATECC608A secure element on I2C1 (SDA GP14, SCL GP15): credential keys, ECDSA signing, the
+# signature budget (chip counter) and extra entropy live in the chip (src/se/, atecc608a/CONFIG.md).
+se_atecc = []
+# Use all 16 chip slots for credential keys instead of 8 (only if your chip accepts private keys
+# in slots 8-15; verify with atecc608a/tools/gen_atecc_config.py --check on the real chip first).
+se_slots_16 = []
 # Development: log the RAM-guard refresh statistics (rate, longest critical section, tick lateness) every 5 s.
 guard_log = []
 
@@ -62,6 +68,7 @@ futures = { version = "0.3.17", default-features = false, features = [
 
 embedded-storage = { version = "0.3" }
 static_cell = "2"
+critical-section = "1"
 rand = { version = "0.8.5", default-features = false }
 rand_core = { version = "0.6", default-features = false }
 rand_chacha = { version = "0.3", default-features = false } # ChaCha20 DRBG for the share-refresh masks (src/ram_guard.rs)

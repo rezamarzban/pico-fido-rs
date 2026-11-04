@@ -1,0 +1,17 @@
+[package]
+name = "se-host-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Host-side tests of src/se/* (ATECC608A protocol, command layer, OpenSK ECDSA adapter) against a
+# software fake of the chip. No hardware, no Embassy. Needs third_party/OpenSK (see README).
+[workspace]
+
+[dependencies]
+opensk = { path = "../../third_party/OpenSK/libraries/opensk", default-features = false, features = ["std"] }
+sha2 = "0.10"
+critical-section = { version = "1", features = ["std"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand_chacha = "0.3"
+rand_core = "0.6"

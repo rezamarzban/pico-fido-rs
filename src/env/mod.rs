@@ -21,6 +21,7 @@ use rng::PicoRng;
 pub use user_presence::PicoUserPresence;
 
 use core::fmt;
+#[cfg(not(feature = "se_atecc"))]
 use opensk::api::crypto::software_crypto::SoftwareCrypto;
 use opensk::api::customization::{CustomizationImpl, DEFAULT_CUSTOMIZATION};
 use opensk::api::key_store;
@@ -78,6 +79,10 @@ impl Env for PicoEnv {
     type Customization = CustomizationImpl;
     type HidConnection = PicoHidConnection;
     type Clock = PicoClock;
+    // With the secure element, ECDSA (all credential keys) runs inside the ATECC608A.
+    #[cfg(feature = "se_atecc")]
+    type Crypto = crate::se::crypto::PicoCrypto;
+    #[cfg(not(feature = "se_atecc"))]
     type Crypto = SoftwareCrypto;
 
     fn rng(&mut self) -> &mut Self::Rng {
