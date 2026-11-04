@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Build the pico-fido-rs firmware (UF2) from GitHub.
 #
-# Usage:  bash build.sh [-s 2|4|8|16] [-u] [-P] [-O] [-t TOOLCHAIN] [-r REPO_URL] [-b BRANCH] [-o OUT_DIR]
+# Usage:  bash build.sh [-s 2|4|8|16] [-u] [-P] [-O] [-X] [-t TOOLCHAIN] [-r REPO_URL] [-b BRANCH] [-o OUT_DIR]
 #   -s  flash size of your board in MiB (default 2; a standard Raspberry Pi Pico has 2)
 #   -u  build WITH a USB serial number (off by default for privacy; adds the `usb_serial` feature)
 #   -P  build WITHOUT the SRAM PUF (default: with; the `sram_puf` feature)
 #   -O  build WITHOUT the SSD1306 status display (default: with; the `oled` feature, GP16/GP17)
+#   -X  build WITHOUT the ATECC608A secure element (default: with; `se_atecc`, I2C1 GP14/GP15)
 #   -t  Rust nightly to use (default: nightly-2026-06-03, the one OpenSK pins, then `nightly`)
 #   -r  repository URL   (default https://github.com/rezamarzban/pico-fido-rs)
 #   -b  branch           (default openSK-based-se4)
@@ -19,6 +20,7 @@ FLASH_MB=2
 SERIAL=0
 PUF=1
 OLED=1
+SE=1
 TOOLCHAIN=""
 REPO="https://github.com/rezamarzban/pico-fido-rs"
 BRANCH="openSK-based-se5"
@@ -26,12 +28,13 @@ OUT_DIR="$PWD/out"
 OPENSK_URL="${OPENSK_URL:-https://github.com/google/OpenSK.git}"
 
 usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
-while getopts "s:uPOnt:r:b:o:h" opt; do
+while getopts "s:uPOXnt:r:b:o:h" opt; do
   case "$opt" in
     s) FLASH_MB="$OPTARG" ;;
     u) SERIAL=1 ;;
     P) PUF=0 ;;
     O) OLED=0 ;;
+    X) SE=0 ;;
     n) SERIAL=0 ;; # kept for compatibility: no serial is the default
     t) TOOLCHAIN="$OPTARG" ;;
     r) REPO="$OPTARG" ;;
@@ -117,6 +120,8 @@ FEATURES="rp2040_board,flash_${FLASH_MB}m"
 [ "$PUF" = 1 ] && FEATURES="$FEATURES,sram_puf"
 # `--no-default-features` below switches the crate's default `oled` off, so it must be added here.
 [ "$OLED" = 1 ] && FEATURES="$FEATURES,oled"
+# ATECC608A secure element (default); -X builds the old software-key firmware.
+[ "$SE" = 1 ] && FEATURES="$FEATURES,se_atecc"
 echo "Cargo features: $FEATURES"
 
 # OpenSK uses edition 2024 and let-chains, so the old 2025 nightlies cannot compile it.

@@ -255,3 +255,14 @@ Checked while preparing this tree:
   flash write, P-256 signing time, RAM headroom (128 KiB heap), and RNG health tests on a real ring oscillator.
 * `build.sh` end to end, and U2F attestation provisioning.
 * USB VID/PID (`0xc0de:0xcafe`) and strings are prototype placeholders (`src/usb/mod.rs`).
+
+
+## Secure-element mode (ATECC608A)
+
+Default build feature `se_atecc` (`-X` in build.sh disables it): every credential key lives in an
+ATECC608A on I2C1 (SDA GP14, SCL GP15); signing, the signature budget and extra entropy are done by
+the chip. See `atecc608a/CONFIG.md` (wiring, config, provisioning, what is still software) and
+`atecc608a/tools/gen_atecc_config.py`. Host tests: `host-test/run.sh` (includes `host-test/se`).
+**The firmware changes of this mode were not compiled for the RP2040** (no thumbv6m toolchain was
+available); the protocol, command layer and OpenSK adapter are host-tested against a software model
+of the chip.
