@@ -41,3 +41,42 @@
 - **Should stay software:** CTAP protocol logic, Argon2id, credential table management.
 
 The document offers two next steps: reordering this list by implementation priority, or moving straight to designing a changeable PIN.
+
+### Checklist 
+
+Credential keys, signing, the budget counter and the PIN gate are in the chip; the attestation key and a changeable PIN are not done.
+
+**Legend:** ✅ done · 🟡 partial · ⬜ not done
+
+**A. Hardware (ATECC608A)**
+- ✅ Credential private keys are created in the chip (GenKey) and never leave it.
+- ✅ ECDSA signing runs in the chip (Nonce pass-through + external Sign).
+- ✅ Public key extraction runs in the chip.
+- ✅ Signature budget: LimitedUse slots plus Counter 0, enforced by the chip. The firmware also refuses user presence when the budget reaches 0.
+- ✅ Slot round-robin cursor in Counter 1, with the oldest credential evicted.
+- 🟡 PIN-key (slot 11), CheckMac and Nonce/TempKey are implemented behind the optional `se_pin` feature and the `pingate` config. Both are off by default, and `CONFIG.md` says to verify them on real hardware.
+- ⬜ Changeable PIN. The PIN key is fixed at provisioning, and an encrypted write (GenDig + MAC) is not implemented.
+- 🟡 Attestation key: slot 7 is reserved and configured as non-limited-use, but the firmware never uses it. FIDO2 uses self-attestation and U2F attestation is not provisioned.
+- ✅ TRNG: the chip's random output is XORed into the Pico RNG.
+
+**B. Software (Pico)**
+- ✅ Seed/vault, wrapping key, and hmac-secret/credRandom stay in software (`vault.rs`, `wrap.rs`).
+- ✅ PIN hash is wrapped with Argon2id (64 KiB) plus HMAC.
+- ✅ PIN retry counter is written to flash before the PIN is checked (8 tries).
+- ✅ KeyStore and credential table live in flash.
+- ✅ CTAP/ClientPIN logic comes from OpenSK.
+- ✅ AES, HMAC, HKDF, SHA-256 and ECDH are software primitives (`PicoCrypto`).
+- ✅ User presence needs a fresh BOOTSEL press.
+
+**C. Software hardening that stands in for hardware**
+- ✅ Retry counter is decremented before the PIN check.
+- ✅ User presence is enforced for signing.
+- ✅ RAM and stack scrubbing runs after each command (`scrub.rs`), plus a RAM guard.
+- 🟡 Input validation: `REVIEW.md` lists fixes for map validation and FFI checks. I found no fuzzing or CBOR hardening evidence beyond that.
+
+**D. Config images**
+- ✅ `atecc608a_fido_config-2.bin` is the standard layout: slots 0-7 are P-256 LimitedUse with GenKey allowed.
+- ✅ `atecc608a_fido_config_pingate.bin` adds ReqAuth to credential slots 0-6 with AuthKey = slot 11. The attestation slot stays ungated.
+- 🟡 Bus-level attack: I2C is not encrypted, so a bus attacker can still request signatures until the budget runs out. This is outside your software-attacker model.
+
+**Next steps:** a changeable PIN (item A) and the attestation key are the two gaps. The hardware acceptance tests in `CONFIG.md` are still unrun.
