@@ -23,28 +23,15 @@ use embedded_alloc::Heap;
 use {defmt_rtt as _, panic_probe as _};
 
 mod env;
-mod guard;
-mod health;
 mod keys;
-mod puf;
-mod ram_guard;
 #[cfg(feature = "oled")]
 mod oled;
-#[cfg(feature = "se_atecc")]
 mod se;
-mod scrub;
-#[cfg(feature = "stack_probe")]
-mod stack_probe;
 mod status;
-mod wdog;
-mod store;
 mod usb;
-mod vault;
-mod wrap;
 
 use core::cell::RefCell;
-use embassy_rp::adc::{Adc, Channel as AdcChannel, Config as AdcConfig};
-use env::{HardenPersist, PicoEnv, PicoPersist, PicoUserPresence};
+use env::{PicoEnv, PicoPersist, PicoUserPresence};
 use static_cell::StaticCell;
 use opensk::api::connection::{HidConnection as _, UsbEndpoint};
 use opensk::env::Env as _;
@@ -62,18 +49,9 @@ const _: () = core::assert!(
 );
 pub const FLASH_SIZE: usize = FLASH_MB * 1024 * 1024;
 
-/// Pages of 4 KiB at the end of flash for OpenSK's key-value store. build.rs keeps the store
-/// (72 KiB), the two PUF sectors and the vault (92 KiB in total) out of the linker's FLASH region:
-/// change them together.
+/// Pages of 4 KiB at the end of flash for OpenSK's key-value store (72 KiB). build.rs keeps the
+/// same area out of the linker's FLASH region: change them together.
 pub const STORE_PAGES: usize = 18;
-
-/// The last 12 KiB of flash hold the vault: [PIN retry counter][seed slot 0][seed slot 1].
-/// build.rs keeps them (and the store above) out of the linker's FLASH region.
-pub const VAULT_BYTES: usize = 3 * 4096;
-
-/// Two sectors just below the vault hold the SRAM-PUF helper data (src/puf.rs, two slots): 72 KiB
-/// store + 8 KiB PUF + 12 KiB vault = the same 92 KiB build.rs keeps out of the FLASH region.
-pub const PUF_BYTES: usize = 2 * 4096;
 
 // Heap for OpenSK (alloc): credentials, CBOR, the P-256 software crypto, message buffers.
 const HEAP_SIZE: usize = 128 * 1024;
@@ -115,8 +93,6 @@ async fn usb_executor_init(parts: AssertSend<UsbParts>) {
     spawner.spawn(usb::run_usb(device)).unwrap();
     spawner.spawn(usb::usb_io(reader, writer)).unwrap();
     spawner.spawn(blinker(led)).unwrap();
-    // Adaptive share refresh (src/guard.rs), also while the main thread signs or waits for the button.
-    spawner.spawn(guard::tick_task()).unwrap();
 }
 
 /// Heap in use, bytes (for the status display).
@@ -127,31 +103,14 @@ pub fn heap_used() -> usize {
 #[entry]
 fn main() -> ! {
     unsafe { HEAP.init(core::ptr::addr_of_mut!(HEAP_MEM) as usize, HEAP_SIZE) }
-    // A warm reset (watchdog, panic) keeps RAM: overwrite what the previous run left on the stack.
-    scrub::stack_boot();
-    #[cfg(feature = "stack_probe")]
-    stack_probe::paint();
     info!("Starting (OpenSK)");
 
     let p = embassy_rp::init(Default::default());
-    #[cfg(feature = "watchdog")]
-    wdog::start(embassy_rp::watchdog::Watchdog::new(p.WATCHDOG));
     #[cfg(feature = "oled")]
     oled::init(p.I2C0, p.PIN_17, p.PIN_16);
-    // ATECC608A: all credential keys, signing and the signature budget live in this chip.
-    #[cfg(feature = "se_atecc")]
+    // ATECC608A: credential and attestation keys, signing, the signature budget and the RNG seed.
     se::i2c::init(p.I2C1, p.PIN_15, p.PIN_14);
     let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
-
-    // RAM guard: seed the mask DRBG once, before any secret is stored (ROSC, flash unique ID,
-    // ADC noise, timer jitter -> SHA-256).
-    {
-        let mut uid = [0u8; 8];
-        let _ = flash.blocking_unique_id(&mut uid); // not secret; a failed read only drops that input
-        let mut adc = Adc::new_blocking(p.ADC, AdcConfig::default());
-        let mut sensor = AdcChannel::new_temp_sensor(p.ADC_TEMP_SENSOR);
-        guard::init(&uid, || adc.blocking_read(&mut sensor).unwrap_or(0));
-    }
 
     // Persistent serial number (privacy trade-off): build without `usb_serial` to omit it.
     let serial = if cfg!(feature = "usb_serial") {
@@ -181,10 +140,7 @@ fn main() -> ! {
     // OpenSK in thread mode. The flash moves into the key-value store, BOOTSEL into user presence.
     static FLASH: StaticCell<RefCell<keys::Fl>> = StaticCell::new();
     let flash: &'static RefCell<keys::Fl> = &*FLASH.init(RefCell::new(flash));
-    let puf = puf::Puf::open(flash);
-    let (vault, rec, blank) = vault::open(flash, !puf.required());
-    let persist = HardenPersist::new(PicoPersist::new(flash), vault, rec, blank, puf);
-    let env = PicoEnv::new(persist, PicoUserPresence::new(p.BOOTSEL));
+    let env = PicoEnv::new(PicoPersist::new(flash), PicoUserPresence::new(p.BOOTSEL));
     let mut ctap = Ctap::new(env);
     info!("OpenSK initialised");
     opensk_loop(&mut ctap)
@@ -200,20 +156,17 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
     let mut last_store_ms = 0u32;
     LED_SIGNAL.signal(LedState::Active);
     loop {
-        wdog::feed();
         // Key-value store figures for the display (reads the store: every 15 s at most).
         #[cfg(feature = "oled")]
         {
             let t = embassy_time::Instant::now().as_millis() as u32;
             if t.wrapping_sub(last_store_ms) >= 15_000 || last_store_ms == 0 {
                 last_store_ms = t.max(1);
-                if let Some((u, tot, lu, lt)) = ctap.env().persist().store_stats() {
+                if let Some((u, tot, lu, lt)) = ctap.env().persist().stats() {
                     status::set_store(u, tot, lu, lt);
                 }
             }
         }
-        #[cfg(feature = "stack_probe")]
-        stack_probe::report();
         let wink = ctap.should_wink();
         if wink != winking {
             winking = wink;
@@ -231,18 +184,14 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
         let mut packet = [0u8; 64];
         let mut received = env::hid::wait_packet(&mut packet, timeout, seen);
 
-        // USB reset / suspend / unplug: the wait above ends at once. Forget the master key (the
-        // next use needs the PIN again) and every in-flight operation: HID reassembly, pending
-        // U2F touch, PIN tokens, stateful commands.
+        // USB reset / suspend / unplug: the wait above ends at once. Drop a packet that was
+        // dequeued just before the reset (it belongs to the old session) and stop polling for
+        // the button; the host starts over with a new CTAPHID_INIT.
         let now = env::hid::epoch();
         if now != seen {
             seen = now;
-            // A packet dequeued just before the reset belongs to the old session: drop it.
             received = false;
-            ctap.env().persist().lock();
-            ctap.cancel_in_flight();
             status::BUSY.store(false, portable_atomic::Ordering::Relaxed);
-            scrub::stack();
             u2f_armed = false;
             winking = false;
             LED_SIGNAL.signal(LedState::Active);
@@ -256,13 +205,11 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
         }
 
         if received {
-            guard::touch();
             status::PKTS.fetch_add(1, portable_atomic::Ordering::Relaxed);
             status::BUSY.store(true, portable_atomic::Ordering::Relaxed);
             // Stamp the operation: everything blocking inside it (user presence, sends) stops
             // as soon as a reset / suspend / unplug bumps the epoch.
             let op = env::hid::begin_op_at(seen);
-            guard::refresh_now();
             for out in ctap.process_hid_packet(&packet, Transport::MainHid) {
                 // A cancelled operation never answers (stale responses must not leak into the
                 // next host session).
@@ -279,11 +226,7 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
                     break;
                 }
             }
-            guard::refresh_now();
             status::BUSY.store(false, portable_atomic::Ordering::Relaxed);
-            // Dead stack frames of the command (moved keys, hash/HMAC state) may still hold
-            // secret bytes: overwrite them now.
-            scrub::stack();
             if !u2f_armed && !winking {
                 LED_SIGNAL.signal(LedState::Active);
             }
@@ -320,19 +263,6 @@ pub async fn blinker(mut led: Output<'static>) {
         if let Some(new_signal) = LED_SIGNAL.try_take() {
             info!("Got new signal: {}", new_signal);
             signal = new_signal;
-        }
-
-        // SRAM PUF fault (key required but unavailable): 3 short blinks, then a pause. Takes
-        // precedence over every other state until a boot / reset with a working key clears it.
-        if puf::led_fault() {
-            for _ in 0..3 {
-                led.set_high();
-                Timer::after(Duration::from_millis(80)).await;
-                led.set_low();
-                Timer::after(Duration::from_millis(120)).await;
-            }
-            Timer::after(Duration::from_millis(900)).await;
-            continue;
         }
 
         let (on_time, off_time) = match signal {

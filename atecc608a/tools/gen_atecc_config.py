@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""ATECC608A configuration for the FIDO key (pico-fido-rs, feature `se_atecc`).
+"""ATECC608A configuration for the FIDO key (pico-fido-rs).
 
-  gen_atecc_config.py --slots 8 --budget 500 -o out/        build a config image
-  gen_atecc_config.py --slots 8 --budget 500 --base cfg.bin  patch your own `read-config` dump
+  gen_atecc_config.py --slots 7 --budget 500 -o out/        build a config image
+  gen_atecc_config.py --slots 7 --budget 500 --base cfg.bin  patch your own `read-config` dump
   gen_atecc_config.py --check cfg.bin                        decode + verify a dumped config
   gen_atecc_config.py --selftest
 
@@ -11,7 +11,8 @@ are read-only on the chip and ignored by the write).
 
 Every credential slot is: ECC P-256 private key, secret, GenKey allowed (also after the zones are
 locked, so slots can be regenerated), external signatures only (no ECDH, no PrivWrite), public key
-derivable, LimitedUse (every use bumps the chip's monotonic Counter 0).
+derivable, LimitedUse (every use bumps the chip's monotonic Counter 0). The slot after the
+credential slots is the attestation key: same, but not LimitedUse. All other slots are unused.
 Counter 0 is then set to 2097151 - BUDGET, so the chip refuses to sign after BUDGET signatures.
 Counter 0 is shared by all LimitedUse slots: BUDGET is a total for the whole device.
 """
@@ -34,6 +35,9 @@ SLOT_CRED = bytes([0x80 | 0x20 | 0x01, 0x20])   # secret, limited use, external 
 # KeyConfig, low byte first: bit0 Private, bit1 PubInfo, bits4:2 KeyType (4 = P256)
 KEY_CRED = bytes([0x01 | 0x02 | (4 << 2), 0x00])  # 0x13 0x00
 # unused slots: general data slot, never readable / writable by commands, no ECC
+# attestation key (slot right after the credential slots): same, but NOT limited-use, so the
+# signature budget is not spent on U2F/packed attestation
+SLOT_ATTEST = bytes([0x80 | 0x01, 0x20])
 SLOT_UNUSED = bytes([0x8F, 0x8F])
 KEY_UNUSED = bytes([0x3C, 0x00])
 
@@ -61,15 +65,20 @@ def default_base():
 
 
 def build(slots, budget, base=None):
-    if not 1 <= slots <= 16:
-        raise ValueError("slots must be 1..16")
+    if not 1 <= slots <= 15:
+        raise ValueError("slots must be 1..15 (one more slot is the attestation key)")
     if not 1 <= budget <= COUNTER_MAX:
         raise ValueError("budget must be 1..%d" % COUNTER_MAX)
     c = bytearray(base) if base else default_base()
     if len(c) != CFG_LEN:
         raise ValueError("base config must be 128 bytes")
     for i in range(16):
-        s, k = (SLOT_CRED, KEY_CRED) if i < slots else (SLOT_UNUSED, KEY_UNUSED)
+        if i < slots:
+            s, k = SLOT_CRED, KEY_CRED
+        elif i == slots:
+            s, k = SLOT_ATTEST, KEY_CRED
+        else:
+            s, k = SLOT_UNUSED, KEY_UNUSED
         c[SLOT_CFG + 2 * i:SLOT_CFG + 2 * i + 2] = s
         c[KEY_CFG + 2 * i:KEY_CFG + 2 * i + 2] = k
     # Counter 0 / 1 as they should be after counter-init (atecc write-config resets them to 0).
@@ -96,7 +105,7 @@ def describe(c):
             flags.append("PrivWrite" if (s[1] >> 4) & 4 else "no-PrivWrite")
             flags.append("pubkey-derivable" if k[0] & 2 else "NO-PUBKEY")
             out.append("slot %2d: ECC P-256 private key, %s" % (i, ", ".join(flags)))
-            if s != SLOT_CRED or k != KEY_CRED:
+            if k != KEY_CRED or s not in (SLOT_CRED, SLOT_ATTEST):
                 ok = False
         else:
             out.append("slot %2d: not a private-key slot (SlotConfig %02X %02X, KeyConfig %02X %02X)" % (i, s[0], s[1], k[0], k[1]))
@@ -114,13 +123,14 @@ def instructions(slots, budget):
   atecc -b <bus> -c 'dump-config -'          # compare with --check output
   atecc -b <bus> -c 'lock-config'            # IRREVERSIBLE: config, budget, slot types frozen
   atecc -b <bus> -c 'lock-data'              # IRREVERSIBLE: slots stay regenerable (GenKey enabled)
+  python3 make_attest_cert.py --out attest   # ONCE: attestation key in slot %d + its certificate
 Then, ON HARDWARE, verify before relying on it (see CONFIG.md "Acceptance test").
-""" % (budget, budget)
+""" % (budget, budget, slots)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--slots", type=int, default=8, help="credential slots, 8 (default) or 16")
+    ap.add_argument("--slots", type=int, default=7, help="credential slots (default 7); the next slot is the attestation key")
     ap.add_argument("--budget", type=int, help="total signatures the chip will allow (1..2097151)")
     ap.add_argument("--base", help="existing 128-byte config dump to patch (atecc read-config)")
     ap.add_argument("-o", "--out", default=".", help="output directory")
@@ -158,12 +168,14 @@ def selftest():
     # counter encoding is the cryptoauthlib one: spot-check against values computed by its C code
     # (see tests/test_gen_config.py for the cross-check).
     assert counter_bytes(0) == bytes([0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0])
-    c = build(8, 500)
+    c = build(7, 500)
     lines, ok = describe(c)
     assert ok and len(c) == 128
     assert c[SLOT_CFG:SLOT_CFG + 2] == bytes([0xA1, 0x20])
     assert c[KEY_CFG:KEY_CFG + 2] == bytes([0x13, 0x00])
-    assert c[SLOT_CFG + 16:SLOT_CFG + 18] == SLOT_UNUSED
+    assert c[SLOT_CFG + 14:SLOT_CFG + 16] == SLOT_ATTEST
+    assert c[SLOT_CFG + 18:SLOT_CFG + 20] == SLOT_UNUSED
+    assert c[SLOT_CFG + 22:SLOT_CFG + 24] == SLOT_UNUSED  # unused
     print("selftest ok")
     return 0
 

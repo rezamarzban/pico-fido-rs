@@ -32,14 +32,13 @@ pub trait ChipOps {
 
 pub struct Atecc<B: Bus> {
     bus: B,
-    awake: bool,
 }
 
 const WAKE_OK: [u8; 4] = [0x04, 0x11, 0x33, 0x43];
 
 impl<B: Bus> Atecc<B> {
     pub fn new(bus: B) -> Self {
-        Self { bus, awake: false }
+        Self { bus }
     }
 
     pub fn into_bus(self) -> B {
@@ -51,18 +50,15 @@ impl<B: Bus> Atecc<B> {
             self.bus.wake_pulse();
             let mut r = [0u8; 4];
             if self.bus.read(&mut r).is_ok() && r == WAKE_OK {
-                self.awake = true;
                 return Ok(());
             }
         }
-        self.awake = false;
         Err(Error::Bus)
     }
 
     fn idle(&mut self) {
-        // Keeps TempKey, lets the chip save power; a failure only means it is already asleep.
+        // Lets the chip save power; a failure only means it is already asleep.
         let _ = self.bus.write(&[proto::WORD_IDLE]);
-        self.awake = false;
     }
 
     /// One command inside an already awake session. Returns the payload length in `out`.

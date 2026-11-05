@@ -60,7 +60,7 @@ fn pull_ups() {
 }
 
 /// Starts the bus, checks that the chip answers, and registers it for `se::ecdsa`. Halts (panic)
-/// if the chip is missing: with `se_atecc` all credential keys live in it, so there is nothing
+/// if the chip is missing: the credential keys and the RNG seed come from it, so there is nothing
 /// useful to do without it.
 pub fn init(i2c: I2C1, scl: PIN_15, sda: PIN_14) {
     let bus = I2c::new_blocking(i2c, scl, sda, cfg(NORMAL_HZ));
@@ -69,7 +69,10 @@ pub fn init(i2c: I2C1, scl: PIN_15, sda: PIN_14) {
     let chip = CHIP.init(Atecc::new(RpBus { i2c: bus }));
     ecdsa::install(chip);
     match ecdsa::budget_left() {
-        Some(left) => info!("ATECC608A ready: {} signatures left", left),
+        Some(left) => {
+            crate::status::SE_LEFT.store(left, portable_atomic::Ordering::Relaxed);
+            info!("ATECC608A ready: {} signatures left", left)
+        }
         None => panic!("ATECC608A not found on I2C1 (SDA GP14, SCL GP15, address 0x60)"),
     }
 }

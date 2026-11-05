@@ -1,6 +1,6 @@
 //! Host tests for src/se: the real driver code runs against a byte-level software model of the
 //! ATECC608A (frame parsing, CRC, wake/idle/sleep, busy NACKs, GenKey/Sign/Counter/Random, the
-//! LimitedUse counter).
+//! LimitedUse counter, the attestation slot).
 
 extern crate alloc;
 
@@ -24,7 +24,7 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{CryptoRng, RngCore, SeedableRng};
 use se::chip::{Atecc, Bus, ChipOps};
-use se::ecdsa::{self, SeEcdsa, SeSecretKey, COUNTER_MAX, SLOTS};
+use se::ecdsa::{self, SeEcdsa, SeSecretKey, ATTEST_SLOT, COUNTER_MAX, HANDLE_ATTEST, SLOTS};
 use se::proto::{self, Error};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
@@ -112,7 +112,8 @@ impl Model {
                     return status(0x0F);
                 };
                 let Some(k) = &self.keys[slot] else { return status(0x0F) };
-                if self.limited {
+                // Credential slots are LimitedUse, the attestation slot is not.
+                if self.limited && slot != ATTEST_SLOT as usize {
                     if self.counters[0] >= COUNTER_MAX {
                         return status(0x0F);
                     }
@@ -220,10 +221,13 @@ fn crc_known_vectors() {
     // Wake-up response and the plain success status frame, from the datasheet.
     assert_eq!(proto::crc16(&[0x04, 0x11]).to_le_bytes(), [0x33, 0x43]);
     assert_eq!(proto::crc16(&[0x04, 0x00]).to_le_bytes(), [0x03, 0x40]);
-    // Info(revision) command as sent by cryptoauthlib.
+    // Info(revision) command (opcode 0x30, not used by the firmware) as sent by cryptoauthlib.
     let mut f = [0u8; proto::MAX_CMD];
-    let n = proto::build_command(&mut f, proto::OP_INFO, 0, 0, &[]).unwrap();
+    let n = proto::build_command(&mut f, 0x30, 0, 0, &[]).unwrap();
     assert_eq!(&f[..n], &[0x03, 0x07, 0x30, 0x00, 0x00, 0x00, 0x03, 0x5D]);
+    // The longest frame we send (Nonce pass-through, 32 bytes) fits.
+    let n = proto::build_command(&mut f, proto::OP_NONCE, proto::NONCE_PASSTHROUGH, 0, &[0u8; 32]).unwrap();
+    assert_eq!(n, 40);
 }
 
 #[test]
@@ -332,10 +336,13 @@ fn key_lifecycle_through_opensk_traits() {
     // Rejected handles.
     assert!(SeSecretKey::import(&handle[..31]).is_none());
     let mut bad = handle.clone();
-    bad[0] = 2;
+    bad[0] = 3; // unknown version
     assert!(SeSecretKey::import(&bad).is_none());
     let mut bad = handle.clone();
-    bad[1] = SLOTS;
+    bad[0] = HANDLE_ATTEST; // attestation version on a credential slot
+    assert!(SeSecretKey::import(&bad).is_none());
+    let mut bad = handle.clone();
+    bad[1] = SLOTS; // credential version on the attestation slot
     assert!(SeSecretKey::import(&bad).is_none());
     let mut bad = handle.clone();
     bad[5] ^= 0xFF; // wrong fingerprint
@@ -389,15 +396,14 @@ fn signature_budget_is_enforced_by_the_chip() {
 }
 
 #[test]
-fn rng_mixing_and_missing_chip() {
+fn chip_random_and_missing_chip() {
     let (_g, _m) = install(false, 0);
-    let mut buf = [0u8; 70];
-    ecdsa::mix_random(&mut buf);
-    assert!(buf.iter().any(|&b| b != 0));
+    let a = ecdsa::chip_random().unwrap();
+    let b = ecdsa::chip_random().unwrap();
+    assert_ne!(a, b);
+    assert_ne!(a, [0u8; 32]);
     ecdsa::uninstall();
-    let mut buf = [0u8; 8];
-    ecdsa::mix_random(&mut buf); // silent no-op
-    assert_eq!(buf, [0u8; 8]);
+    assert_eq!(ecdsa::chip_random(), Err(Error::Bus));
     assert_eq!(ecdsa::budget_left(), None);
     assert!(!ecdsa::installed());
 }
@@ -407,4 +413,72 @@ fn pico_crypto_is_an_opensk_crypto() {
     fn takes<C: Crypto>() {}
     takes::<se::crypto::PicoCrypto>();
     let _ = std::any::type_name::<SeEcdsa>();
+}
+
+// ---------------------------------------------------------------- attestation key
+
+/// What the provisioning tool does (atecc608a/tools/make_attest_cert.py): GenKey in the attestation
+/// slot, then build the handle that OpenSK's attestation store keeps in place of a private key.
+fn provision_attestation(m: &Arc<Mutex<Model>>) -> Vec<u8> {
+    let mut g = m.lock().unwrap();
+    let k = SigningKey::random(g.rng.as_mut().unwrap());
+    let pk: [u8; 64] = VerifyingKey::from(&k).to_encoded_point(false).as_bytes()[1..].try_into().unwrap();
+    g.keys[ATTEST_SLOT as usize] = Some(k);
+    ecdsa::handle(HANDLE_ATTEST, ATTEST_SLOT, &pk)
+}
+
+#[test]
+fn attestation_handle_layout_matches_the_python_tool() {
+    // make_attest_cert.py: bytes([2, 7]) + sha256(pub)[:6] + 24 zero bytes.
+    let pk = [0xA5u8; 64];
+    let h = ecdsa::handle(HANDLE_ATTEST, ATTEST_SLOT, &pk);
+    assert_eq!(h.len(), 32);
+    assert_eq!(&h[..2], &[2, 7]);
+    assert_eq!(&h[2..8], &Sha256::digest(pk)[..6]);
+    assert!(h[8..].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn attestation_key_signs_without_spending_the_budget() {
+    let (_g, m) = install(true, COUNTER_MAX - 3);
+    let handle = provision_attestation(&m);
+    let k = SeSecretKey::import(&handle).expect("attestation handle imports");
+    assert_eq!(k.export(), handle, "re-exported handle is the same (version 2)");
+    for _ in 0..10 {
+        check_sig(&k, b"authData || clientDataHash");
+    }
+    assert_eq!(ecdsa::budget_left(), Some(3), "attestation does not use the signature budget");
+}
+
+#[test]
+fn attestation_handle_is_checked_against_the_chip() {
+    let (_g, m) = install(false, 0);
+    // Not provisioned yet: the slot is empty, the handle cannot be used.
+    let pk = [7u8; 64];
+    assert!(SeSecretKey::import(&ecdsa::handle(HANDLE_ATTEST, ATTEST_SLOT, &pk)).is_none());
+    let handle = provision_attestation(&m);
+    assert!(SeSecretKey::import(&handle).is_some());
+    // A handle for another key (wrong fingerprint) is refused.
+    let mut bad = handle.clone();
+    bad[2] ^= 1;
+    assert!(SeSecretKey::import(&bad).is_none());
+    // Version 1 handles never reach the attestation slot, version 2 handles never the credential slots.
+    let mut bad = handle.clone();
+    bad[0] = 1;
+    assert!(SeSecretKey::import(&bad).is_none());
+    let mut bad = handle.clone();
+    bad[1] = 0;
+    assert!(SeSecretKey::import(&bad).is_none());
+}
+
+#[test]
+fn credential_registration_never_touches_the_attestation_slot() {
+    let (_g, m) = install(false, 0);
+    let handle = provision_attestation(&m);
+    let mut rng = TestRng(ChaCha8Rng::seed_from_u64(9));
+    for _ in 0..(3 * SLOTS as usize) {
+        let k = SeSecretKey::random(&mut rng);
+        assert!(k.export()[1] < SLOTS);
+    }
+    assert!(SeSecretKey::import(&handle).is_some(), "attestation key survived all registrations");
 }
