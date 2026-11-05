@@ -50,10 +50,11 @@ impl PicoUserPresence {
 
 impl UserPresence for PicoUserPresence {
     fn check_init(&mut self) {
-        #[cfg(feature = "se_atecc")]
-        {
-            self.exhausted = crate::se::ecdsa::budget_left() == Some(0);
+        let left = crate::se::ecdsa::budget_left();
+        if let Some(n) = left {
+            crate::status::SE_LEFT.store(n, portable_atomic::Ordering::Relaxed);
         }
+        self.exhausted = left == Some(0);
         self.arm();
         LED_SIGNAL.signal(LedState::Confirm);
     }
@@ -95,7 +96,7 @@ impl UserPresence for PicoUserPresence {
             if Instant::now() >= deadline {
                 return Ok((Err(UserPresenceError::Timeout), RecvStatus::Timeout));
             }
-            crate::wdog::poll_wait(POLL);
+            super::poll_wait(POLL);
         }
     }
 

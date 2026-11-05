@@ -12,13 +12,12 @@ use core::cell::RefCell;
 use wasefire_store::{Storage, StorageError, StorageIndex, StorageResult};
 
 use crate::keys::Fl;
-use crate::{FLASH_SIZE, PUF_BYTES, STORE_PAGES, VAULT_BYTES};
+use crate::{FLASH_SIZE, STORE_PAGES};
 
 pub const PAGE_SIZE: usize = 4096;
 const STORE_BYTES: usize = STORE_PAGES * PAGE_SIZE;
-/// The vault (src/vault.rs) occupies the very end of flash, then the two PUF helper
-/// sectors (src/puf.rs), and the store sits right below them.
-const STORE_START: usize = FLASH_SIZE - VAULT_BYTES - PUF_BYTES - STORE_BYTES;
+/// The store occupies the very end of flash.
+const STORE_START: usize = FLASH_SIZE - STORE_BYTES;
 /// Start of the memory-mapped flash (XIP window).
 const XIP_BASE: usize = 0x1000_0000;
 

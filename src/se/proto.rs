@@ -14,12 +14,8 @@ pub const WORD_COMMAND: u8 = 0x03;
 
 pub const OP_COUNTER: u8 = 0x24;
 pub const OP_GENKEY: u8 = 0x40;
-pub const OP_INFO: u8 = 0x30;
-pub const OP_LOCK: u8 = 0x17;
 pub const OP_NONCE: u8 = 0x16;
 pub const OP_RANDOM: u8 = 0x1B;
-pub const OP_READ: u8 = 0x02;
-pub const OP_SELFTEST: u8 = 0x77;
 pub const OP_SIGN: u8 = 0x41;
 
 /// Largest command frame we build: Nonce pass-through (32 bytes data) = 1+1+1+1+2+32+2 = 40.
@@ -34,7 +30,7 @@ pub enum Error {
     /// Response CRC wrong or malformed length.
     Crc,
     /// Chip status byte (0x03 parse, 0x05 ECC fault, 0x07 self-test, 0x08 health, 0x0F exec, 0xEE
-    /// watchdog, 0xFF comm). 0x01 = miscompare.
+    /// watchdog, 0xFF comm).
     Status(u8),
     /// Slot / argument out of range, or the response had an unexpected size.
     Param,
@@ -100,7 +96,7 @@ pub fn parse_response(frame: &[u8]) -> Result<&[u8], Error> {
     Ok(&frame[1..n - 2])
 }
 
-/// Slot bit-fields used by this firmware. See atecc608a/CONFIG.md for the chip configuration.
+/// Command parameters used by this firmware. See atecc608a/CONFIG.md for the chip configuration.
 pub const GENKEY_CREATE: u8 = 0x04; // create a new random private key in the slot, return pub key
 pub const GENKEY_PUBLIC: u8 = 0x00; // compute the public key of the slot's private key
 pub const NONCE_PASSTHROUGH: u8 = 0x03; // load 32 bytes into TempKey unchanged
@@ -123,11 +119,8 @@ pub fn max_exec_ms(opcode: u8) -> u32 {
     match opcode {
         OP_COUNTER => 25,
         OP_GENKEY => 115,
-        OP_INFO => 5,
         OP_NONCE => 29,
         OP_RANDOM => 23,
-        OP_READ => 5,
-        OP_SELFTEST => 625,
         OP_SIGN => 70,
         _ => 200,
     }

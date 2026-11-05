@@ -2,8 +2,6 @@
 //! atomics: written where the state changes, read by the display. Nothing here is secret.
 use portable_atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
-/// Time the main thread spent asleep in `wfi` (microseconds, wrapping). CPU load = 1 - idle.
-pub static IDLE_US: AtomicU32 = AtomicU32::new(0);
 /// HID packets handled.
 pub static PKTS: AtomicU32 = AtomicU32::new(0);
 /// A CTAP command is being processed.
@@ -14,13 +12,9 @@ pub const USB_CONFIGURED: u8 = 1;
 pub const USB_SUSPENDED: u8 = 2;
 pub static USB: AtomicU8 = AtomicU8::new(USB_NONE);
 
-pub const PUF_OFF: u8 = 0;
-pub const PUF_BLANK: u8 = 1;
-pub const PUF_DAMAGED: u8 = 2;
-pub const PUF_NOISY: u8 = 3;
-pub const PUF_READY: u8 = 4;
-pub static PUF: AtomicU8 = AtomicU8::new(PUF_OFF);
-pub static PUF_SLOT: AtomicU8 = AtomicU8::new(0);
+/// Signatures the secure element still allows (`SE_UNKNOWN` = not read yet / chip did not answer).
+pub const SE_UNKNOWN: u32 = u32::MAX;
+pub static SE_LEFT: AtomicU32 = AtomicU32::new(SE_UNKNOWN);
 
 /// Key-value store usage and erase-budget use, in store words (0 = not read yet).
 pub static STORE_USED: AtomicU32 = AtomicU32::new(0);

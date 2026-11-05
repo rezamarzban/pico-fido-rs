@@ -3,8 +3,9 @@
 //! Only the four primitive accessors are implemented; everything else (PIN state, retry counters,
 //! credentials, large blobs, attestation) uses OpenSK's default methods built on them.
 //!
-//! This is the raw, cleartext backend. `HardenPersist` (harden.rs) wraps it and keeps the master
-//! key and the resident-credential secrets out of it (see SECURITY.md).
+//! This is OpenSK's standard storage, unmodified: PIN hash, master keys, resident credentials and
+//! counters are plain flash contents. The private keys of the credentials are not in it (they are
+//! in the secure element); a credential ID only holds a slot handle.
 use alloc::boxed::Box;
 use core::cell::RefCell;
 use alloc::vec::Vec;

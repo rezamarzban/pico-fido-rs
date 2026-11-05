@@ -24,5 +24,4 @@ fi
   cargo test --features=std,config_command,ctap1 )
 cargo test --manifest-path=libraries/cbor/Cargo.toml
 # the repo-level .cargo/config.toml defaults to the Pico target: force the host target here
-( cd "$HERE/guard" && cargo test --target "$(rustc -vV | sed -n 's/^host: //p')" )
 ( cd "$HERE/se" && cargo test --target "$(rustc -vV | sed -n 's/^host: //p')" )

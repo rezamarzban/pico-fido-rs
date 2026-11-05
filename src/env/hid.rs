@@ -62,8 +62,6 @@ pub fn op_cancelled() -> bool {
 /// Cancels everything in flight and drops the queues. Callable from the USB handler.
 pub fn cancel_all() {
     CANCEL_EPOCH.fetch_add(1, Ordering::AcqRel);
-    // Forget the seed now (with a PIN set), not at the next main-loop turn.
-    super::harden::lock_now();
     flush();
     // Tell the USB task to abandon the read it has in flight (see `usb::ctap::usb_io`).
     RESET_SIG.signal(());
@@ -98,7 +96,7 @@ pub fn recv_packet(buf: &mut HidPacket, timeout_ms: Option<usize>) -> bool {
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return false;
         }
-        crate::wdog::poll_wait(POLL);
+        super::poll_wait(POLL);
     }
 }
 
@@ -122,7 +120,7 @@ pub fn wait_packet(buf: &mut HidPacket, timeout_ms: Option<usize>, seen: u32) ->
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return false;
         }
-        crate::wdog::poll_wait(POLL);
+        super::poll_wait(POLL);
     }
 }
 
@@ -150,7 +148,7 @@ impl HidConnection for PicoHidConnection {
             if Instant::now() >= deadline {
                 return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_HARDWARE_FAILURE);
             }
-            crate::wdog::poll_wait(POLL);
+            super::poll_wait(POLL);
         }
     }
 

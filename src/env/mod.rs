@@ -6,8 +6,6 @@
 
 mod clock;
 mod flash_store;
-mod harden;
-pub use harden::pin_set;
 pub mod hid;
 mod persist;
 mod rng;
@@ -15,41 +13,40 @@ mod user_presence;
 
 use clock::PicoClock;
 use hid::PicoHidConnection;
-pub use harden::HardenPersist;
 pub use persist::PicoPersist;
 use rng::PicoRng;
 pub use user_presence::PicoUserPresence;
 
 use core::fmt;
-#[cfg(not(feature = "se_atecc"))]
-use opensk::api::crypto::software_crypto::SoftwareCrypto;
 use opensk::api::customization::{CustomizationImpl, DEFAULT_CUSTOMIZATION};
 use opensk::api::key_store;
 use opensk::env::Env;
 
-/// OpenSK defaults, except:
-/// * PINs must have at least 10 code points. The master key is wrapped with Argon2id under the
-///   PIN, but the RP2040 cannot make offline guessing expensive enough for short PINs: a long
-///   passphrase is the real protection of a stolen device.
-/// * `use_batch_attestation` stays false (packed self-attestation): switching it on without a
-///   provisioned attestation key would make every makeCredential fail. U2F registration needs the
-///   key anyway (provision it with OpenSK's tools/configure.py).
-pub const CUSTOMIZATION: CustomizationImpl = CustomizationImpl {
-    default_min_pin_length: 10,
-    ..DEFAULT_CUSTOMIZATION
-};
+/// OpenSK defaults. `use_batch_attestation` stays false (packed self-attestation, signed with the
+/// credential key): U2F registration always uses the attestation key in the chip, but turning
+/// batch attestation on would also make every FIDO2 registration carry that per-device
+/// certificate, which every site can then use to recognise the device. Set it to true only if
+/// that is wanted (and the attestation material is provisioned, see atecc608a/CONFIG.md).
+pub const CUSTOMIZATION: CustomizationImpl = DEFAULT_CUSTOMIZATION;
+
+/// One step of a polling wait on the main thread: give the status display a turn, then wait.
+pub fn poll_wait(d: embassy_time::Duration) {
+    #[cfg(feature = "oled")]
+    crate::oled::poll();
+    embassy_time::block_for(d);
+}
 
 /// Top-level environment that ties all OpenSK platform pieces together.
 pub struct PicoEnv {
     rng: PicoRng,
     user_presence: PicoUserPresence,
-    persist: HardenPersist,
+    persist: PicoPersist,
     clock: PicoClock,
     hid: PicoHidConnection,
 }
 
 impl PicoEnv {
-    pub fn new(persist: HardenPersist, user_presence: PicoUserPresence) -> Self {
+    pub fn new(persist: PicoPersist, user_presence: PicoUserPresence) -> Self {
         Self {
             rng: PicoRng::new(),
             user_presence,
@@ -73,17 +70,14 @@ impl fmt::Write for DefmtWrite {
 impl Env for PicoEnv {
     type Rng = PicoRng;
     type UserPresence = PicoUserPresence;
-    type Persist = HardenPersist;
+    type Persist = PicoPersist;
     type KeyStore = Self;
     type Write = DefmtWrite;
     type Customization = CustomizationImpl;
     type HidConnection = PicoHidConnection;
     type Clock = PicoClock;
-    // With the secure element, ECDSA (all credential keys) runs inside the ATECC608A.
-    #[cfg(feature = "se_atecc")]
+    // ECDSA (credential and attestation keys) runs inside the ATECC608A, the rest in software.
     type Crypto = crate::se::crypto::PicoCrypto;
-    #[cfg(not(feature = "se_atecc"))]
-    type Crypto = SoftwareCrypto;
 
     fn rng(&mut self) -> &mut Self::Rng {
         &mut self.rng
@@ -123,6 +117,6 @@ impl Env for PicoEnv {
     }
 }
 
-// OpenSK's blanket `KeyStore` implementation. Its master keys come from `HardenPersist::
-// key_store_bytes` (RAM, unlocked by the PIN), so credential IDs are encrypted with them.
+// OpenSK's blanket `KeyStore` implementation: the master keys live in the key-value store and
+// encrypt the credential IDs (which carry the chip-slot handles).
 impl key_store::Helper for PicoEnv {}

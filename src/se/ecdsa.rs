@@ -1,11 +1,14 @@
 //! OpenSK `Ecdsa` whose private keys never leave the ATECC608A.
 //!
-//! * `random()` allocates the next chip slot (round-robin on Counter 1, which survives power
-//!   cycles) and runs GenKey there. The key that was in that slot is overwritten: with N slots
-//!   the N+1-th registration evicts the oldest credential (its handle then fails `import`).
+//! * `random()` allocates the next credential slot (round-robin on Counter 1, which survives
+//!   power cycles) and runs GenKey there. The key that was in that slot is overwritten: with N
+//!   slots the N+1-th registration evicts the oldest credential (its handle then fails `import`).
 //! * `export()` is a 32-byte *handle*: [version][slot][6-byte public-key fingerprint][zeros].
 //!   OpenSK stores it inside the encrypted credential ID, exactly like a wrapped software key.
 //! * `import()` checks that the slot still holds the key the handle was made for (fingerprint).
+//! * The attestation key lives in slot `ATTEST_SLOT` and is created once at provisioning
+//!   (atecc608a/tools/make_attest_cert.py). OpenSK's attestation store holds its handle
+//!   (version 2) where a software firmware would hold the 32-byte private key.
 //! * `sign()` hashes the message (SHA-256) and lets the chip sign the digest. The chip's
 //!   LimitedUse/Counter 0 limit is what stops signing after the configured budget.
 
@@ -20,13 +23,14 @@ use sha2::{Digest, Sha256};
 use super::chip::ChipOps;
 use super::proto::Error;
 
-/// Number of chip slots used for credential keys (feature `se_slots_16`: all sixteen).
-#[cfg(feature = "se_slots_16")]
-pub const SLOTS: u8 = 16;
-#[cfg(not(feature = "se_slots_16"))]
-pub const SLOTS: u8 = 8;
+/// Chip slots 0..SLOTS hold credential keys (LimitedUse). Slot SLOTS is the attestation key
+/// (not limited-use). The remaining slots are unused.
+pub const SLOTS: u8 = 7;
+pub const ATTEST_SLOT: u8 = SLOTS;
 
-const HANDLE_VERSION: u8 = 1;
+/// Handle of a credential key (slot < SLOTS) / of the attestation key (slot == ATTEST_SLOT).
+pub const HANDLE_CRED: u8 = 1;
+pub const HANDLE_ATTEST: u8 = 2;
 const HANDLE_LEN: usize = 32;
 const FP_LEN: usize = 6;
 /// Counter 0 value at which a LimitedUse key stops working (chip datasheet).
@@ -72,15 +76,18 @@ pub fn budget_left() -> Option<u32> {
     with_chip(|c| c.counter(0)).ok().map(|v| COUNTER_MAX.saturating_sub(v))
 }
 
-/// XORs chip randomness into `buf` (32 bytes per chip call). Silent no-op without a chip.
-pub fn mix_random(buf: &mut [u8]) {
-    for chunk in buf.chunks_mut(32) {
-        if let Ok(r) = with_chip(|c| c.random()) {
-            for (b, x) in chunk.iter_mut().zip(r.iter()) {
-                *b ^= x;
-            }
-        }
-    }
+/// 32 random bytes from the chip (seed of the RNG, `env/rng.rs`).
+pub fn chip_random() -> Result<[u8; 32], Error> {
+    with_chip(|c| c.random())
+}
+
+/// The 32-byte handle for the key `pk` in `slot`: [version][slot][fingerprint][zeros].
+pub fn handle(version: u8, slot: u8, pk: &[u8; 64]) -> Vec<u8> {
+    let mut h = alloc::vec![0u8; HANDLE_LEN];
+    h[0] = version;
+    h[1] = slot;
+    h[2..2 + FP_LEN].copy_from_slice(&fingerprint(pk));
+    h
 }
 
 fn fingerprint(pk: &[u8; 64]) -> [u8; FP_LEN] {
@@ -161,23 +168,25 @@ impl EcSecretKey for SeSecretKey {
     }
 
     fn export(&self) -> Vec<u8> {
-        let mut h = alloc::vec![0u8; HANDLE_LEN];
-        h[0] = HANDLE_VERSION;
-        h[1] = self.slot;
-        h[2..2 + FP_LEN].copy_from_slice(&fingerprint(&self.pubkey));
-        h
+        let version = if self.slot == ATTEST_SLOT { HANDLE_ATTEST } else { HANDLE_CRED };
+        handle(version, self.slot, &self.pubkey)
     }
 
     fn import(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != HANDLE_LEN || bytes[0] != HANDLE_VERSION || bytes[1] >= SLOTS {
-            return None;
-        }
-        if bytes[2 + FP_LEN..].iter().any(|&b| b != 0) {
+        if bytes.len() != HANDLE_LEN {
             return None;
         }
         let slot = bytes[1];
+        let slot_ok = match bytes[0] {
+            HANDLE_CRED => slot < SLOTS,
+            HANDLE_ATTEST => slot == ATTEST_SLOT,
+            _ => false,
+        };
+        if !slot_ok || bytes[2 + FP_LEN..].iter().any(|&b| b != 0) {
+            return None;
+        }
         let pubkey = cached_pubkey(slot).ok()?;
-        // The slot may have been recycled for a newer credential.
+        // The slot may have been recycled for a newer credential (or the attestation key replaced).
         if fingerprint(&pubkey)[..] != bytes[2..2 + FP_LEN] {
             return None;
         }
