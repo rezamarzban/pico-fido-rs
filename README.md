@@ -7,8 +7,8 @@ repository is the RP2040 platform layer around it. **Experimental. Read `SECURIT
 ## What is where
 | In the ATECC608A (`src/se/`) | On the Pico |
 |---|---|
-| 7 credential private keys (GenKey, ECDSA signing, signature limit by the chip counter) | OpenSK with its standard key-value store (`src/env/persist.rs`, `flash_store.rs`) |
-| 1 attestation private key (created once, no signature limit) | ClientPIN, PIN hash, credential-ID encryption keys, resident credentials: all OpenSK standard |
+| 9 credential private keys (GenKey, ECDSA signing; signature budget counted in a chip counter) | OpenSK with its standard key-value store (`src/env/persist.rs`, `flash_store.rs`) |
+| 1 attestation private key (slot 0, created once, not counted) | ClientPIN, PIN hash, credential-ID encryption keys, resident credentials: all OpenSK standard |
 | Public-key extraction | SHA-256 / HMAC / AES / HKDF / ECDH in software (`src/se/crypto.rs`) |
 | Random (the only entropy source) | RNG = ChaCha20 DRBG seeded and re-seeded from the chip (`src/env/rng.rs`) |
 | | BOOTSEL as user presence (`src/env/user_presence.rs`), USB HID (`src/usb/`, `src/env/hid.rs`) |

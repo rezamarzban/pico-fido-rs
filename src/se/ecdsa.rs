@@ -9,8 +9,11 @@
 //! * The attestation key lives in slot `ATTEST_SLOT` and is created once at provisioning
 //!   (atecc608a/tools/make_attest_cert.py). OpenSK's attestation store holds its handle
 //!   (version 2) where a software firmware would hold the 32-byte private key.
-//! * `sign()` hashes the message (SHA-256) and lets the chip sign the digest. The chip's
-//!   LimitedUse/Counter 0 limit is what stops signing after the configured budget.
+//! * `sign()` hashes the message (SHA-256) and lets the chip sign the digest. The chip config has
+//!   no LimitedUse bit, so the signature budget is counted here: before every credential
+//!   signature the chip's monotonic Counter 0 is incremented, and the chip refuses to increment
+//!   past `COUNTER_MAX` (the config preloads it with `COUNTER_MAX - budget`). The attestation
+//!   key does not spend the budget.
 
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -23,17 +26,20 @@ use sha2::{Digest, Sha256};
 use super::chip::ChipOps;
 use super::proto::Error;
 
-/// Chip slots 0..SLOTS hold credential keys (LimitedUse). Slot SLOTS is the attestation key
-/// (not limited-use). The remaining slots are unused.
-pub const SLOTS: u8 = 7;
-pub const ATTEST_SLOT: u8 = SLOTS;
+/// Slot map of the provisioned chip (atecc608a/out/atecc608a_general_config.bin): slots 0-9 are
+/// ECC P-256 private-key slots with GenKey enabled. Slot 0 holds the attestation key (made once,
+/// never overwritten by the firmware); slots 1..=9 are credential slots. Slots 10-15 are not used.
+pub const ATTEST_SLOT: u8 = 0;
+pub const FIRST_CRED_SLOT: u8 = 1;
+/// Number of credential slots (the 10th registration evicts the oldest credential).
+pub const SLOTS: u8 = 9;
 
 /// Handle of a credential key (slot < SLOTS) / of the attestation key (slot == ATTEST_SLOT).
 pub const HANDLE_CRED: u8 = 1;
 pub const HANDLE_ATTEST: u8 = 2;
 const HANDLE_LEN: usize = 32;
 const FP_LEN: usize = 6;
-/// Counter 0 value at which a LimitedUse key stops working (chip datasheet).
+/// Counter 0 value at which the chip refuses to count further (datasheet maximum).
 pub const COUNTER_MAX: u32 = 2_097_151;
 
 type Chip = &'static mut (dyn ChipOps + Send);
@@ -134,12 +140,22 @@ impl EcSecretKey for SeSecretKey {
     type Signature = SeSignature;
 
     fn random(_rng: &mut impl Rng) -> Self {
-        // Round-robin slot from Counter 1 (first registration: counter 1 -> slot 0).
-        let n = with_chip(|c| c.counter_inc(1)).unwrap_or_else(|_| panic!("se: counter 1"));
-        let slot = (n.wrapping_sub(1) % SLOTS as u32) as u8;
-        let pubkey = with_chip(|c| c.gen_key(slot)).unwrap_or_else(|_| panic!("se: GenKey failed"));
-        critical_section::with(|cs| PUBKEYS.borrow(cs).borrow_mut()[slot as usize] = Some(pubkey));
-        SeSecretKey { slot, pubkey }
+        // Round-robin slot from Counter 1 (first registration: counter 1 -> slot FIRST_CRED_SLOT).
+        // If the chip refuses GenKey in a slot (e.g. a slot that cannot hold a P-256 private key)
+        // the next slot is tried, so such a slot is simply never used.
+        for attempt in 0..SLOTS {
+            let n = with_chip(|c| c.counter_inc(1)).unwrap_or_else(|_| panic!("se: counter 1"));
+            let slot = FIRST_CRED_SLOT + (n.wrapping_sub(1) % SLOTS as u32) as u8;
+            match with_chip(|c| c.gen_key(slot)) {
+                Ok(pubkey) => {
+                    critical_section::with(|cs| PUBKEYS.borrow(cs).borrow_mut()[slot as usize] = Some(pubkey));
+                    return SeSecretKey { slot, pubkey };
+                }
+                Err(Error::Status(_)) if attempt + 1 < SLOTS => continue,
+                Err(_) => break,
+            }
+        }
+        panic!("se: GenKey failed")
     }
 
     fn public_key(&self) -> SePublicKey {
@@ -152,6 +168,11 @@ impl EcSecretKey for SeSecretKey {
 
     fn sign(&self, message: &[u8]) -> SeSignature {
         let digest: [u8; 32] = Sha256::digest(message).into();
+        // Spend one unit of the budget first (like a LimitedUse key would). At the limit the chip
+        // refuses to increment, and nothing is signed.
+        if self.slot != ATTEST_SLOT && with_chip(|c| c.counter_inc(0)).is_err() {
+            return SeSignature { r: [0; 32], s: [0; 32] };
+        }
         match with_chip(|c| c.sign(self.slot, &digest)) {
             Ok(sig) => {
                 let mut r = [0u8; 32];
@@ -178,7 +199,7 @@ impl EcSecretKey for SeSecretKey {
         }
         let slot = bytes[1];
         let slot_ok = match bytes[0] {
-            HANDLE_CRED => slot < SLOTS,
+            HANDLE_CRED => (FIRST_CRED_SLOT..FIRST_CRED_SLOT + SLOTS).contains(&slot),
             HANDLE_ATTEST => slot == ATTEST_SLOT,
             _ => false,
         };

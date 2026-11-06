@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """ATECC608A configuration for the FIDO key (pico-fido-rs).
 
-  gen_atecc_config.py --slots 7 --budget 500 -o out/        build a config image
-  gen_atecc_config.py --slots 7 --budget 500 --base cfg.bin  patch your own `read-config` dump
-  gen_atecc_config.py --check cfg.bin                        decode + verify a dumped config
+  gen_atecc_config.py --slots 10 --budget 500 -o out/        build a config image
+  gen_atecc_config.py --slots 10 --budget 500 --base cfg.bin  patch your own `read-config` dump
+  gen_atecc_config.py --check cfg.bin                         decode + verify a dumped config
   gen_atecc_config.py --selftest
 
 Output is the 128-byte config zone blob that wirenboard `atecc write-config` expects (bytes 0-15
 are read-only on the chip and ignored by the write).
 
-Every credential slot is: ECC P-256 private key, secret, GenKey allowed (also after the zones are
-locked, so slots can be regenerated), external signatures only (no ECDH, no PrivWrite), public key
-derivable, LimitedUse (every use bumps the chip's monotonic Counter 0). The slot after the
-credential slots is the attestation key: same, but not LimitedUse. All other slots are unused.
-Counter 0 is then set to 2097151 - BUDGET, so the chip refuses to sign after BUDGET signatures.
-Counter 0 is shared by all LimitedUse slots: BUDGET is a total for the whole device.
+Layout (same as the provisioned chip, atecc608a/out/atecc608a_general_config.bin): the first
+SLOTS slots are ECC P-256 private keys: secret, GenKey allowed (also after the zones are locked),
+external signatures only (no ECDH, no PrivWrite), public key derivable. Slot 0 is the attestation
+key, the others are credential keys. There is NO LimitedUse bit: the signature budget is counted
+by the firmware in the chip's monotonic Counter 0 (src/se/ecdsa.rs), which this tool preloads with
+2097151 - BUDGET; the chip refuses to count past 2097151. Never set LimitedUse as well, or every
+signature would be counted twice. All other slots are left unused.
 """
 import argparse, os, sys
 
@@ -31,13 +32,10 @@ CHIP_OPTIONS, X509, KEY_CFG = 90, 92, 96
 #   byte 20+2i : bit7 IsSecret, bit6 EncryptRead, bit5 LimitedUse, bit4 NoMac,
 #                bit3 WriteECDH, bit2 ECDH, bit1 internal signatures, bit0 external signatures
 #   byte 21+2i : bits7:4 WriteConfig (bit1 = GenKey allowed, bit2 = PrivWrite encrypted), bits3:0 WriteKey
-SLOT_CRED = bytes([0x80 | 0x20 | 0x01, 0x20])   # secret, limited use, external sign; GenKey
+SLOT_CRED = bytes([0x80 | 0x01, 0x20])   # secret, external sign; GenKey (no LimitedUse!)
 # KeyConfig, low byte first: bit0 Private, bit1 PubInfo, bits4:2 KeyType (4 = P256)
 KEY_CRED = bytes([0x01 | 0x02 | (4 << 2), 0x00])  # 0x13 0x00
 # unused slots: general data slot, never readable / writable by commands, no ECC
-# attestation key (slot right after the credential slots): same, but NOT limited-use, so the
-# signature budget is not spent on U2F/packed attestation
-SLOT_ATTEST = bytes([0x80 | 0x01, 0x20])
 SLOT_UNUSED = bytes([0x8F, 0x8F])
 KEY_UNUSED = bytes([0x3C, 0x00])
 
@@ -65,8 +63,8 @@ def default_base():
 
 
 def build(slots, budget, base=None):
-    if not 1 <= slots <= 15:
-        raise ValueError("slots must be 1..15 (one more slot is the attestation key)")
+    if not 2 <= slots <= 16:
+        raise ValueError("slots must be 2..16 (slot 0 = attestation key, the rest credentials)")
     if not 1 <= budget <= COUNTER_MAX:
         raise ValueError("budget must be 1..%d" % COUNTER_MAX)
     c = bytearray(base) if base else default_base()
@@ -75,8 +73,6 @@ def build(slots, budget, base=None):
     for i in range(16):
         if i < slots:
             s, k = SLOT_CRED, KEY_CRED
-        elif i == slots:
-            s, k = SLOT_ATTEST, KEY_CRED
         else:
             s, k = SLOT_UNUSED, KEY_UNUSED
         c[SLOT_CFG + 2 * i:SLOT_CFG + 2 * i + 2] = s
@@ -85,6 +81,16 @@ def build(slots, budget, base=None):
     c[COUNTER0:COUNTER0 + 8] = counter_bytes(COUNTER_MAX - budget)
     c[COUNTER0 + 8:COUNTER0 + 16] = counter_bytes(0)
     return bytes(c)
+
+
+def counter_value(b):
+    """Inverse of counter_bytes (the value a config-zone counter field encodes)."""
+    b = bytes(b)
+    bin_a = (b[4] << 8) | b[5]
+    for v in range(bin_a * 32, bin_a * 32 + 32):
+        if v <= COUNTER_MAX and counter_bytes(v) == b:
+            return v
+    return None
 
 
 def describe(c):
@@ -98,17 +104,20 @@ def describe(c):
         if priv and ktype == 4:
             flags = []
             flags.append("secret" if s[0] & 0x80 else "NOT-SECRET")
-            flags.append("limited-use" if s[0] & 0x20 else "UNLIMITED")
+            flags.append("LIMITED-USE (do not combine with the firmware counter)" if s[0] & 0x20 else "no LimitedUse")
             flags.append("ext-sign" if s[0] & 1 else "no-ext-sign")
             flags.append("ECDH" if s[0] & 4 else "no-ECDH")
             flags.append("GenKey" if (s[1] >> 4) & 2 else "no-GenKey")
             flags.append("PrivWrite" if (s[1] >> 4) & 4 else "no-PrivWrite")
             flags.append("pubkey-derivable" if k[0] & 2 else "NO-PUBKEY")
             out.append("slot %2d: ECC P-256 private key, %s" % (i, ", ".join(flags)))
-            if k != KEY_CRED or s not in (SLOT_CRED, SLOT_ATTEST):
+            if k != KEY_CRED or s != SLOT_CRED:
                 ok = False
         else:
             out.append("slot %2d: not a private-key slot (SlotConfig %02X %02X, KeyConfig %02X %02X)" % (i, s[0], s[1], k[0], k[1]))
+    v0 = counter_value(c[COUNTER0:COUNTER0 + 8])
+    if v0 is not None:
+        out.append("Counter 0 in the config: %d  ->  %d signatures left (firmware counts them)" % (v0, COUNTER_MAX - v0))
     out.append("I2C address byte: 0x%02X, ChipMode 0x%02X" % (c[I2C_ADDR], c[CHIP_MODE]))
     out.append("LockValue (data zone): %s, LockConfig (config zone): %s" % (
         "unlocked" if c[LOCK_VALUE] == 0x55 else "LOCKED", "unlocked" if c[LOCK_CONFIG] == 0x55 else "LOCKED"))
@@ -123,14 +132,14 @@ def instructions(slots, budget):
   atecc -b <bus> -c 'dump-config -'          # compare with --check output
   atecc -b <bus> -c 'lock-config'            # IRREVERSIBLE: config, budget, slot types frozen
   atecc -b <bus> -c 'lock-data'              # IRREVERSIBLE: slots stay regenerable (GenKey enabled)
-  python3 make_attest_cert.py --out attest   # ONCE: attestation key in slot %d + its certificate
+  python3 make_attest_cert.py --out attest   # ONCE: attestation key in slot 0 + its certificate
 Then, ON HARDWARE, verify before relying on it (see CONFIG.md "Acceptance test").
-""" % (budget, budget, slots)
+""" % (budget, budget)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--slots", type=int, default=7, help="credential slots (default 7); the next slot is the attestation key")
+    ap.add_argument("--slots", type=int, default=10, help="ECC private-key slots (default 10): slot 0 attestation, 1.. credentials")
     ap.add_argument("--budget", type=int, help="total signatures the chip will allow (1..2097151)")
     ap.add_argument("--base", help="existing 128-byte config dump to patch (atecc read-config)")
     ap.add_argument("-o", "--out", default=".", help="output directory")
@@ -165,17 +174,14 @@ def main():
 
 
 def selftest():
-    # counter encoding is the cryptoauthlib one: spot-check against values computed by its C code
-    # (see tests/test_gen_config.py for the cross-check).
     assert counter_bytes(0) == bytes([0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0])
-    c = build(7, 500)
+    c = build(10, 500)
     lines, ok = describe(c)
     assert ok and len(c) == 128
-    assert c[SLOT_CFG:SLOT_CFG + 2] == bytes([0xA1, 0x20])
+    assert c[SLOT_CFG:SLOT_CFG + 2] == bytes([0x81, 0x20])
     assert c[KEY_CFG:KEY_CFG + 2] == bytes([0x13, 0x00])
-    assert c[SLOT_CFG + 14:SLOT_CFG + 16] == SLOT_ATTEST
-    assert c[SLOT_CFG + 18:SLOT_CFG + 20] == SLOT_UNUSED
-    assert c[SLOT_CFG + 22:SLOT_CFG + 24] == SLOT_UNUSED  # unused
+    assert c[SLOT_CFG + 20:SLOT_CFG + 22] == SLOT_UNUSED
+    assert counter_value(c[COUNTER0:COUNTER0 + 8]) == COUNTER_MAX - 500
     print("selftest ok")
     return 0
 

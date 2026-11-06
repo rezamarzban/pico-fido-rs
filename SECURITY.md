@@ -6,8 +6,11 @@ Experimental firmware; read this before relying on it.
 * **Credential and attestation private keys** are generated in the ATECC608A and never leave it.
   A copy of the Pico's flash contains no private key, only credential handles (slot number +
   fingerprint) inside OpenSK's encrypted credential IDs.
-* **Signature budget**: the chip's LimitedUse counter stops signing after the configured number of
-  signatures. It cannot be reset once the chip's configuration is locked.
+* **Signature budget**: every credential signature first increments the chip's monotonic Counter 0
+  (preloaded to `2097151 - budget`); the chip refuses to count past the maximum, and the firmware
+  then signs nothing. The counter cannot be reset once the chip's configuration is locked. The
+  *counting* is done by the Pico firmware (the provisioned config has no LimitedUse bit), so
+  modified firmware could skip it: the chip alone does not enforce the limit.
 * **Randomness** comes only from the chip's TRNG (a ChaCha20 DRBG seeded from it and re-seeded every
   1 KiB of output). If the chip stops answering the firmware halts; there is no weaker fallback.
 
@@ -19,7 +22,7 @@ Experimental firmware; read this before relying on it.
 * **The chip does not authenticate the Pico.** Code running on the Pico, or a probe on the I2C
   bus, can make the chip sign (until the budget is spent). User presence is the BOOTSEL button,
   checked by the Pico.
-* Evicted credentials (more than 7 registrations) are gone for good.
+* Evicted credentials (more than 9 registrations) are gone for good.
 * Attestation with the per-device key (`use_batch_attestation`, and always for U2F) lets sites
   recognise the device.
 
