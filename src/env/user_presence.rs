@@ -17,8 +17,6 @@ pub struct PicoUserPresence {
     button: BOOTSEL,
     /// The button has been seen released since the current check was armed.
     released: bool,
-    /// The chip's signature budget is used up: refuse every presence check.
-    exhausted: bool,
 }
 
 impl PicoUserPresence {
@@ -26,7 +24,6 @@ impl PicoUserPresence {
         PicoUserPresence {
             button,
             released: false,
-            exhausted: false,
         }
     }
 
@@ -50,11 +47,6 @@ impl PicoUserPresence {
 
 impl UserPresence for PicoUserPresence {
     fn check_init(&mut self) {
-        let left = crate::se::ecdsa::budget_left();
-        if let Some(n) = left {
-            crate::status::SE_LEFT.store(n, portable_atomic::Ordering::Relaxed);
-        }
-        self.exhausted = left == Some(0);
         self.arm();
         LED_SIGNAL.signal(LedState::Confirm);
     }
@@ -64,10 +56,6 @@ impl UserPresence for PicoUserPresence {
         packet: &mut [u8; 64],
         timeout_ms: usize,
     ) -> UserPresenceWaitResult {
-        if self.exhausted {
-            info!("signature budget of the secure element is used up: refusing");
-            return Ok((Err(UserPresenceError::Declined), RecvStatus::Timeout));
-        }
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         loop {
             // Reset / suspend / unplug: give up at once. Checked BEFORE the button and the queue,

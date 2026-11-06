@@ -11,10 +11,10 @@ The chip does six things and nothing else. Everything else runs on the Pico.
 | Public key extraction | GenKey (public mode) | `import()` |
 | Random numbers | Random | `env/rng.rs` (seed of a ChaCha20 DRBG) |
 
-Two chip counters support this, without extra commands in the list above: **Counter 0** is the
-signature budget (counted by the firmware, the chip stops counting at its limit, see below) and **Counter 1** is the
-round-robin cursor that picks the slot for the next credential (it must survive power cycles, and
-the chip counter is the cheapest place for it).
+One chip counter supports this: **Counter 1** is the round-robin cursor that picks the slot for the next
+credential (it must survive power cycles, and the chip counter is the cheapest place for it). **Counter 0** is not
+used: signatures are unlimited (see "Signatures" below). For the OLED the firmware also reads the chip's identity
+once (Info revision + config-zone reads: serial number, I2C address, lock bytes) and Counter 1 every 15 s.
 
 On the Pico: OpenSK with its standard key-value store, ClientPIN (PIN hash in flash),
 SHA-256 / HMAC / AES / HKDF / ECDH in software, BOOTSEL as user presence, USB.
@@ -33,7 +33,7 @@ I2C address 0x60 (config byte 0xC0), 100 kHz. Internal pull-ups are enabled; mos
 their own. The SSD1306 display stays on I2C0 (GP16/GP17), so the two never share a bus. Without the
 chip the firmware halts at start-up (the credential keys and the RNG seed come from it).
 
-## Slot layout (the provisioned chip: `out/atecc608a_general_config.bin`)
+## Slot layout (`gen_atecc_config.py --slots 10` writes `atecc608a_fido_config.bin`; the `atecc608a_general_config.bin` of the author's own chip is not in the repository)
 * **Slot 0: attestation key** (ECC P-256, created once with `tools/make_attest_cert.py`; the firmware
   never overwrites it).
 * **Slots 1-9: credential keys** (9 credentials). Registration `n` uses slot `1 + (n-1) mod 9`; the
@@ -58,16 +58,18 @@ credential slots must never include the slot that holds the attestation key.
 ```
 python3 tools/gen_atecc_config.py --slots 10 --budget 500 -o out   # or --base your_read_config.bin
 atecc ... write-config out/atecc608a_fido_config.bin
-atecc ... counter-init 0 -500        # AFTER write-config (it resets counters). 500 signatures left.
-atecc ... counter-read 0 -r          # must show 500
+# (counter-init 0 is no longer needed: the firmware does not use Counter 0. --budget only fills the
+#  unused counter in the config image, any value works.)
 atecc ... lock-config                # irreversible
 atecc ... lock-data                  # irreversible; GenKey stays enabled on the key slots
 atecc ... ecc-gen 0 pub0.bin         # attestation key (or make_attest_cert.py does it)
 python3 tools/make_attest_cert.py --out attest                     # once: certificate for slot 0
 ```
-`--check cfg.bin` decodes any dumped config (and the shipped `out/atecc608a_general_config.bin`).
+`--check cfg.bin` decodes any dumped config.
 
 ### Attestation key and certificate
+> **Not in the repository:** `tools/make_attest_cert.py` (and its `--selftest`) is described here but missing from `atecc608a/tools/`. Until it is added, U2F attestation cannot be provisioned with these steps.
+
 `tools/make_attest_cert.py` (needs the `cryptoauthlib` and `cryptography` Python packages, the chip on
 a host I2C bus) does GenKey in slot 0, has the chip sign a self-signed X.509 certificate for that
 public key, and writes:
@@ -85,26 +87,24 @@ What attestation is used for: U2F registration always; FIDO2 registration only i
 self-attestation with the credential key). Note the privacy cost of turning it on: the certificate is
 unique to this device, so every site can recognise it.
 
-## Signature budget
-The config has no LimitedUse bit, so the budget is counted by the firmware: before each credential
-signature it increments the chip's Counter 0 (`counter_inc`). The counter starts at
-`2097151 - 500`; at 2097151 the chip refuses to increment and the firmware does not sign. The
-counter lives in the chip and cannot be reset or lowered, but the counting step itself is Pico
-firmware (see SECURITY.md). It is shared by all credential slots (a device-wide total); the
-attestation key does not use it. When it reaches zero the firmware refuses user presence (LED/timeout).
-Never also set LimitedUse on these slots: every signature would count twice.
+## Signatures
+There is no signature budget: the firmware signs as often as it is asked and does not touch Counter 0.
+A chip provisioned earlier with `counter-init 0 -500` keeps that value; it is ignored. The attestation
+key and the credential keys sign the same way (Nonce pass-through + Sign). The price is that nothing in
+the chip limits what code on the Pico, or a probe on the I2C bus, can have signed (see SECURITY.md).
+Never set LimitedUse on these slots unless you want the chip itself to count.
 
 ## Acceptance test on real hardware (do this before locking a chip you care about)
-1. `counter-read 0` shows the budget (500 left); sign 3 times through a browser/`fido2` tool; it drops by exactly 3
-   (a registration signs once more for the attestation statement, with the credential key: expect 1 per use).
-2. On a spare chip set a tiny budget (e.g. 3) and confirm the 4th signature is refused.
-3. Register 10 credentials: the first one must stop working, the other nine must still work.
-4. Unplug/replug: the slot cursor (Counter 1) and budget must persist.
+1. Sign more than 500 times through a browser/`fido2` tool: every signature works and `counter-read 0` does not change.
+2. OLED, second page: serial number, revision (`00006003`) and both lock states match `atecc ... info` / `read-config`.
+3. Register 10 credentials: the first one must stop working, the other nine must still work (the OLED
+   shows `REGS 10`).
+4. Unplug/replug: the slot cursor (Counter 1) must persist.
 5. After the attestation step: a U2F registration succeeds (e.g. webauthn.io with a U2F-only
-   option), and does not change Counter 0.
+   option).
 
 ## What this design does not protect
 * There is no PIN or authentication in the chip. Whoever can talk to the chip on the I2C bus (code
-  running on the Pico, or a probe on GP14/GP15) can ask it to sign, until the budget is used up. The
+  running on the Pico, or a probe on GP14/GP15) can ask it to sign, without limit. The
   PIN (ClientPIN) is checked by the Pico firmware only.
 * The I2C bus is not encrypted.

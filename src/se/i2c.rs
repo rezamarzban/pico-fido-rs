@@ -68,10 +68,19 @@ pub fn init(i2c: I2C1, scl: PIN_15, sda: PIN_14) {
     static CHIP: StaticCell<Atecc<RpBus>> = StaticCell::new();
     let chip = CHIP.init(Atecc::new(RpBus { i2c: bus }));
     ecdsa::install(chip);
-    match ecdsa::budget_left() {
-        Some(left) => {
-            crate::status::SE_LEFT.store(left, portable_atomic::Ordering::Relaxed);
-            info!("ATECC608A ready: {} signatures left", left)
+    match ecdsa::chip_info() {
+        Some(i) => {
+            crate::status::set_se(&i);
+            if let Some(n) = ecdsa::registrations() {
+                crate::status::SE_REGS.store(n, portable_atomic::Ordering::Relaxed);
+            }
+            info!(
+                "ATECC608A ready: serial {=[u8]:x}, revision {=[u8]:x}, config locked {}, data locked {}",
+                &i.serial[..],
+                &i.revision[..],
+                i.config_locked,
+                i.data_locked
+            )
         }
         None => panic!("ATECC608A not found on I2C1 (SDA GP14, SCL GP15, address 0x60)"),
     }

@@ -10,14 +10,27 @@
 //! * While a command is being processed (signature, flash compaction) the display keeps the last
 //!   frame; the BUSY state shows up in the next one.
 //!
-//! Layout (21 characters per line, upper case only):
+//! Two pages of 8 lines (21 characters per line, upper case only), switched every `PAGE_MS`.
+//!
+//! Page 1, the device:
 //! ```text
 //! FIDO READY USB OK           state (READY / BUSY), USB (-- / OK / SLP)
-//! SE 499991 SIGS LEFT         signatures the secure element still allows (SE -- = unknown)
+//! SE OK SIGNS UNLIMITED       secure element answered; signatures are not counted
 //! UP 1:23:45 P1234            uptime, packets handled
 //! RAM 153K/264K HP 12K        RAM in use (static + stack), heap in use
-//! STK 1.2K                    stack now
-//! FW214K ST12/70K W3%         firmware size, key-value store use, erase budget used
+//! STK 1.2K FW214K             stack now, firmware size
+//! ST12/70K WEAR 3%            key-value store use, erase budget used
+//! ```
+//! Page 2, the secure element:
+//! ```text
+//! ATECC608 I2C 0X60           chip family (from the revision), its own I2C address
+//! SN 0123ABCDEF0123456EE      9-byte serial number
+//! REV 00006003                Info(revision)
+//! CONFIG ZONE LOCKED          LockConfig (LOCKED / OPEN)
+//! DATA ZONE LOCKED            LockValue (LOCKED / OPEN)
+//! SLOTS 9 CRED 1 ATTEST       key slots used by the firmware
+//! REGS 12 NEXT SLOT 4         credentials registered (Counter 1), slot for the next one
+//! SIGNATURES UNLIMITED
 //! ```
 use core::cell::UnsafeCell;
 use core::fmt::Write as _;
@@ -29,6 +42,8 @@ use embassy_time::Instant;
 use heapless::String;
 use portable_atomic::Ordering;
 
+use crate::se::ecdsa::{FIRST_CRED_SLOT, SLOTS};
+use crate::se::proto::ADDR_7BIT;
 use crate::status as st;
 
 const ADDR: u8 = 0x3C;
@@ -36,6 +51,8 @@ const W: usize = 128;
 const PAGES: usize = 8;
 const COLS: usize = 21;
 const FRAME_MS: u32 = 500;
+/// Each of the two pages stays this long.
+const PAGE_MS: u32 = 5_000;
 const RETRY_MS: u32 = 5_000;
 /// The first retry after a failed start-up probe comes this early (modules need up to ~100 ms
 /// after power-up before they acknowledge anything).
@@ -91,6 +108,13 @@ fn put_line(buf: &mut [u8; W * PAGES], row: usize, text: &str) {
         let x = base + k * 6;
         buf[x..x + 5].copy_from_slice(glyph(c));
     }
+}
+
+/// Formats one line (cut at `COLS` characters).
+fn put_fmt(buf: &mut [u8; W * PAGES], row: usize, args: core::fmt::Arguments) {
+    let mut s: String<32> = String::new();
+    let _ = s.write_fmt(args);
+    put_line(buf, row, &s);
 }
 
 fn now_ms() -> u32 {
@@ -164,6 +188,60 @@ impl Oled {
     }
 
     fn render(&mut self) {
+        // Two pages, switched every PAGE_MS (the display only has 8 lines).
+        if (now_ms() / PAGE_MS) % 2 == 0 {
+            self.render_device();
+        } else {
+            self.render_chip();
+        }
+    }
+
+    /// Page 2: everything known about the ATECC608A.
+    fn render_chip(&mut self) {
+        let b = &mut self.buf;
+        if !st::SE_PRESENT.load(Ordering::Relaxed) {
+            for r in 0..PAGES {
+                put_line(b, r, "");
+            }
+            put_line(b, 0, "SE NOT ANSWERING");
+            put_fmt(b, 1, format_args!("I2C1 GP14 GP15 0X{:02X}", ADDR_7BIT));
+            return;
+        }
+        let rev = st::SE_REV.load(Ordering::Relaxed);
+        let family = match (rev >> 8) as u8 {
+            0x50 => "ATECC508A",
+            0x60 => "ATECC608",
+            0x20 => "ATSHA204A",
+            _ => "ATECC",
+        };
+        let addr = st::SE_ADDR.load(Ordering::Relaxed);
+        put_fmt(b, 0, format_args!("{} I2C 0X{:02X}", family, addr));
+
+        let (a, c, d) = (
+            st::SE_SN_A.load(Ordering::Relaxed),
+            st::SE_SN_B.load(Ordering::Relaxed),
+            st::SE_SN_C.load(Ordering::Relaxed),
+        );
+        put_fmt(b, 1, format_args!("SN {:08X}{:08X}{:02X}", a, c, d));
+        put_fmt(b, 2, format_args!("REV {:08X}", rev));
+
+        let locks = st::SE_LOCKS.load(Ordering::Relaxed);
+        let lk = |bit: u8| if locks & bit != 0 { "LOCKED" } else { "OPEN" };
+        put_fmt(b, 3, format_args!("CONFIG ZONE {}", lk(st::SE_CFG_LOCKED)));
+        put_fmt(b, 4, format_args!("DATA ZONE {}", lk(st::SE_DATA_LOCKED)));
+        put_fmt(b, 5, format_args!("SLOTS {} CRED 1 ATTEST", SLOTS));
+        let regs = st::SE_REGS.load(Ordering::Relaxed);
+        if regs == st::SE_UNKNOWN {
+            put_fmt(b, 6, format_args!("REGS --"));
+        } else {
+            let next = FIRST_CRED_SLOT as u32 + regs % SLOTS as u32;
+            put_fmt(b, 6, format_args!("REGS {} NEXT SLOT {}", regs, next));
+        }
+        put_line(b, 7, "SIGNATURES UNLIMITED");
+    }
+
+    /// Page 1: state of the firmware and the Pico.
+    fn render_device(&mut self) {
         let mut s: String<32> = String::new();
         let mut line = |buf: &mut [u8; W * PAGES], row: usize, f: &dyn Fn(&mut String<32>)| {
             s.clear();
@@ -182,13 +260,13 @@ impl Oled {
             let _ = write!(s, "FIDO {} USB {}", state, usb);
         });
 
-        // ---- 1: signature budget of the secure element
-        let left = st::SE_LEFT.load(Ordering::Relaxed);
+        // ---- 1: secure element (signatures are not counted)
+        let se_ok = st::SE_PRESENT.load(Ordering::Relaxed);
         line(&mut self.buf, 1, &|s| {
-            let _ = if left == st::SE_UNKNOWN {
-                write!(s, "SE --")
+            let _ = if se_ok {
+                write!(s, "SE OK SIGNS UNLIMITED")
             } else {
-                write!(s, "SE {} SIGS LEFT", left)
+                write!(s, "SE -- NOT ANSWERING")
             };
         });
 
@@ -217,14 +295,14 @@ impl Oled {
             let _ = write!(s, "RAM {}K/{}K HP {}K", ram_k, RAM_TOTAL / 1024, heap_k);
         });
 
-        // ---- 4: stack
+        // ---- 4: stack, firmware size
         let (sw, st10) = kib10(stack);
+        let fw_k = flash_end.saturating_sub(FLASH_BASE) / 1024;
         line(&mut self.buf, 4, &|s| {
-            let _ = write!(s, "STK {}.{}K", sw, st10);
+            let _ = write!(s, "STK {}.{}K FW{}K", sw, st10, fw_k);
         });
 
-        // ---- 5: flash
-        let fw_k = flash_end.saturating_sub(FLASH_BASE) / 1024;
+        // ---- 5: key-value store
         let (su, st_total) = (
             st::STORE_USED.load(Ordering::Relaxed) as usize * 4 / 1024,
             st::STORE_TOTAL.load(Ordering::Relaxed) as usize * 4 / 1024,
@@ -236,10 +314,12 @@ impl Oled {
         let wear = if lt > 0 { Some(lu * 100 / lt) } else { None };
         line(&mut self.buf, 5, &|s| {
             let _ = match wear {
-                Some(w) => write!(s, "FW{}K ST{}/{}K W{}%", fw_k, su, st_total, w),
-                None => write!(s, "FW{}K ST--", fw_k),
+                Some(w) => write!(s, "ST{}/{}K WEAR {}%", su, st_total, w),
+                None => write!(s, "ST--"),
             };
         });
+        put_line(&mut self.buf, 6, "");
+        put_line(&mut self.buf, 7, "");
     }
 
     fn poll(&mut self) {

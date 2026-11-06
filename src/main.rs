@@ -108,7 +108,7 @@ fn main() -> ! {
     let p = embassy_rp::init(Default::default());
     #[cfg(feature = "oled")]
     oled::init(p.I2C0, p.PIN_17, p.PIN_16);
-    // ATECC608A: credential and attestation keys, signing, the signature budget and the RNG seed.
+    // ATECC608A: credential and attestation keys, signing and the RNG seed.
     se::i2c::init(p.I2C1, p.PIN_15, p.PIN_14);
     let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
 
@@ -164,6 +164,9 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
                 last_store_ms = t.max(1);
                 if let Some((u, tot, lu, lt)) = ctap.env().persist().stats() {
                     status::set_store(u, tot, lu, lt);
+                }
+                if let Some(n) = se::ecdsa::registrations() {
+                    status::SE_REGS.store(n, portable_atomic::Ordering::Relaxed);
                 }
             }
         }

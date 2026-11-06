@@ -7,8 +7,8 @@ repository is the RP2040 platform layer around it. **Experimental. Read `SECURIT
 ## What is where
 | In the ATECC608A (`src/se/`) | On the Pico |
 |---|---|
-| 9 credential private keys (GenKey, ECDSA signing; signature budget counted in a chip counter) | OpenSK with its standard key-value store (`src/env/persist.rs`, `flash_store.rs`) |
-| 1 attestation private key (slot 0, created once, not counted) | ClientPIN, PIN hash, credential-ID encryption keys, resident credentials: all OpenSK standard |
+| 9 credential private keys (GenKey, ECDSA signing; unlimited signatures) | OpenSK with its standard key-value store (`src/env/persist.rs`, `flash_store.rs`) |
+| 1 attestation private key (slot 0, created once) | ClientPIN, PIN hash, credential-ID encryption keys, resident credentials: all OpenSK standard |
 | Public-key extraction | SHA-256 / HMAC / AES / HKDF / ECDH in software (`src/se/crypto.rs`) |
 | Random (the only entropy source) | RNG = ChaCha20 DRBG seeded and re-seeded from the chip (`src/env/rng.rs`) |
 | | BOOTSEL as user presence (`src/env/user_presence.rs`), USB HID (`src/usb/`, `src/env/hid.rs`) |
@@ -52,22 +52,19 @@ default: it lets hosts recognise the device). `oled` (default) is an SSD1306 on 
 `build.sh [-s 2|4|8|16] [-u] [-O]` builds a UF2 from the repository (needs network).
 
 ## Provisioning the chip (once per chip)
-See `atecc608a/CONFIG.md`: write and lock the configuration (`tools/gen_atecc_config.py`), set the signature
-budget, then `tools/make_attest_cert.py` creates the attestation key in the chip and its self-signed
+See `atecc608a/CONFIG.md`: write and lock the configuration (`tools/gen_atecc_config.py`), then `tools/make_attest_cert.py` (**this script is not in the repository**: `atecc608a/tools/` has only `gen_atecc_config.py` and `test_gen_config.py`, so the attestation step cannot be run as written) creates the attestation key in the chip and its self-signed
 certificate, which is stored in the token once with OpenSK's `tools/configure.py`.
 
 ## Tests
     sh host-test/run.sh        # OpenSK's library unit tests + host-test/se (chip protocol, command layer,
                                # OpenSK ECDSA adapter incl. attestation slot, against a software chip model)
     python3 atecc608a/tools/test_gen_config.py
-    python3 atecc608a/tools/make_attest_cert.py --selftest
+    # atecc608a/tools/make_attest_cert.py --selftest: script missing from this tree
 
 ## Verification status
-**This revision was not compiled.** The firmware, `host-test/se` and the OpenSK interplay were edited
-without a Rust toolchain and without the OpenSK sources at hand. The two Python tools were run. Before
-anything else: build, run `host-test/run.sh`, then the acceptance test in `atecc608a/CONFIG.md` on a spare
-chip. Never tested on hardware: the chip commands, attestation through OpenSK's attestation store with a
-handle instead of a private key, the RNG (re-seed timing), the OLED lines. USB VID/PID (`0xc0de:0xcafe`)
-are prototype placeholders (`src/usb/mod.rs`).
+**This branch (`atecc1`) was built and tested on all browsers and operating systems** (reported by the
+maintainer, not independently verified). Still run `host-test/run.sh` and the acceptance test in
+`atecc608a/CONFIG.md` on a spare chip before locking a chip you care about. USB VID/PID
+(`0xc0de:0xcafe`) are prototype placeholders (`src/usb/mod.rs`).
 
 `guide.md` is the user guide (udev rule, PIN, registering, LED).

@@ -13,6 +13,8 @@ pub const WORD_IDLE: u8 = 0x02;
 pub const WORD_COMMAND: u8 = 0x03;
 
 pub const OP_COUNTER: u8 = 0x24;
+pub const OP_INFO: u8 = 0x30;
+pub const OP_READ: u8 = 0x02;
 pub const OP_GENKEY: u8 = 0x40;
 pub const OP_NONCE: u8 = 0x16;
 pub const OP_RANDOM: u8 = 0x1B;
@@ -104,6 +106,47 @@ pub const SIGN_EXTERNAL: u8 = 0x80; // sign the message digest held in TempKey
 pub const COUNTER_READ: u8 = 0x00;
 pub const COUNTER_INC: u8 = 0x01;
 pub const RANDOM_MODE: u8 = 0x00; // update the EEPROM seed (normal use)
+pub const INFO_REVISION: u8 = 0x00; // 4 bytes: device revision (00 00 60 xx for the ATECC608)
+pub const READ_CONFIG_32: u8 = 0x80; // config zone, 32-byte block (bit 7 = 32 bytes, zone bits = 0)
+/// Read word address of config block `b` (32 bytes): block << 3.
+pub const fn config_block_addr(b: u8) -> u16 {
+    (b as u16) << 3
+}
+
+/// What the display shows about the chip itself (read once at start-up).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ChipInfo {
+    /// 9-byte serial number (starts 01 23, ends EE).
+    pub serial: [u8; 9],
+    /// Info(revision): 4 bytes, `00 00 60 03` for an ATECC608A/B.
+    pub revision: [u8; 4],
+    /// The chip's own I2C address (7 bit) as set in the configuration.
+    pub i2c_addr: u8,
+    /// LockConfig (config byte 87) is 0x00: the configuration is frozen.
+    pub config_locked: bool,
+    /// LockValue (config byte 86) is 0x00: the data zone is locked.
+    pub data_locked: bool,
+}
+
+/// Builds `ChipInfo` from the Info(revision) answer and config blocks 0 (bytes 0..32) and
+/// 2 (bytes 64..96). Lock bytes: 0x55 = unlocked, anything else (0x00) = locked.
+pub fn parse_info(revision: &[u8], block0: &[u8], block2: &[u8]) -> Result<ChipInfo, Error> {
+    if revision.len() != 4 || block0.len() != 32 || block2.len() != 32 {
+        return Err(Error::Param);
+    }
+    let mut serial = [0u8; 9];
+    serial[..4].copy_from_slice(&block0[..4]); // SN0..SN3
+    serial[4..].copy_from_slice(&block0[8..13]); // SN4..SN8
+    let mut rev = [0u8; 4];
+    rev.copy_from_slice(revision);
+    Ok(ChipInfo {
+        serial,
+        revision: rev,
+        i2c_addr: block0[16] >> 1,
+        data_locked: block2[86 - 64] != 0x55,
+        config_locked: block2[87 - 64] != 0x55,
+    })
+}
 
 /// Counter response: 4 bytes little-endian.
 pub fn counter_value(payload: &[u8]) -> Result<u32, Error> {
@@ -118,6 +161,8 @@ pub fn counter_value(payload: &[u8]) -> Result<u32, Error> {
 pub fn max_exec_ms(opcode: u8) -> u32 {
     match opcode {
         OP_COUNTER => 25,
+        OP_INFO => 10,
+        OP_READ => 10,
         OP_GENKEY => 115,
         OP_NONCE => 29,
         OP_RANDOM => 23,
@@ -130,6 +175,8 @@ pub fn max_exec_ms(opcode: u8) -> u32 {
 pub fn typ_exec_ms(opcode: u8) -> u32 {
     match opcode {
         OP_COUNTER => 20,
+        OP_INFO => 1,
+        OP_READ => 1,
         OP_GENKEY => 59,
         OP_NONCE => 7,
         OP_RANDOM => 15,

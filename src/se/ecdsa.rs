@@ -9,11 +9,9 @@
 //! * The attestation key lives in slot `ATTEST_SLOT` and is created once at provisioning
 //!   (atecc608a/tools/make_attest_cert.py). OpenSK's attestation store holds its handle
 //!   (version 2) where a software firmware would hold the 32-byte private key.
-//! * `sign()` hashes the message (SHA-256) and lets the chip sign the digest. The chip config has
-//!   no LimitedUse bit, so the signature budget is counted here: before every credential
-//!   signature the chip's monotonic Counter 0 is incremented, and the chip refuses to increment
-//!   past `COUNTER_MAX` (the config preloads it with `COUNTER_MAX - budget`). The attestation
-//!   key does not spend the budget.
+//! * `sign()` hashes the message (SHA-256) and lets the chip sign the digest. Signatures are
+//!   unlimited: nothing is counted (Counter 0 is not used any more; the chip config has no
+//!   LimitedUse bit either).
 
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -24,7 +22,7 @@ use opensk::api::rng::Rng;
 use sha2::{Digest, Sha256};
 
 use super::chip::ChipOps;
-use super::proto::Error;
+use super::proto::{ChipInfo, Error};
 
 /// Slot map of the provisioned chip (atecc608a/out/atecc608a_general_config.bin): slots 0-9 are
 /// ECC P-256 private-key slots with GenKey enabled. Slot 0 holds the attestation key (made once,
@@ -39,7 +37,9 @@ pub const HANDLE_CRED: u8 = 1;
 pub const HANDLE_ATTEST: u8 = 2;
 const HANDLE_LEN: usize = 32;
 const FP_LEN: usize = 6;
-/// Counter 0 value at which the chip refuses to count further (datasheet maximum).
+/// Counter 0 value at which the chip refuses to count further (datasheet maximum). Only the
+/// provisioning tools and the host-test chip model still refer to it: the firmware does not
+/// count signatures.
 pub const COUNTER_MAX: u32 = 2_097_151;
 
 type Chip = &'static mut (dyn ChipOps + Send);
@@ -77,9 +77,15 @@ pub fn with_chip<R>(f: impl FnOnce(&mut dyn ChipOps) -> Result<R, Error>) -> Res
     r
 }
 
-/// Remaining signatures before the chip refuses to sign (`None`: chip not reachable).
-pub fn budget_left() -> Option<u32> {
-    with_chip(|c| c.counter(0)).ok().map(|v| COUNTER_MAX.saturating_sub(v))
+/// Serial number, revision, I2C address and lock state of the chip (`None`: chip not reachable).
+pub fn chip_info() -> Option<ChipInfo> {
+    with_chip(|c| c.info()).ok()
+}
+
+/// Credentials registered so far (Counter 1, the slot cursor); `None`: chip not reachable. The
+/// next registration goes to slot `FIRST_CRED_SLOT + count % SLOTS`.
+pub fn registrations() -> Option<u32> {
+    with_chip(|c| c.counter(1)).ok()
 }
 
 /// 32 random bytes from the chip (seed of the RNG, `env/rng.rs`).
@@ -168,11 +174,6 @@ impl EcSecretKey for SeSecretKey {
 
     fn sign(&self, message: &[u8]) -> SeSignature {
         let digest: [u8; 32] = Sha256::digest(message).into();
-        // Spend one unit of the budget first (like a LimitedUse key would). At the limit the chip
-        // refuses to increment, and nothing is signed.
-        if self.slot != ATTEST_SLOT && with_chip(|c| c.counter_inc(0)).is_err() {
-            return SeSignature { r: [0; 32], s: [0; 32] };
-        }
         match with_chip(|c| c.sign(self.slot, &digest)) {
             Ok(sig) => {
                 let mut r = [0u8; 32];
@@ -181,9 +182,8 @@ impl EcSecretKey for SeSecretKey {
                 s.copy_from_slice(&sig[32..]);
                 SeSignature { r, s }
             }
-            // The trait cannot report errors. A refused signature (budget used up, chip gone)
-            // becomes an all-zero signature that no verifier accepts; `PicoUserPresence` already
-            // refuses new operations once `budget_left()` is 0.
+            // The trait cannot report errors. A refused signature (chip gone) becomes an
+            // all-zero signature that no verifier accepts.
             Err(_) => SeSignature { r: [0; 32], s: [0; 32] },
         }
     }
