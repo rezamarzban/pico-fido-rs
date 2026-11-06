@@ -28,26 +28,39 @@ class T(unittest.TestCase):
             self.assertEqual(g.counter_bytes(v).hex(), o, v)
 
     def test_layout(self):
-        c = g.build(7, 100)
+        c = g.build(10, 100)
         lines, ok = g.describe(c)
         self.assertTrue(ok)
-        self.assertEqual(sum("ECC P-256 private key" in l for l in lines), 8)  # 7 credential + attestation
-        self.assertEqual(sum("limited-use" in l for l in lines), 7)
-        self.assertEqual(c[g.SLOT_CFG + 14:g.SLOT_CFG + 16], g.SLOT_ATTEST)
+        self.assertEqual(sum("ECC P-256 private key" in l for l in lines), 10)  # attestation + 9 credentials
+        self.assertEqual(sum("LIMITED-USE" in l for l in lines), 0)
         self.assertEqual(c[g.COUNTER0:g.COUNTER0 + 8], g.counter_bytes(g.COUNTER_MAX - 100))
-        # slots 8..15 are not ECC keys: nothing else is usable in the chip
-        for i in range(8, 16):
+        self.assertEqual(g.counter_value(c[g.COUNTER0:g.COUNTER0 + 8]), g.COUNTER_MAX - 100)
+        for i in range(10, 16):
             self.assertEqual(c[g.SLOT_CFG + 2 * i:g.SLOT_CFG + 2 * i + 2], g.SLOT_UNUSED)
-            self.assertEqual(c[g.KEY_CFG + 2 * i:g.KEY_CFG + 2 * i + 2], g.KEY_UNUSED)
+
+    def test_counter_roundtrip(self):
+        for v in (0, 1, 15, 16, 31, 32, 500, 65535, g.COUNTER_MAX - 500, g.COUNTER_MAX):
+            self.assertEqual(g.counter_value(g.counter_bytes(v)), v)
+
+    def test_the_provisioned_chip_config(self):
+        """atecc608a/out/atecc608a_general_config.bin: slots 0-9 private keys, 500 signatures left."""
+        path = os.path.join(os.path.dirname(__file__), "..", "out", "atecc608a_general_config.bin")
+        c = open(path, "rb").read()
+        self.assertEqual(len(c), 128)
+        for i in range(10):
+            self.assertEqual(c[g.SLOT_CFG + 2 * i:g.SLOT_CFG + 2 * i + 2], g.SLOT_CRED, i)
+            self.assertEqual(c[g.KEY_CFG + 2 * i:g.KEY_CFG + 2 * i + 2], g.KEY_CRED, i)
+        self.assertEqual(g.COUNTER_MAX - g.counter_value(c[g.COUNTER0:g.COUNTER0 + 8]), 500)
+        self.assertEqual(g.counter_value(c[g.COUNTER0 + 8:g.COUNTER0 + 16]), 0)
 
     def test_base_is_patched_not_replaced(self):
         base = bytearray(128); base[16] = 0xB0; base[30] = 0x77
-        c = g.build(8, 10, base)
+        c = g.build(10, 10, base)
         self.assertEqual(c[16], 0xB0)           # I2C address preserved
         self.assertEqual(c[g.SLOT_CFG:g.SLOT_CFG + 2], g.SLOT_CRED)
 
     def test_bounds(self):
-        for s, b in [(0, 1), (16, 1), (7, 0), (7, g.COUNTER_MAX + 1)]:
+        for s, b in [(1, 1), (17, 1), (10, 0), (10, g.COUNTER_MAX + 1)]:
             with self.assertRaises(ValueError):
                 g.build(s, b)
 

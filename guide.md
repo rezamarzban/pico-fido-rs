@@ -43,10 +43,11 @@ LED: fast blink (200 ms on/off) = ready; very fast flicker = busy (or the browse
 almost solid = waiting for your button press.
 
 ## 5. Things to know
-- **Seven credentials at most.** Each credential uses one key slot in the secure element. The 8th registration
+- **Nine credentials at most.** Each credential uses one key slot (1-9) in the secure element. The 10th registration
   overwrites the oldest one, which then stops working.
-- **Signature budget.** The chip allows a fixed number of signatures for its whole life (set when it was provisioned,
-  `atecc608a/CONFIG.md`). When it is used up the key no longer asks for a touch and cannot sign.
+- **Signature budget.** The chip's Counter 0 allows a fixed number of credential signatures for its whole life
+  (500 with the provisioned config). Each signature uses one; the counter cannot be reset. When it is used up the key
+  no longer asks for a touch and cannot sign. The attestation key (U2F) does not use the budget.
 - **Wrong PINs:** the usual CTAP rules apply: after 3 wrong PINs in a row, unplug and replug; after 8 wrong PINs
   without a correct one in between, the PIN is blocked. A correct PIN resets the counts.
 - **Forgotten or blocked PIN:** the only way out is a reset, which **deletes all credentials** from the key store (the

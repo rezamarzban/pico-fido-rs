@@ -24,7 +24,7 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{CryptoRng, RngCore, SeedableRng};
 use se::chip::{Atecc, Bus, ChipOps};
-use se::ecdsa::{self, SeEcdsa, SeSecretKey, ATTEST_SLOT, COUNTER_MAX, HANDLE_ATTEST, SLOTS};
+use se::ecdsa::{self, SeEcdsa, SeSecretKey, ATTEST_SLOT, COUNTER_MAX, FIRST_CRED_SLOT, HANDLE_ATTEST, SLOTS};
 use se::proto::{self, Error};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
@@ -45,6 +45,7 @@ struct Model {
     commands: Vec<u8>, // opcodes seen
     wakes: u32,
     fail_next_wake: u32,
+    no_genkey: Vec<usize>, // slots where GenKey fails (execution error)
 }
 
 fn frame(payload: &[u8]) -> Vec<u8> {
@@ -84,6 +85,9 @@ impl Model {
                     return status(0x0F);
                 }
                 if p1 == proto::GENKEY_CREATE {
+                    if self.no_genkey.contains(&slot) {
+                        return status(0x0F);
+                    }
                     let k = SigningKey::random(self.rng.as_mut().unwrap());
                     self.keys[slot] = Some(k);
                 } else if p1 != proto::GENKEY_PUBLIC {
@@ -112,13 +116,7 @@ impl Model {
                     return status(0x0F);
                 };
                 let Some(k) = &self.keys[slot] else { return status(0x0F) };
-                // Credential slots are LimitedUse, the attestation slot is not.
-                if self.limited && slot != ATTEST_SLOT as usize {
-                    if self.counters[0] >= COUNTER_MAX {
-                        return status(0x0F);
-                    }
-                    self.counters[0] += 1;
-                }
+                // The provisioned config has no LimitedUse bit: the chip does not count signatures.
                 let sig: Signature = k.sign_prehash(&t).unwrap();
                 frame(&sig.to_bytes())
             }
@@ -342,7 +340,7 @@ fn key_lifecycle_through_opensk_traits() {
     bad[0] = HANDLE_ATTEST; // attestation version on a credential slot
     assert!(SeSecretKey::import(&bad).is_none());
     let mut bad = handle.clone();
-    bad[1] = SLOTS; // credential version on the attestation slot
+    bad[1] = ATTEST_SLOT; // credential version on the attestation slot
     assert!(SeSecretKey::import(&bad).is_none());
     let mut bad = handle.clone();
     bad[5] ^= 0xFF; // wrong fingerprint
@@ -358,10 +356,12 @@ fn oldest_credential_is_evicted_after_all_slots_are_used() {
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(2));
     let keys: Vec<_> = (0..SLOTS as usize + 2).map(|_| SeSecretKey::random(&mut rng)).collect();
     let slots: Vec<u8> = keys.iter().map(|k| k.export()[1]).collect();
-    assert_eq!(slots[..SLOTS as usize], (0..SLOTS).collect::<Vec<_>>()[..], "round robin from slot 0");
-    assert_eq!(slots[SLOTS as usize], 0);
+    let first = FIRST_CRED_SLOT;
+    assert_eq!(slots[..SLOTS as usize], (first..first + SLOTS).collect::<Vec<_>>()[..], "round robin over slots 1..=9");
+    assert_eq!(slots[SLOTS as usize], first);
+    assert!(slots.iter().all(|&x| x != ATTEST_SLOT));
     assert_eq!(m.lock().unwrap().counters[1], SLOTS as u32 + 2, "cursor lives in chip counter 1");
-    // Slots 0 and 1 were recycled: their old handles are dead, the others still work.
+    // The first two credential slots were recycled: their old handles are dead, the others still work.
     assert!(SeSecretKey::import(&keys[0].export()).is_none());
     assert!(SeSecretKey::import(&keys[1].export()).is_none());
     for k in &keys[2..] {
@@ -370,8 +370,19 @@ fn oldest_credential_is_evicted_after_all_slots_are_used() {
 }
 
 #[test]
-fn signature_budget_is_enforced_by_the_chip() {
-    // 3 signatures left: counter 0 starts at MAX-3.
+fn a_slot_that_refuses_genkey_is_skipped() {
+    let (_g, m) = install(false, 0);
+    m.lock().unwrap().no_genkey = vec![3, 9];
+    let mut rng = TestRng(ChaCha8Rng::seed_from_u64(5));
+    let slots: Vec<u8> = (0..14).map(|_| SeSecretKey::random(&mut rng).export()[1]).collect();
+    assert!(slots.iter().all(|s| ![3u8, 9, ATTEST_SLOT].contains(s)), "{slots:?}");
+    assert!(slots.iter().any(|&s| s == 4), "the slot after the broken one is used");
+}
+
+#[test]
+fn signature_budget_is_counted_in_chip_counter_0() {
+    // 3 signatures left: counter 0 is preloaded with MAX-3 (as the config does); the firmware
+    // increments it before every credential signature and the chip refuses to count past MAX.
     let (_g, m) = install(true, COUNTER_MAX - 3);
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(3));
     let k = SeSecretKey::random(&mut rng);
@@ -429,18 +440,18 @@ fn provision_attestation(m: &Arc<Mutex<Model>>) -> Vec<u8> {
 
 #[test]
 fn attestation_handle_layout_matches_the_python_tool() {
-    // make_attest_cert.py: bytes([2, 7]) + sha256(pub)[:6] + 24 zero bytes.
+    // make_attest_cert.py: bytes([2, 0]) + sha256(pub)[:6] + 24 zero bytes.
     let pk = [0xA5u8; 64];
     let h = ecdsa::handle(HANDLE_ATTEST, ATTEST_SLOT, &pk);
     assert_eq!(h.len(), 32);
-    assert_eq!(&h[..2], &[2, 7]);
+    assert_eq!(&h[..2], &[2, ATTEST_SLOT]);
     assert_eq!(&h[2..8], &Sha256::digest(pk)[..6]);
     assert!(h[8..].iter().all(|&b| b == 0));
 }
 
 #[test]
 fn attestation_key_signs_without_spending_the_budget() {
-    let (_g, m) = install(true, COUNTER_MAX - 3);
+    let (_g, m) = install(false, COUNTER_MAX - 3);
     let handle = provision_attestation(&m);
     let k = SeSecretKey::import(&handle).expect("attestation handle imports");
     assert_eq!(k.export(), handle, "re-exported handle is the same (version 2)");
@@ -467,7 +478,7 @@ fn attestation_handle_is_checked_against_the_chip() {
     bad[0] = 1;
     assert!(SeSecretKey::import(&bad).is_none());
     let mut bad = handle.clone();
-    bad[1] = 0;
+    bad[1] = FIRST_CRED_SLOT;
     assert!(SeSecretKey::import(&bad).is_none());
 }
 
@@ -478,7 +489,7 @@ fn credential_registration_never_touches_the_attestation_slot() {
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(9));
     for _ in 0..(3 * SLOTS as usize) {
         let k = SeSecretKey::random(&mut rng);
-        assert!(k.export()[1] < SLOTS);
+        assert!((FIRST_CRED_SLOT..FIRST_CRED_SLOT + SLOTS).contains(&k.export()[1]));
     }
     assert!(SeSecretKey::import(&handle).is_some(), "attestation key survived all registrations");
 }
