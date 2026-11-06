@@ -12,9 +12,39 @@ pub const USB_CONFIGURED: u8 = 1;
 pub const USB_SUSPENDED: u8 = 2;
 pub static USB: AtomicU8 = AtomicU8::new(USB_NONE);
 
-/// Signatures the secure element still allows (`SE_UNKNOWN` = not read yet / chip did not answer).
+/// The secure element answered at start-up and its identity below is valid.
+pub static SE_PRESENT: AtomicBool = AtomicBool::new(false);
+/// Serial number (9 bytes: SN0-3, SN4-7, SN8), revision (4 bytes), I2C address, lock bits.
+pub static SE_SN_A: AtomicU32 = AtomicU32::new(0);
+pub static SE_SN_B: AtomicU32 = AtomicU32::new(0);
+pub static SE_SN_C: AtomicU8 = AtomicU8::new(0);
+pub static SE_REV: AtomicU32 = AtomicU32::new(0);
+pub static SE_ADDR: AtomicU8 = AtomicU8::new(0);
+pub const SE_CFG_LOCKED: u8 = 1;
+pub const SE_DATA_LOCKED: u8 = 2;
+pub static SE_LOCKS: AtomicU8 = AtomicU8::new(0);
+/// Credentials registered so far = chip Counter 1 (`SE_UNKNOWN` = not read yet).
 pub const SE_UNKNOWN: u32 = u32::MAX;
-pub static SE_LEFT: AtomicU32 = AtomicU32::new(SE_UNKNOWN);
+pub static SE_REGS: AtomicU32 = AtomicU32::new(SE_UNKNOWN);
+
+/// Stores the chip identity read at start-up.
+pub fn set_se(i: &crate::se::proto::ChipInfo) {
+    let s = &i.serial;
+    SE_SN_A.store(u32::from_be_bytes([s[0], s[1], s[2], s[3]]), Ordering::Relaxed);
+    SE_SN_B.store(u32::from_be_bytes([s[4], s[5], s[6], s[7]]), Ordering::Relaxed);
+    SE_SN_C.store(s[8], Ordering::Relaxed);
+    SE_REV.store(u32::from_be_bytes(i.revision), Ordering::Relaxed);
+    SE_ADDR.store(i.i2c_addr, Ordering::Relaxed);
+    let mut l = 0;
+    if i.config_locked {
+        l |= SE_CFG_LOCKED;
+    }
+    if i.data_locked {
+        l |= SE_DATA_LOCKED;
+    }
+    SE_LOCKS.store(l, Ordering::Relaxed);
+    SE_PRESENT.store(true, Ordering::Relaxed);
+}
 
 /// Key-value store usage and erase-budget use, in store words (0 = not read yet).
 pub static STORE_USED: AtomicU32 = AtomicU32::new(0);

@@ -45,9 +45,10 @@ almost solid = waiting for your button press.
 ## 5. Things to know
 - **Nine credentials at most.** Each credential uses one key slot (1-9) in the secure element. The 10th registration
   overwrites the oldest one, which then stops working.
-- **Signature budget.** The chip's Counter 0 allows a fixed number of credential signatures for its whole life
-  (500 with the provisioned config). Each signature uses one; the counter cannot be reset. When it is used up the key
-  no longer asks for a touch and cannot sign. The attestation key (U2F) does not use the budget.
+- **Unlimited signatures.** Signatures are not counted, there is no budget. (If your chip was provisioned with the old
+  500-signature Counter 0, that counter is simply ignored now.)
+- **OLED.** Two pages, switching every 5 s: the device (state, USB, uptime, RAM, flash) and the ATECC608A (I2C
+  address, serial number, revision, config/data lock state, registered credentials and the next slot).
 - **Wrong PINs:** the usual CTAP rules apply: after 3 wrong PINs in a row, unplug and replug; after 8 wrong PINs
   without a correct one in between, the PIN is blocked. A correct PIN resets the counts.
 - **Forgotten or blocked PIN:** the only way out is a reset, which **deletes all credentials** from the key store (the

@@ -1,6 +1,6 @@
 //! Host tests for src/se: the real driver code runs against a byte-level software model of the
 //! ATECC608A (frame parsing, CRC, wake/idle/sleep, busy NACKs, GenKey/Sign/Counter/Random, the
-//! LimitedUse counter, the attestation slot).
+//! unlimited signing without any counter, chip identity, the attestation slot).
 
 extern crate alloc;
 
@@ -46,6 +46,7 @@ struct Model {
     wakes: u32,
     fail_next_wake: u32,
     no_genkey: Vec<usize>, // slots where GenKey fails (execution error)
+    config: Vec<u8>,       // 128-byte config zone (serial number, I2C address, lock bytes)
 }
 
 fn frame(payload: &[u8]) -> Vec<u8> {
@@ -60,6 +61,19 @@ fn status(code: u8) -> Vec<u8> {
     frame(&[code])
 }
 
+/// A config zone like a provisioned ATECC608A: serial 01 23 .. EE, revision 00 00 60 03, I2C
+/// address 0xC0 (8-bit), LockValue/LockConfig = 0x00 (both zones locked).
+fn config_zone() -> Vec<u8> {
+    let mut c = vec![0u8; 128];
+    c[..4].copy_from_slice(&[0x01, 0x23, 0xA1, 0xB2]);
+    c[4..8].copy_from_slice(&[0x00, 0x00, 0x60, 0x03]);
+    c[8..13].copy_from_slice(&[0xC3, 0xD4, 0xE5, 0xF6, 0xEE]);
+    c[16] = 0xC0;
+    c[86] = 0x00;
+    c[87] = 0x00;
+    c
+}
+
 impl Model {
     fn new(limited: bool, counter0: u32) -> Self {
         Model {
@@ -67,6 +81,7 @@ impl Model {
             counters: [counter0, 0],
             limited,
             rng: Some(ChaCha8Rng::seed_from_u64(7)),
+            config: config_zone(),
             ..Default::default()
         }
     }
@@ -134,6 +149,20 @@ impl Model {
                     return status(0x03);
                 }
                 frame(&self.counters[id].to_le_bytes())
+            }
+            proto::OP_INFO => {
+                if p1 != proto::INFO_REVISION {
+                    return status(0x03);
+                }
+                frame(&self.config[4..8])
+            }
+            proto::OP_READ => {
+                // Config zone, 32-byte blocks only (the only form the firmware uses).
+                let block = (p2 >> 3) as usize;
+                if p1 != proto::READ_CONFIG_32 || p2 & 7 != 0 || block > 3 {
+                    return status(0x03);
+                }
+                frame(&self.config[block * 32..block * 32 + 32])
             }
             _ => status(0x03),
         }
@@ -380,30 +409,61 @@ fn a_slot_that_refuses_genkey_is_skipped() {
 }
 
 #[test]
-fn signature_budget_is_counted_in_chip_counter_0() {
-    // 3 signatures left: counter 0 is preloaded with MAX-3 (as the config does); the firmware
-    // increments it before every credential signature and the chip refuses to count past MAX.
-    let (_g, m) = install(true, COUNTER_MAX - 3);
+fn signatures_are_unlimited_and_not_counted() {
+    // Counter 0 sits at its maximum (a used-up budget of the old firmware): the chip would refuse
+    // to count, but nothing is counted any more, so every signature still verifies.
+    let (_g, m) = install(true, COUNTER_MAX);
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(3));
     let k = SeSecretKey::random(&mut rng);
-    assert_eq!(ecdsa::budget_left(), Some(3));
-    for _ in 0..3 {
-        check_sig(&k, b"ok");
+    for i in 0..50u8 {
+        check_sig(&k, &[i; 8]);
     }
-    assert_eq!(ecdsa::budget_left(), Some(0));
-    // The adapter cannot report errors: the 4th signature is an all-zero one nobody accepts.
-    let der = k.sign(b"too many").to_der();
-    let mut x = ([0u8; 32], [0u8; 32]);
-    k.public_key().to_coordinates(&mut x.0, &mut x.1);
-    let mut sec1 = vec![4u8];
-    sec1.extend_from_slice(&x.0);
-    sec1.extend_from_slice(&x.1);
-    let vk = VerifyingKey::from_sec1_bytes(&sec1).unwrap();
-    match Signature::from_der(&der) {
-        Ok(sig) => assert!(vk.verify_prehash(&Sha256::digest(b"too many"), &sig).is_err()),
-        Err(_) => {} // zero r/s is not even a valid signature encoding
-    }
-    assert_eq!(m.lock().unwrap().counters[0], COUNTER_MAX);
+    let g = m.lock().unwrap();
+    assert_eq!(g.counters[0], COUNTER_MAX, "Counter 0 is never touched");
+    assert_eq!(g.counters[1], 1, "only Counter 1 (slot cursor, one GenKey) moved");
+    assert_eq!(g.commands.iter().filter(|&&c| c == proto::OP_SIGN).count(), 50);
+}
+
+#[test]
+fn signing_does_not_use_counter_commands() {
+    let (_g, m) = install(false, 0);
+    let mut rng = TestRng(ChaCha8Rng::seed_from_u64(4));
+    let k = SeSecretKey::random(&mut rng);
+    let before = m.lock().unwrap().commands.len();
+    check_sig(&k, b"hello");
+    let g = m.lock().unwrap();
+    assert_eq!(&g.commands[before..], &[proto::OP_NONCE, proto::OP_SIGN], "Nonce + Sign, nothing else");
+}
+
+#[test]
+fn chip_info_and_registration_count() {
+    let (_g, _m) = install(false, 0);
+    let i = ecdsa::chip_info().expect("chip answers");
+    assert_eq!(i.serial, [0x01, 0x23, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0xEE]);
+    assert_eq!(i.revision, [0x00, 0x00, 0x60, 0x03]);
+    assert_eq!(i.i2c_addr, 0x60);
+    assert!(i.config_locked && i.data_locked);
+    assert_eq!(ecdsa::registrations(), Some(0));
+    let mut rng = TestRng(ChaCha8Rng::seed_from_u64(6));
+    let _ = SeSecretKey::random(&mut rng);
+    let _ = SeSecretKey::random(&mut rng);
+    assert_eq!(ecdsa::registrations(), Some(2));
+}
+
+#[test]
+fn chip_info_parsing() {
+    let mut b0 = [0u8; 32];
+    let mut b2 = [0x55u8; 32]; // unlocked zones read 0x55
+    b0[16] = 0xC0;
+    let i = proto::parse_info(&[0, 0, 0x60, 2], &b0, &b2).unwrap();
+    assert!(!i.config_locked && !i.data_locked);
+    b2[86 - 64] = 0x00; // LockValue
+    let i = proto::parse_info(&[0, 0, 0x60, 2], &b0, &b2).unwrap();
+    assert!(i.data_locked && !i.config_locked);
+    b2[87 - 64] = 0x00; // LockConfig
+    assert!(proto::parse_info(&[0, 0, 0x60, 2], &b0, &b2).unwrap().config_locked);
+    assert_eq!(proto::parse_info(&[0, 0, 0x60], &b0, &b2), Err(Error::Param));
+    assert_eq!(proto::parse_info(&[0, 0, 0x60, 2], &b0[..31], &b2), Err(Error::Param));
 }
 
 #[test]
@@ -415,7 +475,8 @@ fn chip_random_and_missing_chip() {
     assert_ne!(a, [0u8; 32]);
     ecdsa::uninstall();
     assert_eq!(ecdsa::chip_random(), Err(Error::Bus));
-    assert_eq!(ecdsa::budget_left(), None);
+    assert_eq!(ecdsa::chip_info(), None);
+    assert_eq!(ecdsa::registrations(), None);
     assert!(!ecdsa::installed());
 }
 
@@ -450,7 +511,7 @@ fn attestation_handle_layout_matches_the_python_tool() {
 }
 
 #[test]
-fn attestation_key_signs_without_spending_the_budget() {
+fn attestation_key_signs_without_touching_counter_0() {
     let (_g, m) = install(false, COUNTER_MAX - 3);
     let handle = provision_attestation(&m);
     let k = SeSecretKey::import(&handle).expect("attestation handle imports");
@@ -458,7 +519,7 @@ fn attestation_key_signs_without_spending_the_budget() {
     for _ in 0..10 {
         check_sig(&k, b"authData || clientDataHash");
     }
-    assert_eq!(ecdsa::budget_left(), Some(3), "attestation does not use the signature budget");
+    assert_eq!(m.lock().unwrap().counters[0], COUNTER_MAX - 3, "no signature is counted");
 }
 
 #[test]

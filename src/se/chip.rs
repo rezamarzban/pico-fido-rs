@@ -28,6 +28,8 @@ pub trait ChipOps {
     fn sign(&mut self, slot: u8, digest: &[u8; 32]) -> Result<[u8; 64], Error>;
     fn counter(&mut self, id: u8) -> Result<u32, Error>;
     fn counter_inc(&mut self, id: u8) -> Result<u32, Error>;
+    /// Serial number, revision, I2C address and lock state (Info + two config-zone reads).
+    fn info(&mut self) -> Result<proto::ChipInfo, Error>;
 }
 
 pub struct Atecc<B: Bus> {
@@ -199,6 +201,19 @@ impl<B: Bus> ChipOps for Atecc<B> {
             let mut r = [0u8; proto::MAX_RESP];
             let n = c.command(proto::OP_COUNTER, proto::COUNTER_INC, id as u16, &[], &mut r)?;
             proto::counter_value(&r[..n])
+        })
+    }
+
+    fn info(&mut self) -> Result<proto::ChipInfo, Error> {
+        self.session(|c| {
+            let mut r = [0u8; proto::MAX_RESP];
+            let n = c.command(proto::OP_INFO, proto::INFO_REVISION, 0, &[], &mut r)?;
+            let revision: [u8; 4] = fixed(&r[..n])?;
+            let n = c.command(proto::OP_READ, proto::READ_CONFIG_32, proto::config_block_addr(0), &[], &mut r)?;
+            let block0: [u8; 32] = fixed(&r[..n])?;
+            let n = c.command(proto::OP_READ, proto::READ_CONFIG_32, proto::config_block_addr(2), &[], &mut r)?;
+            let block2: [u8; 32] = fixed(&r[..n])?;
+            proto::parse_info(&revision, &block0, &block2)
         })
     }
 }
