@@ -184,3 +184,10 @@ zero-programmed, then read back; the area must read uniformly 0xFF or 0x00). If 
 update cannot be determined, the device refuses to use any key until a CTAP reset. After a failed wipe in `set_pin`
 the new record is already the one loaded at boot: set the PIN again in the same session (it retries the erase),
 otherwise a CTAP reset is needed. A failed reset keeps its marker and is repeated at the next boot.
+
+## Secure-element mode (`se_atecc`)
+* **Protected:** credential private keys are generated in the ATECC608A and never leave it; a flash copy holds only handles (slot + public-key fingerprint). The chip enforces the signature budget (Counter 0), which cannot be reset after the config zone is locked.
+* **Not protected:** the chip does not authenticate the Pico unless `se_pin` is used. Code on the Pico, or a probe on the unencrypted I2C bus, can have the chip sign until the budget is spent. The seed vault, wrapping keys, PIN verifier, resident credentials and RNG state stay on the Pico and keep the protections described above.
+* **Availability:** without a working chip the firmware halts at start-up; with the budget used up it refuses user presence. Evicted credentials (more than 7 registrations) are gone for good.
+* **Chip-side PIN (`se_pin`, optional):** the chip refuses to sign without the PIN key (slot 11), so a wrong PIN is stopped by the chip itself, but each guess spends budget, the PIN key cannot be changed after `lock-data`, and the key sits in RAM until power-off.
+* **Unverified:** this mode was not compiled for the RP2040 or run on hardware; the chip commands follow the datasheet and are host-tested against a software model only. Run the acceptance test in `atecc608a/CONFIG.md` on a spare chip before locking one.
