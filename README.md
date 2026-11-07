@@ -2,7 +2,7 @@
 
 A FIDO2 / U2F security key for the Raspberry Pi Pico (RP2040), written in Rust with Embassy. The CTAP
 protocol itself is **Google's OpenSK library** (Apache-2.0); this repository is the RP2040 platform layer
-around it (USB, flash store, button, RNG). This branch adds a PIN-wrapped master-key vault to the OpenSK-based firmware. **Experimental. Built and tested on a Raspberry Pi Pico (Linux, Windows, Android). Read `SECURITY.md` before relying on it.**
+around it (USB, flash store, button, RNG). This branch is `openSK-based-se5` (PIN-wrapped vault, PUF, RAM guard) plus an ATECC608A secure-element mode, the default feature `se_atecc` (see "Secure-element mode"). **Experimental. The secure-element mode was never compiled or run on a Pico; the Pico-tested statements below apply to the software-only firmware (`openSK-based-se5`, or this branch built with `build.sh -X`). Read `SECURITY.md` before relying on it.**
 
 ## Architecture
 | Part | Where |
@@ -30,7 +30,7 @@ pin, rebuild, retest on hardware and update the file.
 ## Flash layout
 The **last 92 KiB** of flash are kept out of the linker's FLASH region (`build.rs`):
 * the last **12 KiB** (`VAULT_BYTES`) are the vault: `[PIN retry counter][seed slot 0][seed slot 1]` (`src/vault.rs`);
-* the **4 KiB** below it (`PUF_BYTES`) hold the SRAM-PUF helper data (`src/puf.rs`);
+* the **8 KiB** below it (`PUF_BYTES`, two 4 KiB helper slots, see "SRAM PUF") hold the SRAM-PUF helper data (`src/puf.rs`);
 * the **72 KiB** below that (18 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store. (Older images used 19 pages and one 4 KiB PUF sector: a device flashed with them must be erased and reset, the store is re-formatted.)
 
 With the `sram_puf` feature (default) `build.rs` also takes the first 512 bytes of RAM out of the linker's RAM: no
@@ -72,7 +72,7 @@ commit it; `build.sh` then builds `--locked` only.
 fetches OpenSK at the pinned commit (or the submodule commit), installs the toolchain and `elf2uf2-rs`, builds with
 the right `--features` (`-s` flash size in MiB, `-u` adds the USB serial number) and writes
 `out/pico-fido-rs-<N>m.uf2`. Hold BOOTSEL while plugging in and copy the file to the `RPI-RP2` drive. It builds the
-*committed* revision of the repository. **The default `-b` is `openSK-based-se4`** (this branch); pass `-b` to build another branch. With a committed `Cargo.lock` the script builds with `--locked` only and fails instead of resolving newer crates; without one it warns and builds unlocked. This script itself was only syntax-checked; the maintainer's Colab build
+*committed* revision of the repository. **The default `-b` is `openSK-based-se5`** (the software-only firmware, not this branch): pass `-b atecc-se1`. With a committed `Cargo.lock` the script builds with `--locked` only and fails instead of resolving newer crates; without one it warns and builds unlocked. This script itself was only syntax-checked; the maintainer's Colab build
 (same toolchain and features) is what was run on hardware.
 
 ## Watchdog (optional)
@@ -235,6 +235,8 @@ exists and were removed. **Nothing in this repository tests `src/env/*`, the USB
 they are checked on hardware only.
 
 ## Verification status (be honest about it)
+This section describes the software-only firmware (`openSK-based-se5`). For the `se_atecc` mode nothing was compiled for the RP2040 or run on hardware (see "Secure-element mode").
+
 Reported by the maintainer (not independently verified): this branch was built and flashed to a Raspberry Pi Pico and tested on hardware, and
 the OpenSK-based firmware family (this branch included) **works on Linux, Windows and Android**. The base firmware was built with the Colab script
 (`nightly-2026-06-03`, `flash_2m`, no `usb_serial`, size-optimised release profile), flashed to a Pico, and
@@ -258,11 +260,13 @@ Checked while preparing this tree:
 
 
 ## Secure-element mode (ATECC608A)
+Default build feature `se_atecc` (`build.sh -X` disables it and gives the software-key firmware of `openSK-based-se5`): every
+credential key is created and used inside an ATECC608A on I2C1 (SDA GP14, SCL GP15, address 0x60). The chip does GenKey, ECDSA
+signing and the signature budget (LimitedUse slots + Counter 0, enforced by the chip), keeps the slot cursor in Counter 1, and
+its TRNG is XORed into the RNG. See `atecc608a/CONFIG.md` (wiring, config, provisioning) and `atecc608a/tools/gen_atecc_config.py`.
+Host tests: `host-test/run.sh` (includes `host-test/se`, against a software model of the chip).
 
-Default build feature `se_atecc` (`-X` in build.sh disables it): every credential key lives in an
-ATECC608A on I2C1 (SDA GP14, SCL GP15); signing, the signature budget and extra entropy are done by
-the chip. See `atecc608a/CONFIG.md` (wiring, config, provisioning, what is still software) and
-`atecc608a/tools/gen_atecc_config.py`. Host tests: `host-test/run.sh` (includes `host-test/se`).
-**The firmware changes of this mode were not compiled for the RP2040** (no thumbv6m toolchain was
-available); the protocol, command layer and OpenSK adapter are host-tested against a software model
-of the chip.
+* **Credential limit:** 8 credentials (`SLOTS` in `src/se/ecdsa.rs`; feature `se_slots_16` uses 16, but only after your chip accepted private keys in slots 8-15). The next registration overwrites the oldest key in the chip and that credential stops working.
+* **Chip required:** if the chip is missing or does not answer, the firmware halts at start-up. When the signature budget is used up it refuses user presence. The budget is shared by all slots and cannot be raised after the config zone is locked.
+* **Still in software on the Pico:** the seed vault, credential-ID wrapping keys, the PIN verifier and retry counter, hmac-secret, resident credentials and SHA/HMAC/AES/HKDF/ECDH (see `SECURITY.md`).
+* **Not verified:** **the firmware changes of this mode were not compiled for the RP2040 and never run on hardware**; the protocol, command layer and OpenSK adapter are only host-tested against the software chip model.
