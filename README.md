@@ -30,7 +30,7 @@ pin, rebuild, retest on hardware and update the file.
 ## Flash layout
 The **last 92 KiB** of flash are kept out of the linker's FLASH region (`build.rs`):
 * the last **12 KiB** (`VAULT_BYTES`) are the vault: `[PIN retry counter][seed slot 0][seed slot 1]` (`src/vault.rs`);
-* the **4 KiB** below it (`PUF_BYTES`) hold the SRAM-PUF helper data (`src/puf.rs`);
+* the **8 KiB** below it (`PUF_BYTES`, two 4 KiB helper slots, see "SRAM PUF") hold the SRAM-PUF helper data (`src/puf.rs`);
 * the **72 KiB** below that (18 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store. (Older images used 19 pages and one 4 KiB PUF sector: a device flashed with them must be erased and reset, the store is re-formatted.)
 
 With the `sram_puf` feature (default) `build.rs` also takes the first 512 bytes of RAM out of the linker's RAM: no
@@ -72,7 +72,7 @@ commit it; `build.sh` then builds `--locked` only.
 fetches OpenSK at the pinned commit (or the submodule commit), installs the toolchain and `elf2uf2-rs`, builds with
 the right `--features` (`-s` flash size in MiB, `-u` adds the USB serial number) and writes
 `out/pico-fido-rs-<N>m.uf2`. Hold BOOTSEL while plugging in and copy the file to the `RPI-RP2` drive. It builds the
-*committed* revision of the repository. **The default `-b` is `openSK-based-se4`** (this branch); pass `-b` to build another branch. With a committed `Cargo.lock` the script builds with `--locked` only and fails instead of resolving newer crates; without one it warns and builds unlocked. This script itself was only syntax-checked; the maintainer's Colab build
+*committed* revision of the repository. **The default `-b` is `openSK-based-se5`** (this branch); pass `-b` to build another branch. With a committed `Cargo.lock` the script builds with `--locked` only and fails instead of resolving newer crates; without one it warns and builds unlocked. This script itself was only syntax-checked; the maintainer's Colab build
 (same toolchain and features) is what was run on hardware.
 
 ## Watchdog (optional)
