@@ -49,18 +49,18 @@ Needs the **nightly** pinned in `rust-toolchain.toml` and `flip-link`. Release b
 Enable **exactly one** `flash_*` feature. `usb_serial` adds the flash unique ID as USB serial number (off by
 default: it lets hosts recognise the device). `oled` (default) is an SSD1306 on I2C0 (SDA GP16, SCL GP17,
 0x3C); build without it by leaving it out of `--features`. **Commit `Cargo.lock`** (none in this tree).
-`build.sh [-s 2|4|8|16] [-u] [-O]` builds a UF2 from the repository (needs network).
+`build.sh [-s 2|4|8|16] [-u] [-O]` builds a UF2 from the repository (needs network); its default `-b` is `openSK-based-se5` (a different firmware), so pass `-b atecc0`.
 
 ## Provisioning the chip (once per chip)
 See `atecc608a/CONFIG.md`: write and lock the configuration (`tools/gen_atecc_config.py`), set the signature
-budget, then `tools/make_attest_cert.py` creates the attestation key in the chip and its self-signed
+budget, then `tools/make_attest_cert.py` (**this script is not in the repository**: `atecc608a/tools/` has only `gen_atecc_config.py` and `test_gen_config.py`, so the attestation step cannot be run as written) creates the attestation key in the chip and its self-signed
 certificate, which is stored in the token once with OpenSK's `tools/configure.py`.
 
 ## Tests
     sh host-test/run.sh        # OpenSK's library unit tests + host-test/se (chip protocol, command layer,
                                # OpenSK ECDSA adapter incl. attestation slot, against a software chip model)
     python3 atecc608a/tools/test_gen_config.py
-    python3 atecc608a/tools/make_attest_cert.py --selftest
+    # atecc608a/tools/make_attest_cert.py --selftest: script missing from this tree
 
 ## Verification status
 **This revision was not compiled.** The firmware, `host-test/se` and the OpenSK interplay were edited

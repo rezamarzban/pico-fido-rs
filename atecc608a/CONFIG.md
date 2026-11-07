@@ -60,6 +60,8 @@ documentation: the budget is whatever you set with `counter-init`). Check any du
 `gen_atecc_config.py --check cfg.bin`.
 
 ### Attestation key and certificate
+> **Not in the repository:** `tools/make_attest_cert.py` (and its `--selftest`) is described here but missing from `atecc608a/tools/`. Until it is added, U2F attestation cannot be provisioned with these steps.
+
 `tools/make_attest_cert.py` (needs the `cryptoauthlib` and `cryptography` Python packages, the chip on
 a host I2C bus) does GenKey in slot 7, has the chip sign a self-signed X.509 certificate for that
 public key, and writes:
