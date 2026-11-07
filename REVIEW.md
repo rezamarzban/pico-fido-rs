@@ -15,7 +15,7 @@ for its PIN-wrapped vault; the findings, parameters (for example Argon2 96 KiB, 
 | U2F (CTAP1) | none | `ctap1` feature (attestation key must be provisioned) |
 | Credentials | stateless, derived from one master key, ES256 only | OpenSK credential model (store-backed, discoverable credentials possible) |
 | PIN protection of key at rest | Argon2id wrapping of the master key | Argon2id wrapping of a 32-byte seed in the vault (`src/wrap.rs`, `src/vault.rs`); OpenSK master keys derived from it; resident credentials encrypted (`src/env/harden.rs`). No PIN hash stored. Without a PIN: seed masked with the SRAM-PUF key and authenticated (in clear only in a build without `sram_puf`) |
-| Flash use | 12 KiB (two key slots + retry counter) | 12 KiB vault + 4 KiB SRAM-PUF helper + 76 KiB `wasefire-store` (`src/env/flash_store.rs`) |
+| Flash use | 12 KiB (two key slots + retry counter) | 12 KiB vault + 8 KiB SRAM-PUF helpers (two slots) + 72 KiB `wasefire-store` (`src/env/flash_store.rs`) |
 | Heap | 160 KiB (Argon2) | 128 KiB (OpenSK); Argon2 uses a separate static 64 KiB buffer |
 | Concurrency | single executor, cooperative | OpenSK blocking in thread mode, USB/LED on an interrupt executor, packet queues in between |
 | Touch | BOOTSEL, fresh press (own code) | BOOTSEL, fresh press via OpenSK's `UserPresence` (`src/env/user_presence.rs`) |

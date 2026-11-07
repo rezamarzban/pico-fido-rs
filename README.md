@@ -30,7 +30,7 @@ pin, rebuild, retest on hardware and update the file.
 ## Flash layout
 The **last 92 KiB** of flash are kept out of the linker's FLASH region (`build.rs`):
 * the last **12 KiB** (`VAULT_BYTES`) are the vault: `[PIN retry counter][seed slot 0][seed slot 1]` (`src/vault.rs`);
-* the **4 KiB** below it (`PUF_BYTES`) hold the SRAM-PUF helper data (`src/puf.rs`);
+* the **8 KiB** below it (`PUF_BYTES`, two 4 KiB helper slots, see "SRAM PUF") hold the SRAM-PUF helper data (`src/puf.rs`);
 * the **72 KiB** below that (18 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store. (Older images used 19 pages and one 4 KiB PUF sector: a device flashed with them must be erased and reset, the store is re-formatted.)
 
 With the `sram_puf` feature (default) `build.rs` also takes the first 512 bytes of RAM out of the linker's RAM: no
