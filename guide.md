@@ -46,6 +46,7 @@ almost solid = waiting for your button press; **3 short blinks, then a pause = t
 key is locked** (unplug it for about 10 seconds and plug it in again; if it persists, see `SECURITY.md`).
 
 ## 5. Things to know
+- **Secure-element builds (`se_atecc`, the default here):** the key needs the ATECC608A and does not start without it. At most 8 credentials fit: the next registration overwrites the oldest one, which then stops working. The chip allows a fixed number of signatures for its whole life; when it is used up the key no longer asks for a touch (`atecc608a/CONFIG.md`). Not tested on hardware.
 - **"Hardware failure" when entering the PIN:** with the SRAM PUF the key is re-read from RAM at power-up. If the pattern
   could not be recovered (for example after a very short unplug), unplug the key for about 10 seconds and plug it in
   again. This is not counted as a wrong PIN.
