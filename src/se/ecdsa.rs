@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use super::chip::ChipOps;
 use super::proto::{ChipInfo, Error};
 
-/// Slot map of the provisioned chip (atecc608a/out/atecc608a_general_config.bin): slots 0-9 are
+/// Slot map of the reference config (atecc608a/out/atecc608a_general_config.bin): slots 0-9 are
 /// ECC P-256 private-key slots with GenKey enabled. Slot 0 holds the attestation key (made once,
 /// never overwritten by the firmware); slots 1..=9 are credential slots. Slots 10-15 are not used.
 pub const ATTEST_SLOT: u8 = 0;

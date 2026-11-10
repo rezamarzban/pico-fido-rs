@@ -28,41 +28,42 @@ class T(unittest.TestCase):
             self.assertEqual(g.counter_bytes(v).hex(), o, v)
 
     def test_layout(self):
-        c = g.build(10, 100)
+        c = g.build(10)
         lines, ok = g.describe(c)
         self.assertTrue(ok)
         self.assertEqual(sum("ECC P-256 private key" in l for l in lines), 10)  # attestation + 9 credentials
         self.assertEqual(sum("LIMITED-USE" in l for l in lines), 0)
-        self.assertEqual(c[g.COUNTER0:g.COUNTER0 + 8], g.counter_bytes(g.COUNTER_MAX - 100))
-        self.assertEqual(g.counter_value(c[g.COUNTER0:g.COUNTER0 + 8]), g.COUNTER_MAX - 100)
+        self.assertEqual(c[g.COUNTER0:g.COUNTER0 + 16], g.COUNTER_REF * 2)
         for i in range(10, 16):
-            self.assertEqual(c[g.SLOT_CFG + 2 * i:g.SLOT_CFG + 2 * i + 2], g.SLOT_UNUSED)
+            self.assertEqual(c[g.SLOT_CFG + 2 * i:g.SLOT_CFG + 2 * i + 2], g.UNUSED_SLOT_CFG[i])
 
     def test_counter_roundtrip(self):
         for v in (0, 1, 15, 16, 31, 32, 500, 65535, g.COUNTER_MAX - 500, g.COUNTER_MAX):
             self.assertEqual(g.counter_value(g.counter_bytes(v)), v)
 
     def test_the_provisioned_chip_config(self):
-        """atecc608a/out/atecc608a_general_config.bin: slots 0-9 private keys, 500 signatures left."""
+        """atecc608a/out/atecc608a_general_config.bin: slots 0-9 private keys, the attached general I2C config."""
         path = os.path.join(os.path.dirname(__file__), "..", "out", "atecc608a_general_config.bin")
         c = open(path, "rb").read()
         self.assertEqual(len(c), 128)
         for i in range(10):
             self.assertEqual(c[g.SLOT_CFG + 2 * i:g.SLOT_CFG + 2 * i + 2], g.SLOT_CRED, i)
             self.assertEqual(c[g.KEY_CFG + 2 * i:g.KEY_CFG + 2 * i + 2], g.KEY_CRED, i)
-        self.assertEqual(g.COUNTER_MAX - g.counter_value(c[g.COUNTER0:g.COUNTER0 + 8]), 500)
-        self.assertEqual(g.counter_value(c[g.COUNTER0 + 8:g.COUNTER0 + 16]), 0)
+        self.assertEqual(c[g.COUNTER0:g.COUNTER0 + 16], g.COUNTER_REF * 2)
+        self.assertEqual(c[g.I2C_ENABLE], 1)
+        self.assertEqual(c[g.I2C_ADDR], 0xC0)
+        self.assertEqual(g.build(10), c)   # the generator reproduces the shipped image byte for byte
 
     def test_base_is_patched_not_replaced(self):
         base = bytearray(128); base[16] = 0xB0; base[30] = 0x77
-        c = g.build(10, 10, base)
+        c = g.build(10, base)
         self.assertEqual(c[16], 0xB0)           # I2C address preserved
         self.assertEqual(c[g.SLOT_CFG:g.SLOT_CFG + 2], g.SLOT_CRED)
 
     def test_bounds(self):
-        for s, b in [(1, 1), (17, 1), (10, 0), (10, g.COUNTER_MAX + 1)]:
+        for s in (1, 17):
             with self.assertRaises(ValueError):
-                g.build(s, b)
+                g.build(s)
 
 
 

@@ -34,7 +34,7 @@ I2C address 0x60 (config byte 0xC0), 100 kHz. Internal pull-ups are enabled; mos
 their own. The SSD1306 display stays on I2C0 (GP16/GP17), so the two never share a bus. Without the
 chip the firmware halts at start-up (the credential keys and the RNG seed come from it).
 
-## Slot layout (the provisioned chip: `out/atecc608a_general_config.bin`)
+## Slot layout (the config image: `out/atecc608a_general_config.bin`)
 * **Slot 0: attestation key** (ECC P-256, created once with `tools/make_attest_cert.py`; the firmware
   never overwrites it).
 * **Slots 1-9: credential keys** (9 credentials). A registration takes the first slot that holds no key;
@@ -46,8 +46,8 @@ chip the firmware halts at start-up (the credential keys and the RNG seed come f
 * Every slot 0-9: SlotConfig `81 20`, KeyConfig `13 00` = ECC P-256 private key, secret, external
   signatures only, no ECDH, no PrivWrite, **GenKey allowed** (regenerable after locking), public key
   derivable, **no LimitedUse bit**.
-* Slots 10-15: not used by this firmware (AES / SHA-key / data slots from the general config).
-* Counters: not used by the firmware (Counter 0 = `2097151 - 500` in the shipped config image, ignored).
+* Slots 10-15: not used by this firmware; they keep the general config's values (SlotConfig `8F8F 8F8F 0000 0000 0000 8F8F`, KeyConfig `1800 1C00 3000 3C00 3C00 1C00`).
+* Counters: not used by the firmware. Counter 0 / 1 fields are the factory value 0 (`FFFFFFFF 00000000`, ignored), LastKeyUse is `00` and ChipMode `00`, all as on a factory-default chip. Byte 14 (I2C_Enable, `01` in the image) and the serial are read-only on the chip.
 
 A credential ID holds a 32-byte *handle* `[01][slot][6-byte public-key fingerprint][zeros]` inside
 OpenSK's normal encrypted credential ID. `import()` rejects a handle whose slot holds a different key than the handle was made for.
@@ -58,10 +58,8 @@ credential slots must never include the slot that holds the attestation key.
 
 ## Provisioning (already done for your chip; kept for a new one)
 ```
-python3 tools/gen_atecc_config.py --slots 10 --budget 500 -o out   # or --base your_read_config.bin
+python3 tools/gen_atecc_config.py --slots 10 -o out   # byte-identical to out/atecc608a_general_config.bin; or --base your_read_config.bin
 atecc ... write-config out/atecc608a_fido_config.bin
-# (counter-init 0 is no longer needed: the firmware does not use Counter 0. --budget only fills the
-#  unused counter in the config image, any value works.)
 atecc ... lock-config                # irreversible
 atecc ... lock-data                  # irreversible; GenKey stays enabled on the key slots
 atecc ... ecc-gen 0 pub0.bin         # attestation key (or make_attest_cert.py does it)
@@ -89,7 +87,7 @@ unique to this device, so every site can recognise it.
 
 ## Signatures
 There is no signature budget: the firmware signs as often as it is asked and does not touch Counter 0.
-A chip provisioned earlier with `counter-init 0 -500` keeps that value; it is ignored. The attestation
+A chip provisioned earlier with a counter value keeps it; it is ignored. The attestation
 key and the credential keys sign the same way (Nonce pass-through + Sign). The price is that nothing in
 the chip limits what code on the Pico, or a probe on the I2C bus, can have signed (see SECURITY.md).
 Never set LimitedUse on these slots unless you want the chip itself to count.
