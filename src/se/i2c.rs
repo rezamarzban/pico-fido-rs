@@ -71,8 +71,8 @@ pub fn init(i2c: I2C1, scl: PIN_15, sda: PIN_14) {
     match ecdsa::chip_info() {
         Some(i) => {
             crate::status::set_se(&i);
-            if let Some(n) = ecdsa::registrations() {
-                crate::status::SE_REGS.store(n, portable_atomic::Ordering::Relaxed);
+            if let Some(n) = ecdsa::scan_slots() {
+                crate::status::SE_REGS.store(n as u32, portable_atomic::Ordering::Relaxed);
             }
             info!(
                 "ATECC608A ready: serial {=[u8]:x}, revision {=[u8]:x}, config locked {}, data locked {}",

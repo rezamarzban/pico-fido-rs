@@ -3,7 +3,7 @@
 //! * GenKey (new private key in a slot) and public-key extraction
 //! * ECDSA P-256 signing (Nonce pass-through + Sign)
 //! * Random (seed of the RNG, `env/rng.rs`)
-//! * Counter 1 (credential slot cursor; Counter 0 is unused: signatures are not counted)
+//! * No counters at all: signatures are not counted and key slots are filled in order, never overwritten
 //! * Info + config-zone reads (serial number, revision, lock state: shown on the OLED)
 //!
 //! Modules:

@@ -1,0 +1,20 @@
+slot  0: ECC P-256 private key, secret, no LimitedUse, ext-sign, no-ECDH, GenKey, no-PrivWrite, pubkey-derivable
+slot  1: ECC P-256 private key, secret, no LimitedUse, ext-sign, no-ECDH, GenKey, no-PrivWrite, pubkey-derivable
+slot  2: ECC P-256 private key, secret, no LimitedUse, ext-sign, no-ECDH, GenKey, no-PrivWrite, pubkey-derivable
+slot  3: ECC P-256 private key, secret, no LimitedUse, ext-sign, no-ECDH, GenKey, no-PrivWrite, pubkey-derivable
+slot  4: ECC P-256 private key, secret, no LimitedUse, ext-sign, no-ECDH, GenKey, no-PrivWrite, pubkey-derivable
+slot  5: ECC P-256 private key, secret, no LimitedUse, ext-sign, no-ECDH, GenKey, no-PrivWrite, pubkey-derivable
+slot  6: ECC P-256 private key, secret, no LimitedUse, ext-sign, no-ECDH, GenKey, no-PrivWrite, pubkey-derivable
+slot  7: ECC P-256 private key, secret, no LimitedUse, ext-sign, no-ECDH, GenKey, no-PrivWrite, pubkey-derivable
+slot  8: ECC P-256 private key, secret, no LimitedUse, ext-sign, no-ECDH, GenKey, no-PrivWrite, pubkey-derivable
+slot  9: ECC P-256 private key, secret, no LimitedUse, ext-sign, no-ECDH, GenKey, no-PrivWrite, pubkey-derivable
+slot 10: not a private-key slot (SlotConfig 8F 8F, KeyConfig 18 00)
+slot 11: not a private-key slot (SlotConfig 8F 8F, KeyConfig 1C 00)
+slot 12: not a private-key slot (SlotConfig 00 00, KeyConfig 30 00)
+slot 13: not a private-key slot (SlotConfig 00 00, KeyConfig 3C 00)
+slot 14: not a private-key slot (SlotConfig 00 00, KeyConfig 3C 00)
+slot 15: not a private-key slot (SlotConfig 8F 8F, KeyConfig 1C 00)
+Counter 0 in the config: 2096651  ->  500 signatures left (firmware counts them)
+I2C address byte: 0xC0, ChipMode 0x01
+LockValue (data zone): unlocked, LockConfig (config zone): unlocked
+RESULT: matches the FIDO layout

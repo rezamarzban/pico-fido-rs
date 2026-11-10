@@ -43,16 +43,17 @@ LED: fast blink (200 ms on/off) = ready; very fast flicker = busy (or the browse
 almost solid = waiting for your button press.
 
 ## 5. Things to know
-- **Nine credentials at most.** Each credential uses one key slot (1-9) in the secure element. The 10th registration
-  overwrites the oldest one, which then stops working.
+- **Nine credentials at most, for the life of the chip.** Each credential uses one key slot (1-9) in the secure
+  element and keys are never overwritten. The 10th registration is refused (the key restarts; unplug and replug), and
+  a reset does not free slots. The OLED shows `KEYS n/9`.
 - **Unlimited signatures.** Signatures are not counted, there is no budget. (If your chip was provisioned with the old
   500-signature Counter 0, that counter is simply ignored now.)
 - **OLED.** Two pages, switching every 5 s: the device (state, USB, uptime, RAM, flash) and the ATECC608A (I2C
-  address, serial number, revision, config/data lock state, registered credentials and the next slot).
+  address, serial number, revision, config/data lock state, key slots in use).
 - **Wrong PINs:** the usual CTAP rules apply: after 3 wrong PINs in a row, unplug and replug; after 8 wrong PINs
   without a correct one in between, the PIN is blocked. A correct PIN resets the counts.
 - **Forgotten or blocked PIN:** the only way out is a reset, which **deletes all credentials** from the key store (the
-  chip slots are overwritten when they are used again). Unplug, replug and run
+  chip keys stay in their slots, which are not reused). Unplug, replug and run
   the reset (`fido2-token -R <device>` or the browser's "Reset" option) **immediately**: CTAP only accepts a reset
   shortly after power-up. Press the button when asked.
 - **Passkeys / U2F:** OpenSK supports discoverable credentials and U2F. U2F-only sites need the attestation key and

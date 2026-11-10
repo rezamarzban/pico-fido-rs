@@ -21,7 +21,10 @@ Experimental firmware; read this before relying on it.
 * **The chip does not authenticate the Pico.** Code running on the Pico, or a probe on the I2C
   bus, can make the chip sign (without limit). User presence is the BOOTSEL button,
   checked by the Pico.
-* Evicted credentials (more than 9 registrations) are gone for good.
+* **Only 9 registrations, for the life of the chip.** Keys in the chip slots are never overwritten or
+  regenerated; the 10th registration is refused (firmware panic and restart) and a FIDO reset does not free
+  slots. The firmware tells a free slot from a used one by asking the chip for the public key (status 0x0F =
+  no private key there); a bus error is never taken for "free".
 * Attestation with the per-device key (`use_batch_attestation`, and always for U2F) lets sites
   recognise the device.
 

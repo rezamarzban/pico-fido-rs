@@ -46,6 +46,7 @@ struct Model {
     wakes: u32,
     fail_next_wake: u32,
     no_genkey: Vec<usize>, // slots where GenKey fails (execution error)
+    created: Vec<usize>,   // slots where GenKey(create) ran, in order
     config: Vec<u8>,       // 128-byte config zone (serial number, I2C address, lock bytes)
 }
 
@@ -105,6 +106,7 @@ impl Model {
                     }
                     let k = SigningKey::random(self.rng.as_mut().unwrap());
                     self.keys[slot] = Some(k);
+                    self.created.push(slot);
                 } else if p1 != proto::GENKEY_PUBLIC {
                     return status(0x03);
                 }
@@ -379,23 +381,67 @@ fn key_lifecycle_through_opensk_traits() {
     assert!(SeSecretKey::import(&bad).is_none());
 }
 
+fn registration_panics(rng: &mut TestRng) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = SeSecretKey::random(rng);
+    }))
+    .is_err()
+}
+
 #[test]
-fn oldest_credential_is_evicted_after_all_slots_are_used() {
+fn keys_are_never_overwritten_when_all_slots_are_used() {
     let (_g, m) = install(false, 0);
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(2));
-    let keys: Vec<_> = (0..SLOTS as usize + 2).map(|_| SeSecretKey::random(&mut rng)).collect();
+    let keys: Vec<_> = (0..SLOTS as usize).map(|_| SeSecretKey::random(&mut rng)).collect();
     let slots: Vec<u8> = keys.iter().map(|k| k.export()[1]).collect();
     let first = FIRST_CRED_SLOT;
-    assert_eq!(slots[..SLOTS as usize], (first..first + SLOTS).collect::<Vec<_>>()[..], "round robin over slots 1..=9");
-    assert_eq!(slots[SLOTS as usize], first);
-    assert!(slots.iter().all(|&x| x != ATTEST_SLOT));
-    assert_eq!(m.lock().unwrap().counters[1], SLOTS as u32 + 2, "cursor lives in chip counter 1");
-    // The first two credential slots were recycled: their old handles are dead, the others still work.
-    assert!(SeSecretKey::import(&keys[0].export()).is_none());
-    assert!(SeSecretKey::import(&keys[1].export()).is_none());
-    for k in &keys[2..] {
-        assert!(SeSecretKey::import(&k.export()).is_some());
+    assert_eq!(slots, (first..first + SLOTS).collect::<Vec<_>>(), "free slots are taken in order 1..=9");
+    assert_eq!(ecdsa::used_slots(), None, "no scan was run yet");
+    // The 10th registration is refused (panic: the trait cannot return an error) ...
+    assert!(registration_panics(&mut rng));
+    assert!(registration_panics(&mut rng), "and again: still refused");
+    // ... and nothing was regenerated: GenKey ran exactly once per slot, every old key still works.
+    {
+        let g = m.lock().unwrap();
+        assert_eq!(g.created, (first as usize..(first + SLOTS) as usize).collect::<Vec<_>>());
+        assert_eq!(g.counters, [0, 0], "no counter is used at all");
+        assert!(!g.commands.contains(&proto::OP_COUNTER));
     }
+    for k in &keys {
+        let again = SeSecretKey::import(&k.export()).expect("handle of an existing key still imports");
+        check_sig(&again, b"still the same key");
+    }
+    assert!(slots.iter().all(|&x| x != ATTEST_SLOT));
+}
+
+#[test]
+fn used_slots_are_counted_from_the_chip_and_by_new_keys() {
+    let (_g, _m) = install(false, 0);
+    assert_eq!(ecdsa::scan_slots(), Some(0));
+    let mut rng = TestRng(ChaCha8Rng::seed_from_u64(8));
+    let _a = SeSecretKey::random(&mut rng);
+    let _b = SeSecretKey::random(&mut rng);
+    assert_eq!(ecdsa::used_slots(), Some(2));
+    // A fresh scan (e.g. after a restart) finds the same keys in the chip.
+    assert_eq!(ecdsa::scan_slots(), Some(2));
+    // Existing keys are found even if the cache is gone: a new key goes to the next free slot.
+    let c = SeSecretKey::random(&mut rng);
+    assert_eq!(c.export()[1], FIRST_CRED_SLOT + 2);
+    assert_eq!(ecdsa::used_slots(), Some(3));
+}
+
+#[test]
+fn a_bus_error_never_makes_a_used_slot_look_free() {
+    let (_g, m) = install(false, 0);
+    let mut rng = TestRng(ChaCha8Rng::seed_from_u64(10));
+    let k = SeSecretKey::random(&mut rng);
+    // The chip stops waking up: reading the slots fails, it must not be taken for "empty".
+    m.lock().unwrap().fail_next_wake = 1000;
+    assert!(registration_panics(&mut rng));
+    assert_eq!(ecdsa::scan_slots(), None);
+    m.lock().unwrap().fail_next_wake = 0;
+    assert_eq!(m.lock().unwrap().created, vec![FIRST_CRED_SLOT as usize], "no second GenKey");
+    assert!(SeSecretKey::import(&k.export()).is_some());
 }
 
 #[test]
@@ -403,9 +449,9 @@ fn a_slot_that_refuses_genkey_is_skipped() {
     let (_g, m) = install(false, 0);
     m.lock().unwrap().no_genkey = vec![3, 9];
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(5));
-    let slots: Vec<u8> = (0..14).map(|_| SeSecretKey::random(&mut rng).export()[1]).collect();
-    assert!(slots.iter().all(|s| ![3u8, 9, ATTEST_SLOT].contains(s)), "{slots:?}");
-    assert!(slots.iter().any(|&s| s == 4), "the slot after the broken one is used");
+    let slots: Vec<u8> = (0..SLOTS as usize - 2).map(|_| SeSecretKey::random(&mut rng).export()[1]).collect();
+    assert_eq!(slots, vec![1, 2, 4, 5, 6, 7, 8], "slots 3 and 9 are never used");
+    assert!(registration_panics(&mut rng), "no usable slot left: refused, nothing overwritten");
 }
 
 #[test]
@@ -420,7 +466,8 @@ fn signatures_are_unlimited_and_not_counted() {
     }
     let g = m.lock().unwrap();
     assert_eq!(g.counters[0], COUNTER_MAX, "Counter 0 is never touched");
-    assert_eq!(g.counters[1], 1, "only Counter 1 (slot cursor, one GenKey) moved");
+    assert_eq!(g.counters, [COUNTER_MAX, 0], "no counter is touched");
+    assert!(!g.commands.contains(&proto::OP_COUNTER), "no counter command is ever sent");
     assert_eq!(g.commands.iter().filter(|&&c| c == proto::OP_SIGN).count(), 50);
 }
 
@@ -436,18 +483,13 @@ fn signing_does_not_use_counter_commands() {
 }
 
 #[test]
-fn chip_info_and_registration_count() {
+fn chip_info_is_read_from_the_config_zone() {
     let (_g, _m) = install(false, 0);
     let i = ecdsa::chip_info().expect("chip answers");
     assert_eq!(i.serial, [0x01, 0x23, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0xEE]);
     assert_eq!(i.revision, [0x00, 0x00, 0x60, 0x03]);
     assert_eq!(i.i2c_addr, 0x60);
     assert!(i.config_locked && i.data_locked);
-    assert_eq!(ecdsa::registrations(), Some(0));
-    let mut rng = TestRng(ChaCha8Rng::seed_from_u64(6));
-    let _ = SeSecretKey::random(&mut rng);
-    let _ = SeSecretKey::random(&mut rng);
-    assert_eq!(ecdsa::registrations(), Some(2));
 }
 
 #[test]
@@ -476,7 +518,7 @@ fn chip_random_and_missing_chip() {
     ecdsa::uninstall();
     assert_eq!(ecdsa::chip_random(), Err(Error::Bus));
     assert_eq!(ecdsa::chip_info(), None);
-    assert_eq!(ecdsa::registrations(), None);
+    assert_eq!(ecdsa::scan_slots(), None);
     assert!(!ecdsa::installed());
 }
 
@@ -548,9 +590,11 @@ fn credential_registration_never_touches_the_attestation_slot() {
     let (_g, m) = install(false, 0);
     let handle = provision_attestation(&m);
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(9));
-    for _ in 0..(3 * SLOTS as usize) {
+    for _ in 0..SLOTS as usize {
         let k = SeSecretKey::random(&mut rng);
         assert!((FIRST_CRED_SLOT..FIRST_CRED_SLOT + SLOTS).contains(&k.export()[1]));
     }
+    assert!(registration_panics(&mut rng));
     assert!(SeSecretKey::import(&handle).is_some(), "attestation key survived all registrations");
+    assert!(!m.lock().unwrap().created.contains(&(ATTEST_SLOT as usize)));
 }

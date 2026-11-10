@@ -4,4 +4,5 @@
 target/
 # build.sh output
 out/
+!atecc608a/out/
 work/

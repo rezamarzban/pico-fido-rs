@@ -165,8 +165,8 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
                 if let Some((u, tot, lu, lt)) = ctap.env().persist().stats() {
                     status::set_store(u, tot, lu, lt);
                 }
-                if let Some(n) = se::ecdsa::registrations() {
-                    status::SE_REGS.store(n, portable_atomic::Ordering::Relaxed);
+                if let Some(n) = se::ecdsa::used_slots() {
+                    status::SE_REGS.store(n as u32, portable_atomic::Ordering::Relaxed);
                 }
             }
         }
