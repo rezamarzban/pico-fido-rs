@@ -14,7 +14,7 @@ slot 12: not a private-key slot (SlotConfig 00 00, KeyConfig 30 00)
 slot 13: not a private-key slot (SlotConfig 00 00, KeyConfig 3C 00)
 slot 14: not a private-key slot (SlotConfig 00 00, KeyConfig 3C 00)
 slot 15: not a private-key slot (SlotConfig 8F 8F, KeyConfig 1C 00)
-Counter 0 in the config: 2096651  ->  500 signatures left (firmware counts them)
-I2C address byte: 0xC0, ChipMode 0x01
+Counter 0 field: ffffffff00000000, Counter 1 field: ffffffff00000000 (not used by the firmware)
+I2C_Enable byte: 0x01 (read-only on the chip), I2C address byte: 0xC0, ChipMode 0x00
 LockValue (data zone): unlocked, LockConfig (config zone): unlocked
 RESULT: matches the FIDO layout
