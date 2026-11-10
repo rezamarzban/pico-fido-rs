@@ -1,8 +1,9 @@
 //! OpenSK `Ecdsa` whose private keys never leave the ATECC608A.
 //!
-//! * `random()` allocates the next credential slot (round-robin on Counter 1, which survives
-//!   power cycles) and runs GenKey there. The key that was in that slot is overwritten: with N
-//!   slots the N+1-th registration evicts the oldest credential (its handle then fails `import`).
+//! * `random()` takes the first FREE credential slot (one whose public key cannot be read, i.e.
+//!   the chip holds no private key there) and runs GenKey in it. A slot that already holds a key
+//!   is never touched: nothing is overwritten or regenerated, and no counter is used. When all
+//!   slots are used `random()` panics, so the registration fails and the 9 existing keys stay.
 //! * `export()` is a 32-byte *handle*: [version][slot][6-byte public-key fingerprint][zeros].
 //!   OpenSK stores it inside the encrypted credential ID, exactly like a wrapped software key.
 //! * `import()` checks that the slot still holds the key the handle was made for (fingerprint).
@@ -14,7 +15,7 @@
 //!   LimitedUse bit either).
 
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use critical_section::Mutex;
 use opensk::api::crypto::ec_signing::{EcPublicKey, EcSecretKey, EcSignature, Ecdsa};
 use opensk::api::crypto::EC_FIELD_SIZE;
@@ -29,7 +30,7 @@ use super::proto::{ChipInfo, Error};
 /// never overwritten by the firmware); slots 1..=9 are credential slots. Slots 10-15 are not used.
 pub const ATTEST_SLOT: u8 = 0;
 pub const FIRST_CRED_SLOT: u8 = 1;
-/// Number of credential slots (the 10th registration evicts the oldest credential).
+/// Number of credential slots (the 10th registration is refused: keys are never overwritten).
 pub const SLOTS: u8 = 9;
 
 /// Handle of a credential key (slot < SLOTS) / of the attestation key (slot == ATTEST_SLOT).
@@ -45,6 +46,10 @@ pub const COUNTER_MAX: u32 = 2_097_151;
 type Chip = &'static mut (dyn ChipOps + Send);
 
 static CHIP: Mutex<RefCell<Option<Chip>>> = Mutex::new(RefCell::new(None));
+/// Chip status of GenKey(public) on a slot without a private key (execution error).
+const STATUS_EMPTY_SLOT: u8 = 0x0F;
+/// Credential slots known to hold a key (`None` until `scan_slots` ran).
+static USED: Mutex<Cell<Option<u8>>> = Mutex::new(Cell::new(None));
 static PUBKEYS: Mutex<RefCell<[Option<[u8; 64]>; 16]>> = Mutex::new(RefCell::new([None; 16]));
 
 /// Registers the chip driver. Call once at start-up.
@@ -57,6 +62,7 @@ pub fn uninstall() {
     critical_section::with(|cs| {
         *CHIP.borrow(cs).borrow_mut() = None;
         *PUBKEYS.borrow(cs).borrow_mut() = [None; 16];
+        USED.borrow(cs).set(None);
     });
 }
 
@@ -82,10 +88,33 @@ pub fn chip_info() -> Option<ChipInfo> {
     with_chip(|c| c.info()).ok()
 }
 
-/// Credentials registered so far (Counter 1, the slot cursor); `None`: chip not reachable. The
-/// next registration goes to slot `FIRST_CRED_SLOT + count % SLOTS`.
-pub fn registrations() -> Option<u32> {
-    with_chip(|c| c.counter(1)).ok()
+/// Is a private key present in `slot`? `Ok(false)` only for the chip's "no key here" answer;
+/// any other failure is an error, so a bus problem can never make a used slot look free.
+fn slot_has_key(slot: u8) -> Result<bool, Error> {
+    match with_chip(|c| c.public_key(slot)) {
+        Ok(_) => Ok(true),
+        Err(Error::Status(STATUS_EMPTY_SLOT)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Counts the credential slots that hold a key (reads every slot once: ~0.5 s, call at start-up)
+/// and remembers the result for `used_slots()`. `None`: the chip did not answer cleanly.
+pub fn scan_slots() -> Option<u8> {
+    let mut used = 0u8;
+    for slot in FIRST_CRED_SLOT..FIRST_CRED_SLOT + SLOTS {
+        if slot_has_key(slot).ok()? {
+            used += 1;
+        }
+    }
+    critical_section::with(|cs| USED.borrow(cs).set(Some(used)));
+    Some(used)
+}
+
+/// Credential slots in use as of the last `scan_slots()` plus the keys created since (no chip
+/// access, cheap). `None` before the first scan.
+pub fn used_slots() -> Option<u8> {
+    critical_section::with(|cs| USED.borrow(cs).get())
 }
 
 /// 32 random bytes from the chip (seed of the RNG, `env/rng.rs`).
@@ -146,22 +175,29 @@ impl EcSecretKey for SeSecretKey {
     type Signature = SeSignature;
 
     fn random(_rng: &mut impl Rng) -> Self {
-        // Round-robin slot from Counter 1 (first registration: counter 1 -> slot FIRST_CRED_SLOT).
-        // If the chip refuses GenKey in a slot (e.g. a slot that cannot hold a P-256 private key)
-        // the next slot is tried, so such a slot is simply never used.
-        for attempt in 0..SLOTS {
-            let n = with_chip(|c| c.counter_inc(1)).unwrap_or_else(|_| panic!("se: counter 1"));
-            let slot = FIRST_CRED_SLOT + (n.wrapping_sub(1) % SLOTS as u32) as u8;
+        // First free slot, in order. A slot that holds a key is skipped, never regenerated. If the
+        // chip refuses GenKey in a free slot (e.g. one that cannot hold a P-256 private key) the
+        // next one is tried, so such a slot is simply never used.
+        for slot in FIRST_CRED_SLOT..FIRST_CRED_SLOT + SLOTS {
+            match slot_has_key(slot) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => panic!("se: cannot read key slot"),
+            }
             match with_chip(|c| c.gen_key(slot)) {
                 Ok(pubkey) => {
-                    critical_section::with(|cs| PUBKEYS.borrow(cs).borrow_mut()[slot as usize] = Some(pubkey));
+                    critical_section::with(|cs| {
+                        PUBKEYS.borrow(cs).borrow_mut()[slot as usize] = Some(pubkey);
+                        let u = USED.borrow(cs);
+                        u.set(u.get().map(|n| (n + 1).min(SLOTS)));
+                    });
                     return SeSecretKey { slot, pubkey };
                 }
-                Err(Error::Status(_)) if attempt + 1 < SLOTS => continue,
-                Err(_) => break,
+                Err(Error::Status(_)) => continue,
+                Err(_) => panic!("se: GenKey failed"),
             }
         }
-        panic!("se: GenKey failed")
+        panic!("se: no free key slot, refusing to overwrite an existing key")
     }
 
     fn public_key(&self) -> SePublicKey {
@@ -207,7 +243,7 @@ impl EcSecretKey for SeSecretKey {
             return None;
         }
         let pubkey = cached_pubkey(slot).ok()?;
-        // The slot may have been recycled for a newer credential (or the attestation key replaced).
+        // The slot may hold a different key than the one the handle was made for (or the attestation key was replaced).
         if fingerprint(&pubkey)[..] != bytes[2..2 + FP_LEN] {
             return None;
         }

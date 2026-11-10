@@ -11,10 +11,11 @@ The chip does six things and nothing else. Everything else runs on the Pico.
 | Public key extraction | GenKey (public mode) | `import()` |
 | Random numbers | Random | `env/rng.rs` (seed of a ChaCha20 DRBG) |
 
-One chip counter supports this: **Counter 1** is the round-robin cursor that picks the slot for the next
-credential (it must survive power cycles, and the chip counter is the cheapest place for it). **Counter 0** is not
-used: signatures are unlimited (see "Signatures" below). For the OLED the firmware also reads the chip's identity
-once (Info revision + config-zone reads: serial number, I2C address, lock bytes) and Counter 1 every 15 s.
+**No chip counter is used.** Signatures are unlimited (see "Signatures" below) and credential slots are filled in
+order and never overwritten: a slot is free if the chip has no private key there (public-key read fails with
+status 0x0F), so the state lives in the chip itself and survives power cycles. For the OLED the firmware also reads
+the chip's identity once (Info revision + config-zone reads: serial number, I2C address, lock bytes) and scans
+the 9 credential slots once at start-up (about 0.5 s).
 
 On the Pico: OpenSK with its standard key-value store, ClientPIN (PIN hash in flash),
 SHA-256 / HMAC / AES / HKDF / ECDH in software, BOOTSEL as user presence, USB.
@@ -33,22 +34,23 @@ I2C address 0x60 (config byte 0xC0), 100 kHz. Internal pull-ups are enabled; mos
 their own. The SSD1306 display stays on I2C0 (GP16/GP17), so the two never share a bus. Without the
 chip the firmware halts at start-up (the credential keys and the RNG seed come from it).
 
-## Slot layout (`gen_atecc_config.py --slots 10` writes `atecc608a_fido_config.bin`; the `atecc608a_general_config.bin` of the author's own chip is not in the repository)
+## Slot layout (the provisioned chip: `out/atecc608a_general_config.bin`)
 * **Slot 0: attestation key** (ECC P-256, created once with `tools/make_attest_cert.py`; the firmware
   never overwrites it).
-* **Slots 1-9: credential keys** (9 credentials). Registration `n` uses slot `1 + (n-1) mod 9`; the
-  10th registration overwrites slot 1 (the oldest credential stops working). If the chip refuses
-  GenKey in a slot, the firmware skips that slot (so a slot that cannot hold a private key is just
+* **Slots 1-9: credential keys** (9 credentials). A registration takes the first slot that holds no key;
+  **a slot that holds a key is never regenerated or overwritten**. After 9 registrations the 10th is
+  refused (the firmware panics and restarts; unplug/replug), and the 9 existing keys stay. A FIDO reset
+  does NOT free slots (it only deletes the credential records on the Pico), so the 9 registrations are
+  for the life of the chip. If the chip refuses GenKey in a free slot, the firmware skips it (that slot is
   never used; check with `ecc-gen 8` / `ecc-gen 9` on your chip).
 * Every slot 0-9: SlotConfig `81 20`, KeyConfig `13 00` = ECC P-256 private key, secret, external
   signatures only, no ECDH, no PrivWrite, **GenKey allowed** (regenerable after locking), public key
   derivable, **no LimitedUse bit**.
 * Slots 10-15: not used by this firmware (AES / SHA-key / data slots from the general config).
-* Counter 0 = `2097151 - 500`: **500 signatures left** (decoded from the config bytes by
-  `gen_atecc_config.py --check`). Counter 1 = 0 (slot cursor).
+* Counters: not used by the firmware (Counter 0 = `2097151 - 500` in the shipped config image, ignored).
 
 A credential ID holds a 32-byte *handle* `[01][slot][6-byte public-key fingerprint][zeros]` inside
-OpenSK's normal encrypted credential ID. `import()` rejects a handle whose slot was recycled.
+OpenSK's normal encrypted credential ID. `import()` rejects a handle whose slot holds a different key than the handle was made for.
 
 **If your attestation key is not in slot 0:** the slot numbers are two constants, `ATTEST_SLOT` and
 `FIRST_CRED_SLOT` in `src/se/ecdsa.rs` (and `ATTEST_SLOT` in `tools/make_attest_cert.py`). The
@@ -65,11 +67,9 @@ atecc ... lock-data                  # irreversible; GenKey stays enabled on the
 atecc ... ecc-gen 0 pub0.bin         # attestation key (or make_attest_cert.py does it)
 python3 tools/make_attest_cert.py --out attest                     # once: certificate for slot 0
 ```
-`--check cfg.bin` decodes any dumped config.
+`--check cfg.bin` decodes any dumped config (and the shipped `out/atecc608a_general_config.bin`).
 
 ### Attestation key and certificate
-> **Not in the repository:** `tools/make_attest_cert.py` (and its `--selftest`) is described here but missing from `atecc608a/tools/`. Until it is added, U2F attestation cannot be provisioned with these steps.
-
 `tools/make_attest_cert.py` (needs the `cryptoauthlib` and `cryptography` Python packages, the chip on
 a host I2C bus) does GenKey in slot 0, has the chip sign a self-signed X.509 certificate for that
 public key, and writes:
@@ -97,9 +97,11 @@ Never set LimitedUse on these slots unless you want the chip itself to count.
 ## Acceptance test on real hardware (do this before locking a chip you care about)
 1. Sign more than 500 times through a browser/`fido2` tool: every signature works and `counter-read 0` does not change.
 2. OLED, second page: serial number, revision (`00006003`) and both lock states match `atecc ... info` / `read-config`.
-3. Register 10 credentials: the first one must stop working, the other nine must still work (the OLED
-   shows `REGS 10`).
-4. Unplug/replug: the slot cursor (Counter 1) must persist.
+3. Register 9 credentials (the OLED shows `KEYS 9/9 FULL`), then try a 10th: it must be refused and all
+   nine must still work. First check on a spare chip that `ecc-pub` of an unused credential slot fails
+   (the firmware relies on that to tell a free slot from a used one; if your chip answers differently, no
+   registration will work: it fails safe).
+4. Unplug/replug: the used-slot count must be the same (it is read from the chip).
 5. After the attestation step: a U2F registration succeeds (e.g. webauthn.io with a U2F-only
    option).
 

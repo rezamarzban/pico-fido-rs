@@ -52,18 +52,19 @@ default: it lets hosts recognise the device). `oled` (default) is an SSD1306 on 
 `build.sh [-s 2|4|8|16] [-u] [-O]` builds a UF2 from the repository (needs network).
 
 ## Provisioning the chip (once per chip)
-See `atecc608a/CONFIG.md`: write and lock the configuration (`tools/gen_atecc_config.py`), then `tools/make_attest_cert.py` (**this script is not in the repository**: `atecc608a/tools/` has only `gen_atecc_config.py` and `test_gen_config.py`, so the attestation step cannot be run as written) creates the attestation key in the chip and its self-signed
+See `atecc608a/CONFIG.md`: write and lock the configuration (`tools/gen_atecc_config.py`), then `tools/make_attest_cert.py` creates the attestation key in the chip and its self-signed
 certificate, which is stored in the token once with OpenSK's `tools/configure.py`.
 
 ## Tests
     sh host-test/run.sh        # OpenSK's library unit tests + host-test/se (chip protocol, command layer,
                                # OpenSK ECDSA adapter incl. attestation slot, against a software chip model)
     python3 atecc608a/tools/test_gen_config.py
-    # atecc608a/tools/make_attest_cert.py --selftest: script missing from this tree
+    python3 atecc608a/tools/make_attest_cert.py --selftest
 
 ## Verification status
-**This branch (`atecc1`) was built and tested on all browsers and operating systems** (reported by the
-maintainer, not independently verified). Still run `host-test/run.sh` and the acceptance test in
+**The `atecc1` code up to "OpenSK based ATECC support v2.1" was built and tested on browsers and operating
+systems** (reported by the maintainer, not independently verified). **Not compiled by their author:** the later changes (unlimited signatures, no counters, keys never overwritten, the chip page of the
+OLED, the Info/Read chip commands). Build, then run `host-test/run.sh` and the acceptance test in
 `atecc608a/CONFIG.md` on a spare chip before locking a chip you care about. USB VID/PID
 (`0xc0de:0xcafe`) are prototype placeholders (`src/usb/mod.rs`).
 

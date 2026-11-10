@@ -23,7 +23,7 @@ pub static SE_ADDR: AtomicU8 = AtomicU8::new(0);
 pub const SE_CFG_LOCKED: u8 = 1;
 pub const SE_DATA_LOCKED: u8 = 2;
 pub static SE_LOCKS: AtomicU8 = AtomicU8::new(0);
-/// Credentials registered so far = chip Counter 1 (`SE_UNKNOWN` = not read yet).
+/// Credential key slots in use (0..=9; `SE_UNKNOWN` = not scanned yet).
 pub const SE_UNKNOWN: u32 = u32::MAX;
 pub static SE_REGS: AtomicU32 = AtomicU32::new(SE_UNKNOWN);
 

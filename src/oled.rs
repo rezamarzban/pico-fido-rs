@@ -29,7 +29,7 @@
 //! CONFIG ZONE LOCKED          LockConfig (LOCKED / OPEN)
 //! DATA ZONE LOCKED            LockValue (LOCKED / OPEN)
 //! SLOTS 9 CRED 1 ATTEST       key slots used by the firmware
-//! REGS 12 NEXT SLOT 4         credentials registered (Counter 1), slot for the next one
+//! KEYS 3/9 FREE 6             credential key slots in use (FULL: no more registrations)
 //! SIGNATURES UNLIMITED
 //! ```
 use core::cell::UnsafeCell;
@@ -42,7 +42,7 @@ use embassy_time::Instant;
 use heapless::String;
 use portable_atomic::Ordering;
 
-use crate::se::ecdsa::{FIRST_CRED_SLOT, SLOTS};
+use crate::se::ecdsa::SLOTS;
 use crate::se::proto::ADDR_7BIT;
 use crate::status as st;
 
@@ -232,10 +232,11 @@ impl Oled {
         put_fmt(b, 5, format_args!("SLOTS {} CRED 1 ATTEST", SLOTS));
         let regs = st::SE_REGS.load(Ordering::Relaxed);
         if regs == st::SE_UNKNOWN {
-            put_fmt(b, 6, format_args!("REGS --"));
+            put_fmt(b, 6, format_args!("KEYS --"));
+        } else if regs >= SLOTS as u32 {
+            put_fmt(b, 6, format_args!("KEYS {}/{} FULL", regs, SLOTS));
         } else {
-            let next = FIRST_CRED_SLOT as u32 + regs % SLOTS as u32;
-            put_fmt(b, 6, format_args!("REGS {} NEXT SLOT {}", regs, next));
+            put_fmt(b, 6, format_args!("KEYS {}/{} FREE {}", regs, SLOTS, SLOTS as u32 - regs));
         }
         put_line(b, 7, "SIGNATURES UNLIMITED");
     }
