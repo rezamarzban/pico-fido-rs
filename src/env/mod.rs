@@ -5,12 +5,12 @@
 //! runs on a separate, higher-priority executor and talks to OpenSK through `hid`.
 
 mod clock;
-mod dir_flash;
+pub mod dir_flash;
 mod flash_store;
 pub mod hid;
 mod persist;
 mod rng;
-mod tally_flash;
+pub mod tally_flash;
 mod user_presence;
 
 use clock::PicoClock;

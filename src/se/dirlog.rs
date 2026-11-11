@@ -121,6 +121,18 @@ pub fn chips(page: &[u8]) -> Vec<ChipSerial> {
     v
 }
 
+/// (chips that have at least one site recorded, bytes of the page in use: header + record
+/// positions; 0 = no valid header). For the status display; no hashing for the size.
+pub fn usage(page: &[u8]) -> (Vec<ChipSerial>, usize) {
+    if page.len() != PAGE || page[..HEADER.len()] != HEADER {
+        return (Vec::new(), 0);
+    }
+    let n = (0..MAX_RECS)
+        .take_while(|&i| page[HEADER.len() + i * REC..][..REC].iter().any(|&b| b != 0xFF))
+        .count();
+    (chips(page), HEADER.len() + n * REC)
+}
+
 /// How to bring the page to hold `dir` for chip `serial` (the other chips stay as they are).
 pub fn plan(page: &[u8], serial: &ChipSerial, dir: &[u8; DIR_LEN]) -> Plan {
     let (cur, used, valid) = scan(page, serial);
