@@ -15,7 +15,7 @@ The chip does six things and nothing else. Everything else runs on the Pico.
 There is **one key per site**: a new site takes the first credential slot that already holds a private key and
 belongs to no other site (the key is used as it is), or, if there is none, the first empty slot (public-key read
 fails with status 0x0F), where GenKey creates a key. Which site owns which slot is recorded in a directory in the
-**Pico's flash** (`src/env/dir_flash.rs`), not in the chip; later accounts at the same site find their slot there and
+**Pico's flash** (one directory per chip, told apart by the chip's unique serial number, so several chips can be used with the same key) (`src/env/dir_flash.rs`), not in the chip; later accounts at the same site find their slot there and
 use no new one. Slots that belong to a site are never overwritten. For the OLED the firmware also reads
 the chip's identity once (Info revision + config-zone reads: serial number, I2C address, lock bytes) and scans
 the 9 credential slots once at start-up (about 0.5 s).

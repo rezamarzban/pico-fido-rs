@@ -1,4 +1,6 @@
-//! The site directory (which relying party owns which ATECC608A key slot) in the Pico's flash.
+//! The site directories (which relying party owns which ATECC608A key slot) in the Pico's flash,
+//! one per chip: each chip is identified by its unique serial number, so the key can be used with
+//! several chips and always works with the directory of the chip that is connected.
 //!
 //! It used to live in data slot 13 of the chip; now NOTHING but keys is stored in the chip. The
 //! directory has its own 4 KiB flash page directly below the OpenSK key-value store (build.rs keeps
@@ -13,7 +15,7 @@ use core::cell::RefCell;
 use super::flash_store::{PAGE_SIZE, STORE_START, XIP_BASE};
 use crate::keys::Fl;
 use crate::se::dirlog::{self, Plan};
-use crate::se::ecdsa::{DirStore, DIR_LEN};
+use crate::se::ecdsa::{ChipSerial, DirStore, DIR_LEN};
 
 const _: () = assert!(PAGE_SIZE == dirlog::PAGE);
 
@@ -22,6 +24,9 @@ pub const DIR_START: usize = STORE_START - PAGE_SIZE;
 
 pub struct FlashDir {
     flash: &'static RefCell<Fl>,
+    /// The connected chip (`None` until `select`): without it the directory reads as empty and
+    /// nothing is saved.
+    chip: Option<ChipSerial>,
 }
 
 // SAFETY: there is a single core. The directory is only used from OpenSK's thread-mode code (key
@@ -31,7 +36,7 @@ unsafe impl Send for FlashDir {}
 
 impl FlashDir {
     pub fn new(flash: &'static RefCell<Fl>) -> Self {
-        FlashDir { flash }
+        FlashDir { flash, chip: None }
     }
 
     /// The page, read straight through the XIP window.
@@ -43,13 +48,22 @@ impl FlashDir {
 }
 
 impl DirStore for FlashDir {
+    fn select(&mut self, chip: &ChipSerial) {
+        self.chip = Some(*chip);
+    }
+
     fn load(&mut self) -> [u8; DIR_LEN] {
-        dirlog::scan(self.page()).0
+        match &self.chip {
+            Some(chip) => dirlog::scan(self.page(), chip).0,
+            None => [0u8; DIR_LEN],
+        }
     }
 
     fn save(&mut self, dir: &[u8; DIR_LEN]) -> Result<(), ()> {
-        match dirlog::plan(self.page(), dir) {
+        let chip = self.chip.ok_or(())?;
+        match dirlog::plan(self.page(), &chip, dir) {
             Plan::Nothing => Ok(()),
+            Plan::Full => Err(()),
             Plan::Append { offset, data } => self
                 .flash
                 .borrow_mut()

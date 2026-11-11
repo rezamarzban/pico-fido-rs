@@ -1,4 +1,4 @@
-//! Lifetime signature counter in the Pico's flash (the chip counts nothing). One more 4 KiB page,
+//! Lifetime signature counters in the Pico's flash, one per chip (the chips count nothing; each is told apart by its unique serial number). One more 4 KiB page,
 //! directly below the site directory page (build.rs keeps it out of the linker's FLASH region).
 //! The format (an append-only log, one record per signature) is in `se/tallylog.rs`, host-tested.
 //! The total and the count since power-up are published to the display through `crate::status`.
@@ -10,7 +10,7 @@ use super::dir_flash::DIR_START;
 use super::flash_store::{PAGE_SIZE, XIP_BASE};
 use crate::keys::Fl;
 use crate::se::dirlog::{Plan, PAGE};
-use crate::se::ecdsa::SigTally;
+use crate::se::ecdsa::{ChipSerial, SigTally};
 use crate::se::tallylog;
 use crate::status;
 
@@ -21,6 +21,8 @@ pub const TALLY_START: usize = DIR_START - PAGE_SIZE;
 
 pub struct FlashTally {
     flash: &'static RefCell<Fl>,
+    /// The connected chip (`None` until `select`: nothing is counted then) and ITS signature total.
+    chip: Option<ChipSerial>,
     total: u32,
 }
 
@@ -34,23 +36,28 @@ fn page() -> &'static [u8] {
 }
 
 impl FlashTally {
-    /// Reads the stored total and publishes it.
     pub fn new(flash: &'static RefCell<Fl>) -> Self {
-        let total = tallylog::scan(page()).0;
-        status::SIGS_TOTAL.store(total, Ordering::Relaxed);
-        FlashTally { flash, total }
+        FlashTally { flash, chip: None, total: 0 }
     }
 }
 
 impl SigTally for FlashTally {
+    /// Switches to the count of this chip (0 for a chip never seen) and publishes it.
+    fn select(&mut self, chip: &ChipSerial) {
+        self.chip = Some(*chip);
+        self.total = tallylog::scan(page(), chip).0;
+        status::SIGS_TOTAL.store(self.total, Ordering::Relaxed);
+    }
+
     fn bump(&mut self) {
+        let Some(chip) = self.chip else { return };
         self.total = self.total.saturating_add(1);
         status::SIGS_TOTAL.store(self.total, Ordering::Relaxed);
         status::SIGS_BOOT.fetch_add(1, Ordering::Relaxed);
         let mut flash = self.flash.borrow_mut();
         // A failed write only means the stored total lags behind; signing goes on.
-        let _ = match tallylog::plan(page(), self.total) {
-            Plan::Nothing => Ok(()),
+        let _ = match tallylog::plan(page(), &chip, self.total) {
+            Plan::Nothing | Plan::Full => Ok(()),
             Plan::Append { offset, data } => flash.blocking_write((TALLY_START + offset) as u32, &data),
             Plan::Rewrite { data } => flash
                 .blocking_erase(TALLY_START as u32, (TALLY_START + PAGE_SIZE) as u32)
