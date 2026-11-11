@@ -84,6 +84,18 @@ pub fn totals(page: &[u8]) -> Vec<(ChipSerial, u32)> {
     v
 }
 
+/// (chips that have a count, bytes of the page in use: header + record positions; 0 = no valid
+/// header). For the status display; no hashing for the size.
+pub fn usage(page: &[u8]) -> (Vec<ChipSerial>, usize) {
+    if page.len() != PAGE || page[..HEADER.len()] != HEADER {
+        return (Vec::new(), 0);
+    }
+    let n = (0..MAX_RECS)
+        .take_while(|&i| page[HEADER.len() + i * REC..][..REC].iter().any(|&b| b != 0xFF))
+        .count();
+    (totals(page).into_iter().map(|e| e.0).collect(), HEADER.len() + n * REC)
+}
+
 /// How to bring the page to the new `total` of chip `serial` (the other chips keep theirs).
 pub fn plan(page: &[u8], serial: &ChipSerial, total: u32) -> Plan {
     let (cur, used, valid) = scan(page, serial);

@@ -32,16 +32,16 @@
 //! SITES 2/9 ASSIGNED          credential slots that belong to a site (the directory in the Pico's flash)
 //! SIGNS 1234                  total signatures (kept in the Pico's flash)
 //! ```
-//! Page 3, the private-key slots:
+//! Page 3, the data the Pico's flash keeps about chips (site directory + signature counters):
 //! ```text
-//! KEY SLOTS SITES 2/9         credential slots that belong to a site
-//! ATTEST 0: KEY               attestation slot: KEY / EMPTY
-//! 1:SITE 2:SITE 3:KEY         per credential slot: SITE = holds a key and belongs to a site,
-//! 4:EMPTY 5:EMPTY 6:EMPTY       KEY = holds a key, no site yet (the next new site takes it over),
-//! 7:EMPTY 8:EMPTY 9:EMPTY       EMPTY = no key (the next new site gets a GenKey here)
-//! SIGNS TOTAL 1234
-//! SIGNS BOOT  12
-//! SITE KEY EMPTY LEGEND
+//! FLASH: DATA OF CHIPS
+//! CHIPS STORED 3              different chips found in either flash page
+//! SITE DIR 2 CHIPS            chips with at least one site in the directory page
+//!   USED 480B 11%             bytes of that 4 KiB page in use, and the share
+//! SIG COUNT 3 CHIPS           chips with a signature counter in the counter page
+//!   USED 160B 3%
+//! TOTAL 640B/8192B            both pages together
+//! FREE 7552B
 //! ```
 use core::cell::UnsafeCell;
 use core::fmt::Write as _;
@@ -53,8 +53,11 @@ use embassy_time::Instant;
 use heapless::String;
 use portable_atomic::Ordering;
 
+use crate::env::{dir_flash, tally_flash};
+use crate::se::dirlog;
 use crate::se::ecdsa::SLOTS;
 use crate::se::proto::ADDR_7BIT;
+use crate::se::tallylog;
 use crate::status as st;
 
 const ADDR: u8 = 0x3C;
@@ -62,6 +65,9 @@ const W: usize = 128;
 const PAGES: usize = 8;
 const COLS: usize = 21;
 const FRAME_MS: u32 = 500;
+/// The flash pages are re-read (checksums included) at most this often while page 3 is shown.
+const FLASH_STATS_MS: u32 = 2_000;
+const FLASH_PAGE: usize = 4096;
 /// Each of the three pages stays this long.
 const PAGE_MS: u32 = 5_000;
 const RETRY_MS: u32 = 5_000;
@@ -137,6 +143,34 @@ fn kib10(bytes: usize) -> (usize, usize) {
     (bytes / 1024, bytes % 1024 * 10 / 1024)
 }
 
+/// What the flash keeps about chips (page 3).
+#[derive(Clone, Copy, Default)]
+struct FlashStats {
+    all_chips: u16,
+    dir_chips: u16,
+    dir_bytes: u16,
+    sig_chips: u16,
+    sig_bytes: u16,
+}
+
+fn flash_stats() -> FlashStats {
+    let (mut all, dir_bytes) = dirlog::usage(dir_flash::page());
+    let (sig, sig_bytes) = tallylog::usage(tally_flash::page());
+    let dir_chips = all.len();
+    for s in &sig {
+        if !all.contains(s) {
+            all.push(*s);
+        }
+    }
+    FlashStats {
+        all_chips: all.len() as u16,
+        dir_chips: dir_chips as u16,
+        dir_bytes: dir_bytes as u16,
+        sig_chips: sig.len() as u16,
+        sig_bytes: sig_bytes as u16,
+    }
+}
+
 struct Oled {
     i2c: I2c<'static, I2C0, Blocking>,
     buf: [u8; W * PAGES],
@@ -144,6 +178,9 @@ struct Oled {
     next_page: Option<u8>,
     last_frame_ms: u32,
     retry_ms: u32,
+    fl: FlashStats,
+    fl_ms: u32,
+    fl_valid: bool,
 }
 
 impl Oled {
@@ -203,51 +240,29 @@ impl Oled {
         match (now_ms() / PAGE_MS) % 3 {
             0 => self.render_device(),
             1 => self.render_chip(),
-            _ => self.render_slots(),
+            _ => self.render_flash(),
         }
     }
 
-    /// Page 3: the private-key slots, who owns them, and the signature counts.
-    fn render_slots(&mut self) {
+    /// Page 3: how many chips the flash knows and how much data it keeps about them.
+    fn render_flash(&mut self) {
+        let now = now_ms();
+        if !self.fl_valid || now.wrapping_sub(self.fl_ms) >= FLASH_STATS_MS {
+            self.fl = flash_stats();
+            self.fl_ms = now;
+            self.fl_valid = true;
+        }
+        let f = self.fl;
+        let (d, t) = (f.dir_bytes as usize, f.sig_bytes as usize);
         let b = &mut self.buf;
-        for r in 0..PAGES {
-            put_line(b, r, "");
-        }
-        if !st::SE_PRESENT.load(Ordering::Relaxed) {
-            put_line(b, 0, "SE NOT ANSWERING");
-            return;
-        }
-        let keys = st::KEY_MASK.load(Ordering::Relaxed);
-        let own = st::OWN_MASK.load(Ordering::Relaxed);
-        let sites = st::SE_SITES.load(Ordering::Relaxed);
-        if sites == st::SE_UNKNOWN {
-            put_fmt(b, 0, format_args!("KEY SLOTS SITES --"));
-        } else {
-            put_fmt(b, 0, format_args!("KEY SLOTS SITES {}/{}", sites, SLOTS));
-        }
-        put_fmt(b, 1, format_args!("ATTEST 0: {}", if keys & 1 != 0 { "KEY" } else { "EMPTY" }));
-        // Credential slots 1..=9, three per line, 7 characters per cell.
-        for row in 0..3usize {
-            let mut s: String<32> = String::new();
-            for col in 0..3usize {
-                let slot = 1 + row * 3 + col;
-                let state = if keys >> slot & 1 == 0 {
-                    "EMPTY"
-                } else if own >> slot & 1 != 0 {
-                    "SITE"
-                } else {
-                    "KEY"
-                };
-                let _ = write!(s, "{}:{:<5}", slot, state);
-                if col < 2 {
-                    let _ = s.push(' ');
-                }
-            }
-            put_line(b, 2 + row, &s);
-        }
-        put_fmt(b, 5, format_args!("SIGNS TOTAL {}", st::SIGS_TOTAL.load(Ordering::Relaxed)));
-        put_fmt(b, 6, format_args!("SIGNS BOOT  {}", st::SIGS_BOOT.load(Ordering::Relaxed)));
-        put_line(b, 7, "SITE KEY EMPTY LEGEND");
+        put_line(b, 0, "FLASH: DATA OF CHIPS");
+        put_fmt(b, 1, format_args!("CHIPS STORED {}", f.all_chips));
+        put_fmt(b, 2, format_args!("SITE DIR {} CHIPS", f.dir_chips));
+        put_fmt(b, 3, format_args!("  USED {}B {}%", d, d * 100 / FLASH_PAGE));
+        put_fmt(b, 4, format_args!("SIG COUNT {} CHIPS", f.sig_chips));
+        put_fmt(b, 5, format_args!("  USED {}B {}%", t, t * 100 / FLASH_PAGE));
+        put_fmt(b, 6, format_args!("TOTAL {}B/{}B", d + t, 2 * FLASH_PAGE));
+        put_fmt(b, 7, format_args!("FREE {}B", 2 * FLASH_PAGE - d - t));
     }
 
     /// Page 2: everything known about the ATECC608A.
@@ -443,6 +458,9 @@ pub fn init(i2c: I2C0, scl: PIN_17, sda: PIN_16) {
         next_page: None,
         last_frame_ms: 0,
         retry_ms: now_ms(),
+        fl: FlashStats::default(),
+        fl_ms: 0,
+        fl_valid: false,
     };
     o.ok = o.init_display();
     if o.ok {

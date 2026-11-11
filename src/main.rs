@@ -105,8 +105,6 @@ fn refresh_slot_status() {
     if let Some(r) = se::ecdsa::slot_report() {
         status::SE_REGS.store(r.keys() as u32, Relaxed);
         status::SE_SITES.store(r.sites() as u32, Relaxed);
-        status::KEY_MASK.store(r.has_key as u32, Relaxed);
-        status::OWN_MASK.store(r.owned as u32, Relaxed);
     }
 }
 

@@ -1084,6 +1084,36 @@ fn each_chip_has_its_own_directory_page_records() {
 }
 
 #[test]
+fn usage_counts_chips_and_bytes_for_the_display() {
+    // Blank / foreign page: nothing stored.
+    let blank = vec![0xFFu8; dirlog::PAGE];
+    assert_eq!(dirlog::usage(&blank), (vec![], 0));
+    assert_eq!(tallylog::usage(&blank), (vec![], 0));
+
+    let mut p = Page::blank();
+    p.apply(dirlog::plan(&p.0, &S1, &dir_with(&[(0, 5), (1, 6)])));
+    p.apply(dirlog::plan(&p.0, &S2, &dir_with(&[(2, 7)])));
+    let (chips, bytes) = dirlog::usage(&p.0);
+    assert_eq!(chips, vec![S1, S2]);
+    assert_eq!(bytes, dirlog::HEADER.len() + 3 * dirlog::REC);
+
+    let mut t = vec![0xFFu8; dirlog::PAGE];
+    for (n, s) in [(1u32, S1), (2, S1), (1, S2)] {
+        match tallylog::plan(&t, &s, n) {
+            Plan::Rewrite { data } => {
+                t.fill(0xFF);
+                t[..data.len()].copy_from_slice(&data);
+            }
+            Plan::Append { offset, data } => t[offset..offset + data.len()].copy_from_slice(&data),
+            _ => {}
+        }
+    }
+    let (chips, bytes) = tallylog::usage(&t);
+    assert_eq!(chips, vec![S1, S2]);
+    assert_eq!(bytes, tallylog::HEADER.len() + 3 * tallylog::REC);
+}
+
+#[test]
 fn compaction_keeps_every_other_chip() {
     let mut p = Page::blank();
     let other = dir_with(&[(2, 5), (3, 6)]);

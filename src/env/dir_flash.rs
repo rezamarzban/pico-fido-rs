@@ -22,6 +22,13 @@ const _: () = assert!(PAGE_SIZE == dirlog::PAGE);
 /// The directory page: the 4 KiB right below the key-value store.
 pub const DIR_START: usize = STORE_START - PAGE_SIZE;
 
+/// The directory page, read straight through the XIP window (also used by the status display).
+pub fn page() -> &'static [u8] {
+    // SAFETY: DIR_START..DIR_START+PAGE_SIZE lies inside the memory-mapped flash, outside the
+    // firmware image (build.rs) and outside the store; nothing writes it concurrently.
+    unsafe { core::slice::from_raw_parts((XIP_BASE + DIR_START) as *const u8, PAGE_SIZE) }
+}
+
 pub struct FlashDir {
     flash: &'static RefCell<Fl>,
     /// The connected chip (`None` until `select`): without it the directory reads as empty and
@@ -38,13 +45,6 @@ impl FlashDir {
     pub fn new(flash: &'static RefCell<Fl>) -> Self {
         FlashDir { flash, chip: None }
     }
-
-    /// The page, read straight through the XIP window.
-    fn page(&self) -> &'static [u8] {
-        // SAFETY: DIR_START..DIR_START+PAGE_SIZE lies inside the memory-mapped flash, outside the
-        // firmware image (build.rs) and outside the store; nothing writes it concurrently.
-        unsafe { core::slice::from_raw_parts((XIP_BASE + DIR_START) as *const u8, PAGE_SIZE) }
-    }
 }
 
 impl DirStore for FlashDir {
@@ -54,14 +54,14 @@ impl DirStore for FlashDir {
 
     fn load(&mut self) -> [u8; DIR_LEN] {
         match &self.chip {
-            Some(chip) => dirlog::scan(self.page(), chip).0,
+            Some(chip) => dirlog::scan(page(), chip).0,
             None => [0u8; DIR_LEN],
         }
     }
 
     fn save(&mut self, dir: &[u8; DIR_LEN]) -> Result<(), ()> {
         let chip = self.chip.ok_or(())?;
-        match dirlog::plan(self.page(), &chip, dir) {
+        match dirlog::plan(page(), &chip, dir) {
             Plan::Nothing => Ok(()),
             Plan::Full => Err(()),
             Plan::Append { offset, data } => self

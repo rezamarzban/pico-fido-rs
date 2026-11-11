@@ -56,8 +56,9 @@ almost solid = waiting for your button press.
   with chip A do not work while chip B is connected and work again when A is back.
 - **Unlimited signatures.** Signatures are not counted, there is no budget. (If your chip was provisioned with the old
   500-signature Counter 0, that counter is simply ignored now.)
-- **OLED.** Two pages, switching every 5 s: the device (state, USB, uptime, RAM, flash) and the ATECC608A (I2C
-  address, serial number, revision, config/data lock state, key slots in use).
+- **OLED.** Three pages, switching every 5 s: the device (state, USB, uptime, RAM, flash), the ATECC608A (I2C
+  address, serial number, revision, config/data lock state, key slots in use) and the flash data about chips (how many
+  different chips are stored, chips and bytes used in the site-directory page and in the signature-counter page).
 - **Wrong PINs:** the usual CTAP rules apply: after 3 wrong PINs in a row, unplug and replug; after 8 wrong PINs
   without a correct one in between, the PIN is blocked. A correct PIN resets the counts.
 - **Forgotten or blocked PIN:** the only way out is a reset, which **deletes all credentials** from the key store (the

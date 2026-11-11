@@ -29,7 +29,7 @@ pub struct FlashTally {
 // SAFETY: single core; only used from OpenSK's thread-mode code (signing), never from the USB executor.
 unsafe impl Send for FlashTally {}
 
-fn page() -> &'static [u8] {
+pub fn page() -> &'static [u8] {
     // SAFETY: TALLY_START..+PAGE_SIZE lies inside the memory-mapped flash, outside the firmware
     // image (build.rs) and the other flash areas; nothing writes it concurrently.
     unsafe { core::slice::from_raw_parts((XIP_BASE + TALLY_START) as *const u8, PAGE_SIZE) }
