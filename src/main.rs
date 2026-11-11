@@ -31,7 +31,7 @@ mod status;
 mod usb;
 
 use core::cell::RefCell;
-use env::{PicoEnv, PicoPersist, PicoUserPresence};
+use env::{FlashDir, PicoEnv, PicoPersist, PicoUserPresence};
 use static_cell::StaticCell;
 use opensk::api::connection::{HidConnection as _, UsbEndpoint};
 use opensk::env::Env as _;
@@ -52,6 +52,8 @@ pub const FLASH_SIZE: usize = FLASH_MB * 1024 * 1024;
 /// Pages of 4 KiB at the end of flash for OpenSK's key-value store (72 KiB). build.rs keeps the
 /// same area out of the linker's FLASH region: change them together.
 pub const STORE_PAGES: usize = 18;
+// One more 4 KiB page directly below the store holds the site directory (src/env/dir_flash.rs);
+// build.rs leaves it out of the linker's FLASH region too (72 KiB + 4 KiB = 76 KiB).
 
 // Heap for OpenSK (alloc): credentials, CBOR, the P-256 software crypto, message buffers.
 const HEAP_SIZE: usize = 128 * 1024;
@@ -140,6 +142,9 @@ fn main() -> ! {
     // OpenSK in thread mode. The flash moves into the key-value store, BOOTSEL into user presence.
     static FLASH: StaticCell<RefCell<keys::Fl>> = StaticCell::new();
     let flash: &'static RefCell<keys::Fl> = &*FLASH.init(RefCell::new(flash));
+    // The site directory (which site owns which chip key slot) is in the Pico's flash, not in the chip.
+    static DIR: StaticCell<FlashDir> = StaticCell::new();
+    se::ecdsa::install_dir(DIR.init(FlashDir::new(flash)));
     let env = PicoEnv::new(PicoPersist::new(flash), PicoUserPresence::new(p.BOOTSEL));
     let mut ctap = Ctap::new(env);
     info!("OpenSK initialised");

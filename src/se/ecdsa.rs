@@ -1,14 +1,20 @@
 //! OpenSK `Ecdsa` whose private keys never leave the ATECC608A.
 //!
-//! * One key per relying party (RP). `random()` first looks the RP up in the directory kept in the
-//!   chip (data slot `DIR_SLOT`): if the RP already has a key, that key is used again and no slot
-//!   is consumed (accounts at the same site then share one public key). Otherwise it takes the
-//!   first FREE credential slot (one whose public key cannot be read, i.e. the chip holds no
-//!   private key there), runs GenKey in it and records the RP in the directory. A slot that
-//!   already holds a key is never touched: nothing is overwritten or regenerated, and no counter
-//!   is used. When all slots belong to other RPs `random()` panics, so the registration fails
-//!   and the 9 existing keys stay. The RP comes from OpenSK through `Rng::take_rp_id_hash`
-//!   (third_party/opensk-rp-hint.patch); without it (`None`) every call takes a fresh slot.
+//! * One key per relying party (RP). Which RP owns which credential slot is recorded in a small
+//!   directory that lives in the **Pico's flash** (`DirStore`, implemented by `env/dir_flash.rs`);
+//!   nothing but the keys themselves is stored in the chip. `random()` works like this:
+//!   1. the RP already has a slot in the directory and that slot holds a key: use it again (no
+//!      slot is consumed, accounts at the same site then share one public key);
+//!   2. otherwise the first credential slot that is NOT owned by another RP and already HOLDS a
+//!      private key is taken over for this RP (its key is used as it is, no GenKey);
+//!   3. otherwise the first slot that holds no key (its public key cannot be read) gets a new key
+//!      with GenKey.
+//!   Either way the RP is written to the directory before the key is handed out. A key that is
+//!   owned by an RP is never touched, regenerated or overwritten. When every slot belongs to
+//!   another RP `random()` panics, so the registration fails and the existing keys stay. The RP
+//!   comes from OpenSK through `Rng::take_rp_id_hash` (third_party/opensk-rp-hint.patch); without
+//!   it (`None`), or without an installed directory, nothing is adopted or recorded and every call
+//!   takes a fresh (empty) slot.
 //! * `export()` is a 32-byte *handle*: [version][slot][6-byte public-key fingerprint][zeros].
 //!   OpenSK stores it inside the encrypted credential ID, exactly like a wrapped software key.
 //! * `import()` checks that the slot still holds the key the handle was made for (fingerprint).
@@ -37,13 +43,19 @@ pub const ATTEST_SLOT: u8 = 0;
 pub const FIRST_CRED_SLOT: u8 = 1;
 /// Number of credential slots (a registration at a 10th site is refused: keys are never overwritten).
 pub const SLOTS: u8 = 9;
-/// Data slot (72 bytes, clear read/write in the config) that holds the RP directory: for every
-/// credential slot the first `DIR_ENTRY` bytes of the SHA-256 of the RP ID it belongs to, in slot
-/// order, 63 of the first 64 bytes (two 32-byte blocks). All zero = no RP recorded.
-pub const DIR_SLOT: u8 = 13;
-const DIR_ENTRY: usize = 7;
-const DIR_LEN: usize = 64;
-const _: () = assert!(SLOTS as usize * DIR_ENTRY <= DIR_LEN);
+/// Directory entry of one credential slot: the first `DIR_ENTRY` bytes of the SHA-256 of the RP ID
+/// it belongs to (all zero = no RP recorded). The directory has one entry per credential slot, in
+/// slot order, and is kept by a `DirStore` (the Pico's flash), never in the chip.
+pub const DIR_ENTRY: usize = 7;
+pub const DIR_LEN: usize = SLOTS as usize * DIR_ENTRY;
+
+/// Where the site directory is kept. `load` returns the whole directory image (zeros when nothing
+/// is stored); `save` stores the whole image and must be power-fail safe (an interrupted `save`
+/// leaves the old or the new directory, or an empty one: never a wrong one).
+pub trait DirStore {
+    fn load(&mut self) -> [u8; DIR_LEN];
+    fn save(&mut self, dir: &[u8; DIR_LEN]) -> Result<(), ()>;
+}
 
 /// Handle of a credential key (slot < SLOTS) / of the attestation key (slot == ATTEST_SLOT).
 pub const HANDLE_CRED: u8 = 1;
@@ -56,8 +68,10 @@ const FP_LEN: usize = 6;
 pub const COUNTER_MAX: u32 = 2_097_151;
 
 type Chip = &'static mut (dyn ChipOps + Send);
+type Dir = &'static mut (dyn DirStore + Send);
 
 static CHIP: Mutex<RefCell<Option<Chip>>> = Mutex::new(RefCell::new(None));
+static DIR: Mutex<RefCell<Option<Dir>>> = Mutex::new(RefCell::new(None));
 /// Chip status of GenKey(public) on a slot without a private key (execution error).
 const STATUS_EMPTY_SLOT: u8 = 0x0F;
 /// Credential slots known to hold a key (`None` until `scan_slots` ran).
@@ -69,10 +83,17 @@ pub fn install(chip: Chip) {
     critical_section::with(|cs| *CHIP.borrow(cs).borrow_mut() = Some(chip));
 }
 
-/// Removes the driver again (host tests).
+/// Registers the place where the site directory is kept (the Pico's flash). Without it no site is
+/// recorded and no existing key is taken over (see the module documentation).
+pub fn install_dir(dir: Dir) {
+    critical_section::with(|cs| *DIR.borrow(cs).borrow_mut() = Some(dir));
+}
+
+/// Removes the drivers again (host tests).
 pub fn uninstall() {
     critical_section::with(|cs| {
         *CHIP.borrow(cs).borrow_mut() = None;
+        *DIR.borrow(cs).borrow_mut() = None;
         *PUBKEYS.borrow(cs).borrow_mut() = [None; 16];
         USED.borrow(cs).set(None);
     });
@@ -159,6 +180,15 @@ fn cached_pubkey(slot: u8) -> Result<[u8; 64], Error> {
     Ok(pk)
 }
 
+/// Runs `f` with the directory store (`None`: no store installed). Like `with_chip`, the store is
+/// taken out of the global while `f` runs: a flash erase must not happen inside a critical section.
+fn with_dir<R>(f: impl FnOnce(&mut dyn DirStore) -> R) -> Option<R> {
+    let dir = critical_section::with(|cs| DIR.borrow(cs).borrow_mut().take())?;
+    let r = f(&mut *dir);
+    critical_section::with(|cs| *DIR.borrow(cs).borrow_mut() = Some(dir));
+    Some(r)
+}
+
 /// The directory entry of an RP (never all zero, that means "empty").
 fn dir_tag(rp: &[u8; 32]) -> [u8; DIR_ENTRY] {
     let mut t = [0u8; DIR_ENTRY];
@@ -169,48 +199,40 @@ fn dir_tag(rp: &[u8; 32]) -> [u8; DIR_ENTRY] {
     t
 }
 
-fn dir_read() -> Result<[u8; DIR_LEN], Error> {
-    with_chip(|c| {
-        let mut d = [0u8; DIR_LEN];
-        d[..32].copy_from_slice(&c.read_block(DIR_SLOT, 0)?);
-        d[32..].copy_from_slice(&c.read_block(DIR_SLOT, 1)?);
-        Ok(d)
-    })
+fn dir_entry(dir: &[u8; DIR_LEN], i: usize) -> &[u8] {
+    &dir[i * DIR_ENTRY..(i + 1) * DIR_ENTRY]
+}
+
+fn dir_owned(dir: &[u8; DIR_LEN], i: usize) -> bool {
+    dir_entry(dir, i).iter().any(|&b| b != 0)
 }
 
 /// The credential slot that already holds the key of this RP, with its public key. An entry whose
-/// slot holds no key (an interrupted registration) is ignored. A directory that cannot be read
-/// (e.g. a chip configured differently) only means "no sharing": a fresh slot is used.
-fn dir_find(rp: &[u8; 32]) -> Option<(u8, [u8; 64])> {
-    let d = dir_read().ok()?;
+/// slot holds no key (an interrupted registration) is ignored; a chip that does not answer is not
+/// (it must never look like "no key here").
+fn dir_find(dir: &[u8; DIR_LEN], rp: &[u8; 32]) -> Option<(u8, [u8; 64])> {
     let tag = dir_tag(rp);
     for i in 0..SLOTS as usize {
-        if d[i * DIR_ENTRY..(i + 1) * DIR_ENTRY] == tag {
+        if dir_entry(dir, i) == &tag[..] {
             let slot = FIRST_CRED_SLOT + i as u8;
-            if let Ok(pk) = cached_pubkey(slot) {
-                return Some((slot, pk));
+            match cached_pubkey(slot) {
+                Ok(pk) => return Some((slot, pk)),
+                Err(Error::Status(STATUS_EMPTY_SLOT)) => {}
+                Err(_) => panic!("se: cannot read key slot"),
             }
         }
     }
     None
 }
 
-/// Records that `slot` holds the key of `rp` (only the 32-byte blocks that change are written).
-/// Failure is not fatal: the key works, the RP just gets another slot next time.
-fn dir_record(slot: u8, rp: &[u8; 32]) {
-    let Ok(old) = dir_read() else { return };
-    let mut d = old;
+/// Records in the directory (in the Pico's flash) that `slot` belongs to `rp`. It is done BEFORE
+/// the key is handed out: if it cannot be stored, the registration fails (panic, like every
+/// other failure here) instead of a key being shared with the next site without a trace.
+fn dir_record(dir: &mut [u8; DIR_LEN], slot: u8, rp: &[u8; 32]) {
     let off = (slot - FIRST_CRED_SLOT) as usize * DIR_ENTRY;
-    d[off..off + DIR_ENTRY].copy_from_slice(&dir_tag(rp));
-    for b in 0..2usize {
-        let blk = &d[b * 32..b * 32 + 32];
-        if blk != &old[b * 32..b * 32 + 32] {
-            let mut a = [0u8; 32];
-            a.copy_from_slice(blk);
-            if with_chip(|c| c.write_block(DIR_SLOT, b as u8, &a)).is_err() {
-                return;
-            }
-        }
+    dir[off..off + DIR_ENTRY].copy_from_slice(&dir_tag(rp));
+    if let Some(Err(())) = with_dir(|d| d.save(dir)) {
+        panic!("se: cannot record the site in the flash directory");
     }
 }
 
@@ -242,20 +264,45 @@ impl EcSecretKey for SeSecretKey {
     type Signature = SeSignature;
 
     fn random(rng: &mut impl Rng) -> Self {
-        // This RP already has a key: use it again, no slot is consumed.
         let rp = rng.take_rp_id_hash();
-        if let Some((slot, pubkey)) = rp.as_ref().and_then(dir_find) {
-            return SeSecretKey { slot, pubkey };
-        }
-        // First free slot, in order. A slot that holds a key is skipped, never regenerated. If the
-        // chip refuses GenKey in a free slot (e.g. one that cannot hold a P-256 private key) the
-        // next one is tried, so such a slot is simply never used.
-        for slot in FIRST_CRED_SLOT..FIRST_CRED_SLOT + SLOTS {
-            match slot_has_key(slot) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(_) => panic!("se: cannot read key slot"),
+        // The directory comes from the Pico's flash. Without a hint or without a store nothing can
+        // be recorded, so no key is shared or taken over then.
+        let mut dir = if rp.is_some() { with_dir(|d| d.load()) } else { None };
+        // 1. This RP already has a key: use it again, no slot is consumed.
+        if let (Some(rp), Some(dir)) = (&rp, &dir) {
+            if let Some((slot, pubkey)) = dir_find(dir, rp) {
+                return SeSecretKey { slot, pubkey };
             }
+        }
+        // 2. A slot of nobody that already holds a private key: this RP takes it over as it is.
+        //    The slots without a key are collected for step 3 (also those with a stale entry).
+        let mut empty = [0u8; SLOTS as usize];
+        let mut n_empty = 0;
+        for i in 0..SLOTS as usize {
+            let slot = FIRST_CRED_SLOT + i as u8;
+            let has_key = match slot_has_key(slot) {
+                Ok(b) => b,
+                Err(_) => panic!("se: cannot read key slot"),
+            };
+            if !has_key {
+                empty[n_empty] = slot;
+                n_empty += 1;
+                continue;
+            }
+            if let (Some(rp), Some(dir)) = (&rp, dir.as_mut()) {
+                if !dir_owned(dir, i) {
+                    let pubkey = match cached_pubkey(slot) {
+                        Ok(pk) => pk,
+                        Err(_) => panic!("se: cannot read key slot"),
+                    };
+                    dir_record(dir, slot, rp);
+                    return SeSecretKey { slot, pubkey };
+                }
+            }
+        }
+        // 3. First empty slot, in order: GenKey. If the chip refuses GenKey in a slot (e.g. one that
+        //    cannot hold a P-256 private key) the next one is tried, so such a slot is never used.
+        for &slot in &empty[..n_empty] {
             match with_chip(|c| c.gen_key(slot)) {
                 Ok(pubkey) => {
                     critical_section::with(|cs| {
@@ -263,8 +310,8 @@ impl EcSecretKey for SeSecretKey {
                         let u = USED.borrow(cs);
                         u.set(u.get().map(|n| (n + 1).min(SLOTS)));
                     });
-                    if let Some(rp) = &rp {
-                        dir_record(slot, rp);
+                    if let (Some(rp), Some(dir)) = (&rp, dir.as_mut()) {
+                        dir_record(dir, slot, rp);
                     }
                     return SeSecretKey { slot, pubkey };
                 }

@@ -11,11 +11,12 @@ The chip does six things and nothing else. Everything else runs on the Pico.
 | Public key extraction | GenKey (public mode) | `import()` |
 | Random numbers | Random | `env/rng.rs` (seed of a ChaCha20 DRBG) |
 
-**No chip counter is used.** Signatures are unlimited (see "Signatures" below). There is **one key per site**:
-a new site takes the first free credential slot (free = the chip has no private key there, public-key read fails
-with status 0x0F) and is entered in a directory in data slot 13 (Read/Write of 32-byte blocks in the clear);
-later accounts at the same site find their slot there and use no new one. Slots are never overwritten. All state
-lives in the chip itself and survives power cycles (and works with any Pico). For the OLED the firmware also reads
+**No chip counter is used and nothing but keys is stored in the chip.** Signatures are unlimited (see "Signatures" below).
+There is **one key per site**: a new site takes the first credential slot that already holds a private key and
+belongs to no other site (the key is used as it is), or, if there is none, the first empty slot (public-key read
+fails with status 0x0F), where GenKey creates a key. Which site owns which slot is recorded in a directory in the
+**Pico's flash** (`src/env/dir_flash.rs`), not in the chip; later accounts at the same site find their slot there and
+use no new one. Slots that belong to a site are never overwritten. For the OLED the firmware also reads
 the chip's identity once (Info revision + config-zone reads: serial number, I2C address, lock bytes) and scans
 the 9 credential slots once at start-up (about 0.5 s).
 
@@ -40,18 +41,19 @@ chip the firmware halts at start-up (the credential keys and the RNG seed come f
 * **Slot 0: attestation key** (ECC P-256, created once with `tools/make_attest_cert.py`; the firmware
   never overwrites it).
 * **Slots 1-9: credential keys, one per site** (9 sites). A site that has no key yet takes the first slot that
-  holds no key; **a slot that holds a key is never regenerated or overwritten**. Further accounts at that site
-  reuse its key. A registration at a 10th site is refused (the firmware panics and restarts; unplug/replug),
-  and the 9 existing keys stay. A FIDO reset does NOT free slots (it only deletes the credential records on the
-  Pico), so the 9 sites are for the life of the chip. If the chip refuses GenKey in a free slot, the firmware skips it (that slot is
+  holds a key and belongs to no other site (used as it is); if there is none, the first slot that holds no key gets
+  a new key (GenKey). **A slot that belongs to a site is never regenerated or overwritten.** Further accounts at that
+  site reuse its key. A registration at a 10th site is refused (the firmware panics and restarts; unplug/replug),
+  and the 9 existing keys stay. A FIDO reset does NOT clear the site list (it is in its own flash page, outside
+  OpenSK's store). If the chip refuses GenKey in an empty slot, the firmware skips it (that slot is
   never used; check with `ecc-gen 8` / `ecc-gen 9` on your chip).
 * Every slot 0-9: SlotConfig `81 20`, KeyConfig `13 00` = ECC P-256 private key, secret, external
   signatures only, no ECDH, no PrivWrite, **GenKey allowed** (regenerable after locking), public key
   derivable, **no LimitedUse bit**.
-* **Slot 13: the site directory** (data slot, 72 bytes, `00 00` / `3C 00` = readable and writable in the clear,
-  also after the zones are locked; only the first 64 bytes are used). For credential slot 1..9, bytes
-  7·(n-1) .. 7·n hold the first 7 bytes of the SHA-256 of the site name (all zero = empty). If your chip refuses
-  access to slot 13, the firmware still works but every registration then takes a new slot (no sharing).
+* **Slot 13: not used any more.** Earlier firmware kept the site directory there; this firmware neither reads nor
+  writes it (the directory is in the Pico's flash: 4 KiB page below the OpenSK store, format in `src/se/dirlog.rs`).
+  The slot keeps its general-config values and nothing needs to change in the chip's configuration. Old content
+  stays until you overwrite it yourself.
 * Slots 10-12, 14, 15: not used by this firmware; they keep the general config's values (SlotConfig `8F8F 8F8F 0000 0000 0000 8F8F`, KeyConfig `1800 1C00 3000 3C00 3C00 1C00`).
 * Counters: not used by the firmware. Counter 0 / 1 fields are the factory value 0 (`FFFFFFFF 00000000`, ignored), LastKeyUse is `00` and ChipMode `00`, all as on a factory-default chip. Byte 14 (I2C_Enable, `01` in the image) and the serial are read-only on the chip.
 
@@ -103,8 +105,9 @@ Never set LimitedUse on these slots unless you want the chip itself to count.
 2. OLED, second page: serial number, revision (`00006003`) and both lock states match `atecc ... info` / `read-config`.
 3. Register at 9 different sites (the OLED shows `KEYS 9/9 FULL`), then try a 10th site: it must be refused and all
    nine must still work. Register a second account at one of the 9 sites: it must succeed and `KEYS` must not
-   change (this proves that slot 13 can be read and written after `lock-data`; if `KEYS` grows, the chip refuses
-   slot 13). First check on a spare chip that `ecc-pub` of an unused credential slot fails
+   change (the site list is read from the Pico's flash; if `KEYS` grows, the second account took a new slot, which
+   means the directory page was not saved). With a spare chip that already has keys in some slots, check that new
+   sites take those keys first and run GenKey only in the empty slots. First check on a spare chip that `ecc-pub` of an unused credential slot fails
    (the firmware relies on that to tell a free slot from a used one; if your chip answers differently, no
    registration will work: it fails safe).
 4. Unplug/replug: the used-slot count must be the same (it is read from the chip).

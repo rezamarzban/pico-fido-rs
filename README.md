@@ -7,7 +7,7 @@ repository is the RP2040 platform layer around it. **Experimental. Read `SECURIT
 ## What is where
 | In the ATECC608A (`src/se/`) | On the Pico |
 |---|---|
-| 9 credential private keys, **one per site** (GenKey, ECDSA signing; unlimited signatures) and the site directory (data slot 13) | OpenSK with its standard key-value store (`src/env/persist.rs`, `flash_store.rs`) |
+| 9 credential private keys, **one per site** (GenKey, ECDSA signing; unlimited signatures). **Nothing else is stored in the chip** | OpenSK with its standard key-value store (`src/env/persist.rs`, `flash_store.rs`) and the **site directory** (which site owns which key slot, `src/env/dir_flash.rs`, `src/se/dirlog.rs`) |
 | 1 attestation private key (slot 0, created once) | ClientPIN, PIN hash, credential-ID encryption keys, resident credentials: all OpenSK standard |
 | Public-key extraction | SHA-256 / HMAC / AES / HKDF / ECDH in software (`src/se/crypto.rs`) |
 | Random (the only entropy source) | RNG = ChaCha20 DRBG seeded and re-seeded from the chip (`src/env/rng.rs`) |
@@ -21,6 +21,7 @@ Chip details, wiring, slot layout and provisioning: `atecc608a/CONFIG.md`.
 | Main loop, flash layout constants | `src/main.rs` |
 | `opensk::env::Env` for the Pico | `src/env/mod.rs` |
 | Chip: protocol, commands, OpenSK `Ecdsa`, I2C bus | `src/se/{proto,chip,ecdsa,crypto,i2c}.rs` |
+| Site directory in the Pico's flash | `src/se/dirlog.rs` (page format), `src/env/dir_flash.rs` (flash access) |
 | Status display (optional, feature `oled`) | `src/oled.rs`, `src/status.rs` |
 
 OpenSK blocks (waiting for the button, waiting for the chip), so it runs in thread mode. USB, the LED and
@@ -34,10 +35,20 @@ keeps one key per site (`src/se/ecdsa.rs`). It only adds two default methods to 
 changes. `build.sh`, `host-test/run.sh` and CI apply it with `sh third_party/apply-opensk-patch.sh` (safe to run again).
 
 ## Flash layout
-The last **72 KiB** of flash (18 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store; `build.rs`
-keeps them out of the linker's FLASH region and derives everything from the single `flash_*` feature.
+The last **76 KiB** of flash are kept out of the linker's FLASH region by `build.rs` (derived from the single `flash_*`
+feature): **72 KiB** (18 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store, and the **4 KiB page right below
+it** holds the site directory (`src/env/dir_flash.rs`). The directory page is not part of the store: OpenSK's reset
+and the store's format never touch it. Erasing the whole flash clears it too (see "Key slots" below).
 This differs from the previous revision (which also had a vault and PUF sectors): **erase the whole flash
 before the first install**; credentials of the old firmware are not usable anyway.
+
+## Key slots (one key per site)
+The site directory (which site owns which of the 9 credential slots) is in the Pico's flash, not in the chip. For a
+site that has no slot yet, `se/ecdsa.rs` takes, in this order: (1) the first slot that already **holds a private key**
+and belongs to no other site (the key is used as it is, no GenKey); (2) otherwise the first **empty** slot, where it runs
+GenKey. Slots owned by another site are never touched. If the directory is lost (flash erased), the keys are still in
+the chip and are taken over again, one per site, in slot order; credentials registered earlier keep working (their
+credential ID names the slot), but a site may then end up with another site's old key (see `SECURITY.md`).
 
 ## Build
 Needs the **nightly** pinned in `rust-toolchain.toml` and `flip-link`. Release builds are size-optimised.
@@ -68,8 +79,8 @@ certificate, which is stored in the token once with OpenSK's `tools/configure.py
 ## Verification status
 **The `atecc1` code up to "OpenSK based ATECC support v2.1" was built and tested on browsers and operating
 systems** (reported by the maintainer, not independently verified). **Not compiled by their author:** the later changes (unlimited signatures, no counters, keys never overwritten, the chip page of the
-OLED, the Info/Read chip commands, one key per site). For the last one, `host-test/se` (26 tests, incl. the site directory against a
-software chip model) and OpenSK's own unit tests (353 / 374, with the patch applied) were run on a host; the firmware itself
+OLED, the Info/Read chip commands, one key per site, **and the move of the site directory from chip slot 13 to the Pico's flash with taking over existing keys**; the
+latter was written without a compiler and has not been built or run). `host-test/se` (the directory tests now use a flash-page model and a `DirStore`; run them to see the current count) and OpenSK's own unit tests (353 / 374, with the patch applied) were run on a host; the firmware itself
 (thumbv6m, nightly) was not built and nothing was run on a real chip or in a browser. Build, then run `host-test/run.sh` and the acceptance test in
 `atecc608a/CONFIG.md` on a spare chip before locking a chip you care about. USB VID/PID
 (`0xc0de:0xcafe`) are prototype placeholders (`src/usb/mod.rs`).

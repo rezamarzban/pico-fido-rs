@@ -17,9 +17,9 @@ use crate::{FLASH_SIZE, STORE_PAGES};
 pub const PAGE_SIZE: usize = 4096;
 const STORE_BYTES: usize = STORE_PAGES * PAGE_SIZE;
 /// The store occupies the very end of flash.
-const STORE_START: usize = FLASH_SIZE - STORE_BYTES;
+pub const STORE_START: usize = FLASH_SIZE - STORE_BYTES;
 /// Start of the memory-mapped flash (XIP window).
-const XIP_BASE: usize = 0x1000_0000;
+pub const XIP_BASE: usize = 0x1000_0000;
 
 pub struct FlashStorage {
     flash: &'static RefCell<Fl>,
