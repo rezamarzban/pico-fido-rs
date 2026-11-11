@@ -10,12 +10,12 @@
 //! * While a command is being processed (signature, flash compaction) the display keeps the last
 //!   frame; the BUSY state shows up in the next one.
 //!
-//! Two pages of 8 lines (21 characters per line, upper case only), switched every `PAGE_MS`.
+//! Three pages of 8 lines (21 characters per line, upper case only), switched every `PAGE_MS`.
 //!
 //! Page 1, the device:
 //! ```text
 //! FIDO READY USB OK           state (READY / BUSY), USB (-- / OK / SLP)
-//! SE OK SIGNS UNLIMITED       secure element answered; signatures are not counted
+//! SE OK SIGNS 1234           secure element answered; total signatures (kept in the Pico's flash)
 //! UP 1:23:45 P1234            uptime, packets handled
 //! RAM 153K/264K HP 12K        RAM in use (static + stack), heap in use
 //! STK 1.2K FW214K             stack now, firmware size
@@ -28,9 +28,20 @@
 //! REV 00006003                Info(revision)
 //! CONFIG ZONE LOCKED          LockConfig (LOCKED / OPEN)
 //! DATA ZONE LOCKED            LockValue (LOCKED / OPEN)
-//! SLOTS 9 CRED 1 ATTEST       key slots used by the firmware
-//! KEYS 3/9 FREE 6             credential key slots in use, one per site (FULL: no more new sites)
-//! SIGNATURES UNLIMITED
+//! KEYS 3/9 PRESENT            credential slots that really hold a private key (asked from the chip)
+//! SITES 2/9 ASSIGNED          credential slots that belong to a site (the directory in the Pico's flash)
+//! SIGNS 1234                  total signatures (kept in the Pico's flash)
+//! ```
+//! Page 3, the private-key slots:
+//! ```text
+//! KEY SLOTS SITES 2/9         credential slots that belong to a site
+//! ATTEST 0: KEY               attestation slot: KEY / EMPTY
+//! 1:SITE 2:SITE 3:KEY         per credential slot: SITE = holds a key and belongs to a site,
+//! 4:EMPTY 5:EMPTY 6:EMPTY       KEY = holds a key, no site yet (the next new site takes it over),
+//! 7:EMPTY 8:EMPTY 9:EMPTY       EMPTY = no key (the next new site gets a GenKey here)
+//! SIGNS TOTAL 1234
+//! SIGNS BOOT  12
+//! SITE KEY EMPTY LEGEND
 //! ```
 use core::cell::UnsafeCell;
 use core::fmt::Write as _;
@@ -51,7 +62,7 @@ const W: usize = 128;
 const PAGES: usize = 8;
 const COLS: usize = 21;
 const FRAME_MS: u32 = 500;
-/// Each of the two pages stays this long.
+/// Each of the three pages stays this long.
 const PAGE_MS: u32 = 5_000;
 const RETRY_MS: u32 = 5_000;
 /// The first retry after a failed start-up probe comes this early (modules need up to ~100 ms
@@ -188,12 +199,55 @@ impl Oled {
     }
 
     fn render(&mut self) {
-        // Two pages, switched every PAGE_MS (the display only has 8 lines).
-        if (now_ms() / PAGE_MS) % 2 == 0 {
-            self.render_device();
-        } else {
-            self.render_chip();
+        // Three pages, switched every PAGE_MS (the display only has 8 lines).
+        match (now_ms() / PAGE_MS) % 3 {
+            0 => self.render_device(),
+            1 => self.render_chip(),
+            _ => self.render_slots(),
         }
+    }
+
+    /// Page 3: the private-key slots, who owns them, and the signature counts.
+    fn render_slots(&mut self) {
+        let b = &mut self.buf;
+        for r in 0..PAGES {
+            put_line(b, r, "");
+        }
+        if !st::SE_PRESENT.load(Ordering::Relaxed) {
+            put_line(b, 0, "SE NOT ANSWERING");
+            return;
+        }
+        let keys = st::KEY_MASK.load(Ordering::Relaxed);
+        let own = st::OWN_MASK.load(Ordering::Relaxed);
+        let sites = st::SE_SITES.load(Ordering::Relaxed);
+        if sites == st::SE_UNKNOWN {
+            put_fmt(b, 0, format_args!("KEY SLOTS SITES --"));
+        } else {
+            put_fmt(b, 0, format_args!("KEY SLOTS SITES {}/{}", sites, SLOTS));
+        }
+        put_fmt(b, 1, format_args!("ATTEST 0: {}", if keys & 1 != 0 { "KEY" } else { "EMPTY" }));
+        // Credential slots 1..=9, three per line, 7 characters per cell.
+        for row in 0..3usize {
+            let mut s: String<32> = String::new();
+            for col in 0..3usize {
+                let slot = 1 + row * 3 + col;
+                let state = if keys >> slot & 1 == 0 {
+                    "EMPTY"
+                } else if own >> slot & 1 != 0 {
+                    "SITE"
+                } else {
+                    "KEY"
+                };
+                let _ = write!(s, "{}:{:<5}", slot, state);
+                if col < 2 {
+                    let _ = s.push(' ');
+                }
+            }
+            put_line(b, 2 + row, &s);
+        }
+        put_fmt(b, 5, format_args!("SIGNS TOTAL {}", st::SIGS_TOTAL.load(Ordering::Relaxed)));
+        put_fmt(b, 6, format_args!("SIGNS BOOT  {}", st::SIGS_BOOT.load(Ordering::Relaxed)));
+        put_line(b, 7, "SITE KEY EMPTY LEGEND");
     }
 
     /// Page 2: everything known about the ATECC608A.
@@ -229,16 +283,20 @@ impl Oled {
         let lk = |bit: u8| if locks & bit != 0 { "LOCKED" } else { "OPEN" };
         put_fmt(b, 3, format_args!("CONFIG ZONE {}", lk(st::SE_CFG_LOCKED)));
         put_fmt(b, 4, format_args!("DATA ZONE {}", lk(st::SE_DATA_LOCKED)));
-        put_fmt(b, 5, format_args!("SLOTS {} CRED 1 ATTEST", SLOTS));
+        // Three independent counters: the chip's real state, the assignment to sites, the signatures.
         let regs = st::SE_REGS.load(Ordering::Relaxed);
+        let sites = st::SE_SITES.load(Ordering::Relaxed);
         if regs == st::SE_UNKNOWN {
-            put_fmt(b, 6, format_args!("KEYS --"));
-        } else if regs >= SLOTS as u32 {
-            put_fmt(b, 6, format_args!("KEYS {}/{} FULL", regs, SLOTS));
+            put_fmt(b, 5, format_args!("KEYS --/{} PRESENT", SLOTS));
         } else {
-            put_fmt(b, 6, format_args!("KEYS {}/{} FREE {}", regs, SLOTS, SLOTS as u32 - regs));
+            put_fmt(b, 5, format_args!("KEYS {}/{} PRESENT", regs, SLOTS));
         }
-        put_line(b, 7, "SIGNATURES UNLIMITED");
+        if sites == st::SE_UNKNOWN {
+            put_fmt(b, 6, format_args!("SITES --/{} ASSIGNED", SLOTS));
+        } else {
+            put_fmt(b, 6, format_args!("SITES {}/{} ASSIGNED", sites, SLOTS));
+        }
+        put_fmt(b, 7, format_args!("SIGNS {}", st::SIGS_TOTAL.load(Ordering::Relaxed)));
     }
 
     /// Page 1: state of the firmware and the Pico.
@@ -261,11 +319,12 @@ impl Oled {
             let _ = write!(s, "FIDO {} USB {}", state, usb);
         });
 
-        // ---- 1: secure element (signatures are not counted)
+        // ---- 1: secure element, total signatures (counted on the Pico)
         let se_ok = st::SE_PRESENT.load(Ordering::Relaxed);
+        let sigs = st::SIGS_TOTAL.load(Ordering::Relaxed);
         line(&mut self.buf, 1, &|s| {
             let _ = if se_ok {
-                write!(s, "SE OK SIGNS UNLIMITED")
+                write!(s, "SE OK SIGNS {}", sigs)
             } else {
                 write!(s, "SE -- NOT ANSWERING")
             };

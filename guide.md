@@ -49,7 +49,7 @@ almost solid = waiting for your button press.
   and use no new slot (the site can tell that those accounts come from the same key). Registering at a 10th site is
   refused (the key restarts; unplug and replug). The list of which site owns which slot is kept in the Pico's flash (not
   in the chip); a FIDO reset does not clear it, erasing the whole flash does (the keys stay in the chip and are handed
-  out again to new sites). The OLED shows `KEYS n/9` (slots that hold a key).
+  out again to new sites). The OLED's chip page shows `KEYS n/9 PRESENT` (slots that really hold a key, asked from the chip) and `SITES n/9 ASSIGNED` (slots that belong to a site, from the flash directory) separately, then `SIGNS` (total signatures).
 - **Unlimited signatures.** Signatures are not counted, there is no budget. (If your chip was provisioned with the old
   500-signature Counter 0, that counter is simply ignored now.)
 - **OLED.** Two pages, switching every 5 s: the device (state, USB, uptime, RAM, flash) and the ATECC608A (I2C

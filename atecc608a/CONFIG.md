@@ -103,9 +103,9 @@ Never set LimitedUse on these slots unless you want the chip itself to count.
 ## Acceptance test on real hardware (do this before locking a chip you care about)
 1. Sign more than 500 times through a browser/`fido2` tool: every signature works and `counter-read 0` does not change.
 2. OLED, second page: serial number, revision (`00006003`) and both lock states match `atecc ... info` / `read-config`.
-3. Register at 9 different sites (the OLED shows `KEYS 9/9 FULL`), then try a 10th site: it must be refused and all
-   nine must still work. Register a second account at one of the 9 sites: it must succeed and `KEYS` must not
-   change (the site list is read from the Pico's flash; if `KEYS` grows, the second account took a new slot, which
+3. Register at 9 different sites (the OLED shows `KEYS 9/9 PRESENT` and `SITES 9/9 ASSIGNED`), then try a 10th site: it must be refused and all
+   nine must still work. Register a second account at one of the 9 sites: it must succeed and `SITES` must not
+   change (the site list is read from the Pico's flash; if `SITES` grows, the second account took a new slot, which
    means the directory page was not saved). With a spare chip that already has keys in some slots, check that new
    sites take those keys first and run GenKey only in the empty slots. First check on a spare chip that `ecc-pub` of an unused credential slot fails
    (the firmware relies on that to tell a free slot from a used one; if your chip answers differently, no

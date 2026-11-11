@@ -27,6 +27,15 @@ pub static SE_LOCKS: AtomicU8 = AtomicU8::new(0);
 pub const SE_UNKNOWN: u32 = u32::MAX;
 pub static SE_REGS: AtomicU32 = AtomicU32::new(SE_UNKNOWN);
 
+/// Credential slots that belong to a site (0..=9; `SE_UNKNOWN` = not known yet).
+pub static SE_SITES: AtomicU32 = AtomicU32::new(SE_UNKNOWN);
+/// Bit n = chip slot n holds a private key (bit 0 = attestation slot) / belongs to a site.
+pub static KEY_MASK: AtomicU32 = AtomicU32::new(0);
+pub static OWN_MASK: AtomicU32 = AtomicU32::new(0);
+/// Signatures made: lifetime total (kept in the Pico's flash) and since power-up.
+pub static SIGS_TOTAL: AtomicU32 = AtomicU32::new(0);
+pub static SIGS_BOOT: AtomicU32 = AtomicU32::new(0);
+
 /// Stores the chip identity read at start-up.
 pub fn set_se(i: &crate::se::proto::ChipInfo) {
     let s = &i.serial;

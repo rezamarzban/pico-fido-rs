@@ -1,7 +1,8 @@
 //! Generates the linker memory map (`memory.x`) from the selected `flash_*` Cargo feature and
-//! puts it where the linker finds it. The last 76 KiB of flash are left out of the FLASH region:
-//! 72 KiB hold the OpenSK key-value store (STORE_PAGES in src/main.rs) and the 4 KiB page below it
-//! holds the site directory (src/env/dir_flash.rs). Because this is the single
+//! puts it where the linker finds it. The last 80 KiB of flash are left out of the FLASH region:
+//! 72 KiB hold the OpenSK key-value store (STORE_PAGES in src/main.rs), the 4 KiB page below it
+//! the site directory (src/env/dir_flash.rs) and the 4 KiB page below that the signature counter
+//! (src/env/tally_flash.rs). Because this is the single
 //! source of the flash size, the linker layout cannot disagree with `FLASH_SIZE` in main.rs.
 
 use std::env;
@@ -28,8 +29,8 @@ fn main() {
     let memory = format!(
         "MEMORY {{\n\
          \x20   BOOT2 : ORIGIN = 0x10000000, LENGTH = 0x100\n\
-         \x20   /* last 76K of the {flash_kib}K flash: site directory (4K) + key-value store (72K) */\n\
-         \x20   FLASH : ORIGIN = 0x10000100, LENGTH = {flash_kib}K - 0x100 - 76K\n\
+         \x20   /* last 80K of the {flash_kib}K flash: signature counter (4K) + site directory (4K) + key-value store (72K) */\n\
+         \x20   FLASH : ORIGIN = 0x10000100, LENGTH = {flash_kib}K - 0x100 - 80K\n\
          \x20   RAM   : ORIGIN = 0x20000000, LENGTH = 264K\n\
          }}\n"
     );

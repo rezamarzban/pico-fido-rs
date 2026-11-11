@@ -57,6 +57,33 @@ pub trait DirStore {
     fn save(&mut self, dir: &[u8; DIR_LEN]) -> Result<(), ()>;
 }
 
+/// Where the lifetime signature count is kept (the Pico's flash: the chip counts nothing). `bump`
+/// is called once for every signature the chip made; it may fail silently (the count then lags).
+pub trait SigTally {
+    fn bump(&mut self);
+}
+
+/// Which slots hold a key and which belong to a site. Bit n = slot n (bit 0 = attestation slot).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SlotReport {
+    pub has_key: u16,
+    pub owned: u16,
+}
+
+/// Bits of the credential slots in a `SlotReport`.
+pub const CRED_MASK: u16 = (((1u32 << SLOTS) - 1) << FIRST_CRED_SLOT) as u16;
+
+impl SlotReport {
+    /// Credential slots that hold a key AND belong to a site.
+    pub fn sites(&self) -> u8 {
+        (self.has_key & self.owned & CRED_MASK).count_ones() as u8
+    }
+    /// Credential slots that hold a key.
+    pub fn keys(&self) -> u8 {
+        (self.has_key & CRED_MASK).count_ones() as u8
+    }
+}
+
 /// Handle of a credential key (slot < SLOTS) / of the attestation key (slot == ATTEST_SLOT).
 pub const HANDLE_CRED: u8 = 1;
 pub const HANDLE_ATTEST: u8 = 2;
@@ -69,9 +96,13 @@ pub const COUNTER_MAX: u32 = 2_097_151;
 
 type Chip = &'static mut (dyn ChipOps + Send);
 type Dir = &'static mut (dyn DirStore + Send);
+type Tally = &'static mut (dyn SigTally + Send);
 
 static CHIP: Mutex<RefCell<Option<Chip>>> = Mutex::new(RefCell::new(None));
 static DIR: Mutex<RefCell<Option<Dir>>> = Mutex::new(RefCell::new(None));
+static TALLY: Mutex<RefCell<Option<Tally>>> = Mutex::new(RefCell::new(None));
+/// Slots (bit n = slot n, 0 = attestation) known to hold a key (`None` until `scan_slots` ran).
+static KEYS: Mutex<Cell<Option<u16>>> = Mutex::new(Cell::new(None));
 /// Chip status of GenKey(public) on a slot without a private key (execution error).
 const STATUS_EMPTY_SLOT: u8 = 0x0F;
 /// Credential slots known to hold a key (`None` until `scan_slots` ran).
@@ -89,11 +120,18 @@ pub fn install_dir(dir: Dir) {
     critical_section::with(|cs| *DIR.borrow(cs).borrow_mut() = Some(dir));
 }
 
+/// Registers the lifetime signature counter (the Pico's flash). Without it signatures are not counted.
+pub fn install_tally(t: Tally) {
+    critical_section::with(|cs| *TALLY.borrow(cs).borrow_mut() = Some(t));
+}
+
 /// Removes the drivers again (host tests).
 pub fn uninstall() {
     critical_section::with(|cs| {
         *CHIP.borrow(cs).borrow_mut() = None;
         *DIR.borrow(cs).borrow_mut() = None;
+        *TALLY.borrow(cs).borrow_mut() = None;
+        KEYS.borrow(cs).set(None);
         *PUBKEYS.borrow(cs).borrow_mut() = [None; 16];
         USED.borrow(cs).set(None);
     });
@@ -131,17 +169,41 @@ fn slot_has_key(slot: u8) -> Result<bool, Error> {
     }
 }
 
-/// Counts the credential slots that hold a key (reads every slot once: ~0.5 s, call at start-up)
-/// and remembers the result for `used_slots()`. `None`: the chip did not answer cleanly.
+/// Counts the credential slots that hold a key (reads every slot once, the attestation slot too:
+/// ~0.5 s, call at start-up) and remembers the result for `used_slots()` / `slot_report()`.
+/// `None`: the chip did not answer cleanly.
 pub fn scan_slots() -> Option<u8> {
     let mut used = 0u8;
-    for slot in FIRST_CRED_SLOT..FIRST_CRED_SLOT + SLOTS {
+    let mut mask = 0u16;
+    for slot in ATTEST_SLOT..FIRST_CRED_SLOT + SLOTS {
         if slot_has_key(slot).ok()? {
-            used += 1;
+            mask |= 1 << slot;
+            if slot >= FIRST_CRED_SLOT {
+                used += 1;
+            }
         }
     }
-    critical_section::with(|cs| USED.borrow(cs).set(Some(used)));
+    critical_section::with(|cs| {
+        USED.borrow(cs).set(Some(used));
+        KEYS.borrow(cs).set(Some(mask));
+    });
     Some(used)
+}
+
+/// Key slots and site ownership for the display: which slots hold a key (as of the last
+/// `scan_slots()` plus the keys created since) and which belong to a site (the flash directory,
+/// read now). `None` before the first scan.
+pub fn slot_report() -> Option<SlotReport> {
+    let has_key = critical_section::with(|cs| KEYS.borrow(cs).get())?;
+    let mut owned = 0u16;
+    if let Some(dir) = with_dir(|d| d.load()) {
+        for i in 0..SLOTS as usize {
+            if dir_owned(&dir, i) {
+                owned |= 1 << (FIRST_CRED_SLOT as usize + i);
+            }
+        }
+    }
+    Some(SlotReport { has_key, owned })
 }
 
 /// Credential slots in use as of the last `scan_slots()` plus the keys created since (no chip
@@ -187,6 +249,15 @@ fn with_dir<R>(f: impl FnOnce(&mut dyn DirStore) -> R) -> Option<R> {
     let r = f(&mut *dir);
     critical_section::with(|cs| *DIR.borrow(cs).borrow_mut() = Some(dir));
     Some(r)
+}
+
+/// Counts one signature (no-op without a tally).
+fn tally_bump() {
+    let t = critical_section::with(|cs| TALLY.borrow(cs).borrow_mut().take());
+    if let Some(t) = t {
+        t.bump();
+        critical_section::with(|cs| *TALLY.borrow(cs).borrow_mut() = Some(t));
+    }
 }
 
 /// The directory entry of an RP (never all zero, that means "empty").
@@ -309,6 +380,8 @@ impl EcSecretKey for SeSecretKey {
                         PUBKEYS.borrow(cs).borrow_mut()[slot as usize] = Some(pubkey);
                         let u = USED.borrow(cs);
                         u.set(u.get().map(|n| (n + 1).min(SLOTS)));
+                        let k = KEYS.borrow(cs);
+                        k.set(k.get().map(|m| m | (1 << slot)));
                     });
                     if let (Some(rp), Some(dir)) = (&rp, dir.as_mut()) {
                         dir_record(dir, slot, rp);
@@ -334,6 +407,7 @@ impl EcSecretKey for SeSecretKey {
         let digest: [u8; 32] = Sha256::digest(message).into();
         match with_chip(|c| c.sign(self.slot, &digest)) {
             Ok(sig) => {
+                tally_bump();
                 let mut r = [0u8; 32];
                 let mut s = [0u8; 32];
                 r.copy_from_slice(&sig[..32]);

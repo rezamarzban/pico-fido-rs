@@ -1,0 +1,60 @@
+//! Lifetime signature counter in the Pico's flash (the chip counts nothing). One more 4 KiB page,
+//! directly below the site directory page (build.rs keeps it out of the linker's FLASH region).
+//! The format (an append-only log, one record per signature) is in `se/tallylog.rs`, host-tested.
+//! The total and the count since power-up are published to the display through `crate::status`.
+
+use core::cell::RefCell;
+use portable_atomic::Ordering;
+
+use super::dir_flash::DIR_START;
+use super::flash_store::{PAGE_SIZE, XIP_BASE};
+use crate::keys::Fl;
+use crate::se::dirlog::{Plan, PAGE};
+use crate::se::ecdsa::SigTally;
+use crate::se::tallylog;
+use crate::status;
+
+const _: () = assert!(PAGE_SIZE == PAGE);
+
+/// The counter page: the 4 KiB right below the directory page.
+pub const TALLY_START: usize = DIR_START - PAGE_SIZE;
+
+pub struct FlashTally {
+    flash: &'static RefCell<Fl>,
+    total: u32,
+}
+
+// SAFETY: single core; only used from OpenSK's thread-mode code (signing), never from the USB executor.
+unsafe impl Send for FlashTally {}
+
+fn page() -> &'static [u8] {
+    // SAFETY: TALLY_START..+PAGE_SIZE lies inside the memory-mapped flash, outside the firmware
+    // image (build.rs) and the other flash areas; nothing writes it concurrently.
+    unsafe { core::slice::from_raw_parts((XIP_BASE + TALLY_START) as *const u8, PAGE_SIZE) }
+}
+
+impl FlashTally {
+    /// Reads the stored total and publishes it.
+    pub fn new(flash: &'static RefCell<Fl>) -> Self {
+        let total = tallylog::scan(page()).0;
+        status::SIGS_TOTAL.store(total, Ordering::Relaxed);
+        FlashTally { flash, total }
+    }
+}
+
+impl SigTally for FlashTally {
+    fn bump(&mut self) {
+        self.total = self.total.saturating_add(1);
+        status::SIGS_TOTAL.store(self.total, Ordering::Relaxed);
+        status::SIGS_BOOT.fetch_add(1, Ordering::Relaxed);
+        let mut flash = self.flash.borrow_mut();
+        // A failed write only means the stored total lags behind; signing goes on.
+        let _ = match tallylog::plan(page(), self.total) {
+            Plan::Nothing => Ok(()),
+            Plan::Append { offset, data } => flash.blocking_write((TALLY_START + offset) as u32, &data),
+            Plan::Rewrite { data } => flash
+                .blocking_erase(TALLY_START as u32, (TALLY_START + PAGE_SIZE) as u32)
+                .and_then(|_| flash.blocking_write(TALLY_START as u32, &data)),
+        };
+    }
+}

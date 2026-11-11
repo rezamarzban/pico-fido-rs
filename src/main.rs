@@ -31,7 +31,7 @@ mod status;
 mod usb;
 
 use core::cell::RefCell;
-use env::{FlashDir, PicoEnv, PicoPersist, PicoUserPresence};
+use env::{FlashDir, FlashTally, PicoEnv, PicoPersist, PicoUserPresence};
 use static_cell::StaticCell;
 use opensk::api::connection::{HidConnection as _, UsbEndpoint};
 use opensk::env::Env as _;
@@ -53,7 +53,8 @@ pub const FLASH_SIZE: usize = FLASH_MB * 1024 * 1024;
 /// same area out of the linker's FLASH region: change them together.
 pub const STORE_PAGES: usize = 18;
 // One more 4 KiB page directly below the store holds the site directory (src/env/dir_flash.rs);
-// build.rs leaves it out of the linker's FLASH region too (72 KiB + 4 KiB = 76 KiB).
+// the signature counter (src/env/tally_flash.rs) has the page below that; build.rs leaves both out
+// of the linker's FLASH region too (72 + 4 + 4 = 80 KiB).
 
 // Heap for OpenSK (alloc): credentials, CBOR, the P-256 software crypto, message buffers.
 const HEAP_SIZE: usize = 128 * 1024;
@@ -95,6 +96,18 @@ async fn usb_executor_init(parts: AssertSend<UsbParts>) {
     spawner.spawn(usb::run_usb(device)).unwrap();
     spawner.spawn(usb::usb_io(reader, writer)).unwrap();
     spawner.spawn(blinker(led)).unwrap();
+}
+
+/// Publishes which chip slots hold a key and how many belong to a site (for the status display;
+/// reads the flash directory, no chip access).
+fn refresh_slot_status() {
+    use portable_atomic::Ordering::Relaxed;
+    if let Some(r) = se::ecdsa::slot_report() {
+        status::SE_REGS.store(r.keys() as u32, Relaxed);
+        status::SE_SITES.store(r.sites() as u32, Relaxed);
+        status::KEY_MASK.store(r.has_key as u32, Relaxed);
+        status::OWN_MASK.store(r.owned as u32, Relaxed);
+    }
 }
 
 /// Heap in use, bytes (for the status display).
@@ -145,6 +158,10 @@ fn main() -> ! {
     // The site directory (which site owns which chip key slot) is in the Pico's flash, not in the chip.
     static DIR: StaticCell<FlashDir> = StaticCell::new();
     se::ecdsa::install_dir(DIR.init(FlashDir::new(flash)));
+    // The lifetime signature count is in the Pico's flash too (the chip counts nothing).
+    static TALLY: StaticCell<FlashTally> = StaticCell::new();
+    se::ecdsa::install_tally(TALLY.init(FlashTally::new(flash)));
+    refresh_slot_status();
     let env = PicoEnv::new(PicoPersist::new(flash), PicoUserPresence::new(p.BOOTSEL));
     let mut ctap = Ctap::new(env);
     info!("OpenSK initialised");
@@ -170,9 +187,7 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
                 if let Some((u, tot, lu, lt)) = ctap.env().persist().stats() {
                     status::set_store(u, tot, lu, lt);
                 }
-                if let Some(n) = se::ecdsa::used_slots() {
-                    status::SE_REGS.store(n as u32, portable_atomic::Ordering::Relaxed);
-                }
+                refresh_slot_status();
             }
         }
         let wink = ctap.should_wink();
@@ -235,6 +250,8 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
                 }
             }
             status::BUSY.store(false, portable_atomic::Ordering::Relaxed);
+            // A registration may have taken a slot: update the key-slot page of the display.
+            refresh_slot_status();
             if !u2f_armed && !winking {
                 LED_SIGNAL.signal(LedState::Active);
             }

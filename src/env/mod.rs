@@ -10,10 +10,12 @@ mod flash_store;
 pub mod hid;
 mod persist;
 mod rng;
+mod tally_flash;
 mod user_presence;
 
 use clock::PicoClock;
 pub use dir_flash::FlashDir;
+pub use tally_flash::FlashTally;
 use hid::PicoHidConnection;
 pub use persist::PicoPersist;
 use rng::PicoRng;
