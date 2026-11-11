@@ -16,6 +16,8 @@ const RESEED_BYTES: u32 = 1024;
 pub struct PicoRng {
     drbg: ChaCha20Rng,
     since_seed: u32,
+    /// Relying party of the key about to be created (set by OpenSK, see third_party/opensk-rp-hint.patch).
+    rp_hint: Option<[u8; 32]>,
 }
 
 fn seed() -> [u8; 32] {
@@ -33,6 +35,7 @@ impl PicoRng {
         Self {
             drbg: ChaCha20Rng::from_seed(seed()),
             since_seed: 0,
+            rp_hint: None,
         }
     }
 }
@@ -67,4 +70,12 @@ impl RngCore for PicoRng {
 
 impl CryptoRng for PicoRng {}
 
-impl Rng for PicoRng {}
+impl Rng for PicoRng {
+    fn set_rp_id_hash(&mut self, rp_id_hash: &[u8; 32]) {
+        self.rp_hint = Some(*rp_id_hash);
+    }
+
+    fn take_rp_id_hash(&mut self) -> Option<[u8; 32]> {
+        self.rp_hint.take()
+    }
+}

@@ -21,10 +21,14 @@ Experimental firmware; read this before relying on it.
 * **The chip does not authenticate the Pico.** Code running on the Pico, or a probe on the I2C
   bus, can make the chip sign (without limit). User presence is the BOOTSEL button,
   checked by the Pico.
-* **Only 9 registrations, for the life of the chip.** Keys in the chip slots are never overwritten or
-  regenerated; the 10th registration is refused (firmware panic and restart) and a FIDO reset does not free
-  slots. The firmware tells a free slot from a used one by asking the chip for the public key (status 0x0F =
+* **Only 9 sites, for the life of the chip.** Keys in the chip slots are never overwritten or
+  regenerated; a registration at a 10th site is refused (firmware panic and restart) and a FIDO reset does not free
+  slots. Accounts at a site that already has a key reuse it. The firmware tells a free slot from a used one by asking the chip for the public key (status 0x0F =
   no private key there); a bus error is never taken for "free".
+* **Accounts at the same site share one public key**, so that site can link them (different sites never share
+  one). The chip's data slot 13 lists, for every key slot, the first 7 bytes of the SHA-256 of the site name in the
+  clear: anyone holding the chip can test guesses of site names against it. A site name with the same 7-byte prefix
+  as another site would get that site's key (only the public key is shared, it cannot sign for the other site).
 * Attestation with the per-device key (`use_batch_attestation`, and always for U2F) lets sites
   recognise the device.
 

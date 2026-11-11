@@ -43,9 +43,10 @@ LED: fast blink (200 ms on/off) = ready; very fast flicker = busy (or the browse
 almost solid = waiting for your button press.
 
 ## 5. Things to know
-- **Nine credentials at most, for the life of the chip.** Each credential uses one key slot (1-9) in the secure
-  element and keys are never overwritten. The 10th registration is refused (the key restarts; unplug and replug), and
-  a reset does not free slots. The OLED shows `KEYS n/9`.
+- **Nine sites at most, for the life of the chip.** Each *site* uses one key slot (1-9) in the secure element and keys
+  are never overwritten. Further accounts at a site that already has a key reuse that key and use no new slot (the
+  site can tell that those accounts come from the same key). Registering at a 10th site is refused (the key restarts;
+  unplug and replug), and a reset does not free slots. The OLED shows `KEYS n/9` (sites with a key).
 - **Unlimited signatures.** Signatures are not counted, there is no budget. (If your chip was provisioned with the old
   500-signature Counter 0, that counter is simply ignored now.)
 - **OLED.** Two pages, switching every 5 s: the device (state, USB, uptime, RAM, flash) and the ATECC608A (I2C

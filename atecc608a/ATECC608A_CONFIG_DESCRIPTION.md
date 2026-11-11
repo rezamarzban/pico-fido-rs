@@ -53,9 +53,10 @@ It is the 128-byte **config zone** as `atecc write-config` expects it. It is pro
 | Slot | Bytes | Role in this project |
 |---|---|---|
 | 0 | `81 20` | **Attestation key** (ECC P-256 private key, created once) |
-| 1-9 | `81 20` | **Credential keys** (ECC P-256 private keys, 9 registrations) |
+| 1-9 | `81 20` | **Credential keys** (ECC P-256 private keys, one per site: 9 sites) |
 | 10, 11 | `8F 8F` | Unused (general-config AES / SHA / data slots) |
-| 12, 13, 14 | `00 00` | Unused |
+| 13 | `00 00` | **Site directory** (data slot, clear read/write; see section 5) |
+| 12, 14 | `00 00` | Unused |
 | 15 | `8F 8F` | Unused |
 
 Decoding `81 20` (ECC private key slot):
@@ -74,7 +75,8 @@ Decoding `81 20` (ECC private key slot):
 | byte 1 bits 7:4 | WriteConfig | 2 | Bit 1 set: **GenKey allowed** (key can be generated or regenerated, also after lock). Bit 2 (PrivWrite) clear: no writing a private key in |
 
 Slots 10-15 keep the general-config values (`8F 8F` = ReadKey 15, WriteKey 15, IsSecret; `00 00` = no
-restrictions). The firmware never touches these slots.
+restrictions). The firmware uses only slot 13 (`00 00` plus KeyConfig `3C 00`: a data slot with no read or write
+restriction, 72 bytes); the others are never touched.
 
 ## 4. KeyConfig (bytes 96-127)
 
@@ -99,10 +101,14 @@ KeyType = `100` = P-256. The high byte is `00` everywhere: no AuthKey, no Intrus
 | Read public key | GenKey (public mode) | 0-9 |
 | ECDSA P-256 sign | Nonce (pass-through) + Sign (external) | 0-9 |
 | Random numbers | Random | n/a |
+| Site directory (which site owns which key slot) | Read / Write, 32-byte blocks in the clear | 13 |
 | Chip identity for the display | Info + config-zone reads | n/a |
 
 A credential slot is "free" when the chip has no private key there (public-key read fails). A slot that holds a
-key is never regenerated. No counters, no LimitedUse, no PIN or authentication in the chip.
+key is never regenerated. **One key per site:** the directory in slot 13 holds, for credential slots 1-9, the first
+7 bytes of the SHA-256 of the site name (7 x 9 = 63 of the first 64 bytes, all zero = empty). A registration looks
+the site up there; if found, that key is used again and no slot is consumed, otherwise the first free slot gets a
+new key and the site is entered. No counters, no LimitedUse, no PIN or authentication in the chip.
 
 ## 6. Difference from the factory-default chip (`config.bin`)
 

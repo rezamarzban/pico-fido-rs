@@ -14,7 +14,8 @@ allowed (also after the zones are locked), external signatures only (no ECDH, no
 key derivable. Slot 0 is the attestation key, the others are credential keys. There is NO
 LimitedUse bit and no signature budget: the firmware does not use the chip counters (the counter
 fields hold the factory value 0 and are ignored). All other slots are left
-unused (same SlotConfig / KeyConfig as the reference image).
+unused (same SlotConfig / KeyConfig as the reference image), except slot 13, which the
+firmware uses as the clear-readable/writable site directory (the reference image already allows that).
 """
 import argparse, os, sys
 
