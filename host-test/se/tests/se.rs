@@ -24,7 +24,7 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{CryptoRng, RngCore, SeedableRng};
 use se::chip::{Atecc, Bus, ChipOps};
-use se::ecdsa::{self, SeEcdsa, SeSecretKey, ATTEST_SLOT, COUNTER_MAX, FIRST_CRED_SLOT, HANDLE_ATTEST, SLOTS};
+use se::ecdsa::{self, SeEcdsa, SeSecretKey, ATTEST_SLOT, COUNTER_MAX, DIR_SLOT, FIRST_CRED_SLOT, HANDLE_ATTEST, SLOTS};
 use se::proto::{self, Error};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
@@ -48,6 +48,9 @@ struct Model {
     no_genkey: Vec<usize>, // slots where GenKey fails (execution error)
     created: Vec<usize>,   // slots where GenKey(create) ran, in order
     config: Vec<u8>,       // 128-byte config zone (serial number, I2C address, lock bytes)
+    dir: Vec<u8>,          // data slot DIR_SLOT (72 bytes, clear read/write): the RP directory
+    dir_fails: bool,       // the chip refuses the data slot (a config that does not allow clear access)
+    dir_writes: u32,       // 32-byte block writes seen
 }
 
 fn frame(payload: &[u8]) -> Vec<u8> {
@@ -83,6 +86,7 @@ impl Model {
             limited,
             rng: Some(ChaCha8Rng::seed_from_u64(7)),
             config: config_zone(),
+            dir: vec![0u8; 72],
             ..Default::default()
         }
     }
@@ -158,7 +162,27 @@ impl Model {
                 }
                 frame(&self.config[4..8])
             }
+            proto::OP_WRITE => {
+                let (block, slot) = ((p2 >> 8) as usize, ((p2 >> 3) & 0x1F) as usize);
+                if p1 != proto::ZONE_DATA_32 || data.len() != 32 || p2 & 7 != 0 {
+                    return status(0x03);
+                }
+                if self.dir_fails || slot != DIR_SLOT as usize || block > 1 {
+                    return status(0x0F);
+                }
+                self.dir[block * 32..block * 32 + 32].copy_from_slice(data);
+                self.dir_writes += 1;
+                status(0x00)
+            }
             proto::OP_READ => {
+                if p1 == proto::ZONE_DATA_32 {
+                    // Data zone, 32-byte blocks in the clear: only the directory slot, blocks 0 and 1.
+                    let (block, slot) = ((p2 >> 8) as usize, ((p2 >> 3) & 0x1F) as usize);
+                    if self.dir_fails || slot != DIR_SLOT as usize || block > 1 || p2 & 7 != 0 {
+                        return status(0x0F);
+                    }
+                    return frame(&self.dir[block * 32..block * 32 + 32]);
+                }
                 // Config zone, 32-byte blocks only (the only form the firmware uses).
                 let block = (p2 >> 3) as usize;
                 if p1 != proto::READ_CONFIG_32 || p2 & 7 != 0 || block > 3 {
@@ -257,6 +281,11 @@ fn crc_known_vectors() {
     // The longest frame we send (Nonce pass-through, 32 bytes) fits.
     let n = proto::build_command(&mut f, proto::OP_NONCE, proto::NONCE_PASSTHROUGH, 0, &[0u8; 32]).unwrap();
     assert_eq!(n, 40);
+    // Write of a 32-byte data block in the clear (same size) and its word address.
+    let n = proto::build_command(&mut f, proto::OP_WRITE, proto::ZONE_DATA_32, proto::data_block_addr(13, 1), &[0u8; 32]).unwrap();
+    assert_eq!(n, 40);
+    assert_eq!(proto::data_block_addr(13, 1), 0x0168);
+    assert_eq!(proto::data_block_addr(13, 0), 0x0068);
 }
 
 #[test]
@@ -295,6 +324,13 @@ fn chip_commands() {
     assert_eq!(c.counter_inc(1).unwrap(), 2);
     assert_eq!(c.gen_key(16), Err(Error::Param));
     assert_eq!(c.counter(2), Err(Error::Param));
+    // Data slot blocks in the clear (the RP directory slot).
+    c.write_block(DIR_SLOT, 1, &[7u8; 32]).unwrap();
+    assert_eq!(c.read_block(DIR_SLOT, 1).unwrap(), [7u8; 32]);
+    assert_eq!(c.read_block(DIR_SLOT, 0).unwrap(), [0u8; 32]);
+    assert_eq!(c.read_block(DIR_SLOT, 2), Err(Error::Status(0x0F)), "block 2 is only 8 bytes long");
+    assert_eq!(c.read_block(16, 0), Err(Error::Param));
+    assert_eq!(c.write_block(DIR_SLOT, 13, &[0u8; 32]), Err(Error::Param));
     // Signing with an empty slot is an execution error, not a hang.
     assert_eq!(c.sign(9, &digest), Err(Error::Status(0x0F)));
     // Every high-level call is wake ... idle: the chip is asleep between calls.
@@ -597,4 +633,152 @@ fn credential_registration_never_touches_the_attestation_slot() {
     assert!(registration_panics(&mut rng));
     assert!(SeSecretKey::import(&handle).is_some(), "attestation key survived all registrations");
     assert!(!m.lock().unwrap().created.contains(&(ATTEST_SLOT as usize)));
+}
+
+// ---------------------------------------------------------------- one key per relying party
+
+struct HintRng {
+    inner: TestRng,
+    hint: Option<[u8; 32]>,
+}
+impl HintRng {
+    fn new(seed: u64) -> Self {
+        HintRng { inner: TestRng(ChaCha8Rng::seed_from_u64(seed)), hint: None }
+    }
+}
+impl RngCore for HintRng {
+    fn next_u32(&mut self) -> u32 { self.inner.next_u32() }
+    fn next_u64(&mut self) -> u64 { self.inner.next_u64() }
+    fn fill_bytes(&mut self, d: &mut [u8]) { self.inner.fill_bytes(d) }
+    fn try_fill_bytes(&mut self, d: &mut [u8]) -> Result<(), rand_core::Error> { self.inner.try_fill_bytes(d) }
+}
+impl CryptoRng for HintRng {}
+impl Rng for HintRng {
+    fn set_rp_id_hash(&mut self, h: &[u8; 32]) {
+        self.hint = Some(*h);
+    }
+    fn take_rp_id_hash(&mut self) -> Option<[u8; 32]> {
+        self.hint.take()
+    }
+}
+
+/// What OpenSK does for a registration: announce the RP, then create the key.
+fn register(rng: &mut HintRng, rp: u8) -> SeSecretKey {
+    rng.set_rp_id_hash(&[rp; 32]);
+    SeSecretKey::random(rng)
+}
+
+fn register_panics(rng: &mut HintRng, rp: u8) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = register(rng, rp);
+    }))
+    .is_err()
+}
+
+#[test]
+fn accounts_at_the_same_site_share_one_slot() {
+    let (_g, m) = install(false, 0);
+    let mut rng = HintRng::new(20);
+    let a1 = register(&mut rng, 1);
+    let a2 = register(&mut rng, 1);
+    let b = register(&mut rng, 2);
+    let a3 = register(&mut rng, 1);
+    assert_eq!(a1.export(), a2.export(), "same site: same slot and key");
+    assert_eq!(a1.export(), a3.export());
+    assert_ne!(a1.export()[1], b.export()[1], "another site gets its own slot");
+    assert_eq!(a1.export()[1], FIRST_CRED_SLOT);
+    assert_eq!(b.export()[1], FIRST_CRED_SLOT + 1);
+    assert_eq!(m.lock().unwrap().created, vec![FIRST_CRED_SLOT as usize, FIRST_CRED_SLOT as usize + 1], "GenKey ran once per site");
+    check_sig(&a2, b"signed by the shared key");
+    check_sig(&b, b"signed by the other key");
+}
+
+#[test]
+fn the_hint_is_used_once_and_without_it_every_key_is_new() {
+    let (_g, m) = install(false, 0);
+    let mut rng = HintRng::new(21);
+    let a = register(&mut rng, 1);
+    // No announcement: not the previous site, a fresh slot (and nothing is recorded for it).
+    let c = SeSecretKey::random(&mut rng);
+    let d = SeSecretKey::random(&mut rng);
+    assert_eq!(a.export()[1], FIRST_CRED_SLOT);
+    assert_eq!(c.export()[1], FIRST_CRED_SLOT + 1);
+    assert_eq!(d.export()[1], FIRST_CRED_SLOT + 2);
+    assert_eq!(m.lock().unwrap().dir_writes, 1, "only the announced registration touched the directory");
+}
+
+#[test]
+fn the_directory_lives_in_the_chip_not_in_the_pico() {
+    let (_g, m) = install(false, 0);
+    let mut rng = HintRng::new(22);
+    let a = register(&mut rng, 1).export();
+    let b = register(&mut rng, 2).export();
+    // "Another Pico": new driver, empty caches, same chip.
+    ecdsa::uninstall();
+    ecdsa::install(Box::leak(Box::new(Atecc::new(FakeBus(m.clone())))));
+    assert_eq!(register(&mut rng, 2).export(), b);
+    assert_eq!(register(&mut rng, 1).export(), a);
+    assert_eq!(m.lock().unwrap().created.len(), 2, "no new key was made");
+}
+
+#[test]
+fn nine_sites_fill_the_chip_but_known_sites_keep_working() {
+    let (_g, m) = install(false, 0);
+    let mut rng = HintRng::new(23);
+    let slots: Vec<u8> = (1..=SLOTS).map(|rp| register(&mut rng, rp).export()[1]).collect();
+    assert_eq!(slots, (FIRST_CRED_SLOT..FIRST_CRED_SLOT + SLOTS).collect::<Vec<_>>());
+    // A tenth site is refused, again and again ...
+    assert!(register_panics(&mut rng, 100));
+    assert!(register_panics(&mut rng, 101));
+    // ... but every known site can still register more accounts, also the first and the last one.
+    assert_eq!(register(&mut rng, 1).export()[1], FIRST_CRED_SLOT);
+    assert_eq!(register(&mut rng, SLOTS).export()[1], FIRST_CRED_SLOT + SLOTS - 1);
+    let g = m.lock().unwrap();
+    assert_eq!(g.created.len(), SLOTS as usize, "nothing was regenerated");
+    // The 7-byte entries of slots 5 and 6 straddle the two 32-byte blocks: both survived.
+    drop(g);
+    for rp in 1..=SLOTS {
+        assert_eq!(register(&mut rng, rp).export()[1], FIRST_CRED_SLOT + rp - 1);
+    }
+}
+
+#[test]
+fn a_chip_that_refuses_the_directory_still_registers_with_fresh_slots() {
+    let (_g, m) = install(false, 0);
+    m.lock().unwrap().dir_fails = true;
+    let mut rng = HintRng::new(24);
+    let a1 = register(&mut rng, 1);
+    let a2 = register(&mut rng, 1);
+    assert_ne!(a1.export()[1], a2.export()[1], "no directory, no sharing, but no failure either");
+    check_sig(&a1, b"works");
+    check_sig(&a2, b"works");
+    assert_eq!(m.lock().unwrap().dir_writes, 0);
+}
+
+#[test]
+fn an_entry_without_a_key_behind_it_is_ignored() {
+    let (_g, m) = install(false, 0);
+    // A directory entry for site 1 in slot 3, but slot 3 holds no key (interrupted registration).
+    {
+        let mut g = m.lock().unwrap();
+        let off = 2 * 7;
+        g.dir[off..off + 7].copy_from_slice(&[1u8; 7]);
+    }
+    let mut rng = HintRng::new(25);
+    let a = register(&mut rng, 1);
+    assert_eq!(a.export()[1], FIRST_CRED_SLOT, "first free slot, not the stale one");
+    assert!(!m.lock().unwrap().created.contains(&(FIRST_CRED_SLOT as usize + 2)));
+    assert_eq!(register(&mut rng, 1).export(), a.export(), "from now on the real entry wins");
+}
+
+#[test]
+fn a_key_from_before_the_directory_existed_is_not_shared() {
+    let (_g, m) = install(false, 0);
+    // Slots 1 and 2 hold keys but the directory is empty (keys made without an announcement).
+    let mut rng = HintRng::new(26);
+    let _ = SeSecretKey::random(&mut rng);
+    let _ = SeSecretKey::random(&mut rng);
+    let a = register(&mut rng, 1);
+    assert_eq!(a.export()[1], FIRST_CRED_SLOT + 2, "old keys are never claimed by a site");
+    assert_eq!(m.lock().unwrap().created.len(), 3);
 }

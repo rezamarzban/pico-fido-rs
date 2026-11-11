@@ -29,7 +29,7 @@
 //! CONFIG ZONE LOCKED          LockConfig (LOCKED / OPEN)
 //! DATA ZONE LOCKED            LockValue (LOCKED / OPEN)
 //! SLOTS 9 CRED 1 ATTEST       key slots used by the firmware
-//! KEYS 3/9 FREE 6             credential key slots in use (FULL: no more registrations)
+//! KEYS 3/9 FREE 6             credential key slots in use, one per site (FULL: no more new sites)
 //! SIGNATURES UNLIMITED
 //! ```
 use core::cell::UnsafeCell;

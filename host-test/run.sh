@@ -10,6 +10,7 @@
 # BOOTSEL user presence, HID bridge, RNG), the USB stack and the interrupt-executor split.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
+sh "$HERE/../third_party/apply-opensk-patch.sh"   # the RP-hint patch (src/se/ecdsa.rs needs it)
 cd "$HERE/../third_party/OpenSK" || {
   echo "third_party/OpenSK is missing: git submodule update --init --depth 1 third_party/OpenSK" >&2
   exit 1

@@ -1,9 +1,14 @@
 //! OpenSK `Ecdsa` whose private keys never leave the ATECC608A.
 //!
-//! * `random()` takes the first FREE credential slot (one whose public key cannot be read, i.e.
-//!   the chip holds no private key there) and runs GenKey in it. A slot that already holds a key
-//!   is never touched: nothing is overwritten or regenerated, and no counter is used. When all
-//!   slots are used `random()` panics, so the registration fails and the 9 existing keys stay.
+//! * One key per relying party (RP). `random()` first looks the RP up in the directory kept in the
+//!   chip (data slot `DIR_SLOT`): if the RP already has a key, that key is used again and no slot
+//!   is consumed (accounts at the same site then share one public key). Otherwise it takes the
+//!   first FREE credential slot (one whose public key cannot be read, i.e. the chip holds no
+//!   private key there), runs GenKey in it and records the RP in the directory. A slot that
+//!   already holds a key is never touched: nothing is overwritten or regenerated, and no counter
+//!   is used. When all slots belong to other RPs `random()` panics, so the registration fails
+//!   and the 9 existing keys stay. The RP comes from OpenSK through `Rng::take_rp_id_hash`
+//!   (third_party/opensk-rp-hint.patch); without it (`None`) every call takes a fresh slot.
 //! * `export()` is a 32-byte *handle*: [version][slot][6-byte public-key fingerprint][zeros].
 //!   OpenSK stores it inside the encrypted credential ID, exactly like a wrapped software key.
 //! * `import()` checks that the slot still holds the key the handle was made for (fingerprint).
@@ -30,8 +35,15 @@ use super::proto::{ChipInfo, Error};
 /// never overwritten by the firmware); slots 1..=9 are credential slots. Slots 10-15 are not used.
 pub const ATTEST_SLOT: u8 = 0;
 pub const FIRST_CRED_SLOT: u8 = 1;
-/// Number of credential slots (the 10th registration is refused: keys are never overwritten).
+/// Number of credential slots (a registration at a 10th site is refused: keys are never overwritten).
 pub const SLOTS: u8 = 9;
+/// Data slot (72 bytes, clear read/write in the config) that holds the RP directory: for every
+/// credential slot the first `DIR_ENTRY` bytes of the SHA-256 of the RP ID it belongs to, in slot
+/// order, 63 of the first 64 bytes (two 32-byte blocks). All zero = no RP recorded.
+pub const DIR_SLOT: u8 = 13;
+const DIR_ENTRY: usize = 7;
+const DIR_LEN: usize = 64;
+const _: () = assert!(SLOTS as usize * DIR_ENTRY <= DIR_LEN);
 
 /// Handle of a credential key (slot < SLOTS) / of the attestation key (slot == ATTEST_SLOT).
 pub const HANDLE_CRED: u8 = 1;
@@ -147,6 +159,61 @@ fn cached_pubkey(slot: u8) -> Result<[u8; 64], Error> {
     Ok(pk)
 }
 
+/// The directory entry of an RP (never all zero, that means "empty").
+fn dir_tag(rp: &[u8; 32]) -> [u8; DIR_ENTRY] {
+    let mut t = [0u8; DIR_ENTRY];
+    t.copy_from_slice(&rp[..DIR_ENTRY]);
+    if t == [0u8; DIR_ENTRY] {
+        t[DIR_ENTRY - 1] = 1;
+    }
+    t
+}
+
+fn dir_read() -> Result<[u8; DIR_LEN], Error> {
+    with_chip(|c| {
+        let mut d = [0u8; DIR_LEN];
+        d[..32].copy_from_slice(&c.read_block(DIR_SLOT, 0)?);
+        d[32..].copy_from_slice(&c.read_block(DIR_SLOT, 1)?);
+        Ok(d)
+    })
+}
+
+/// The credential slot that already holds the key of this RP, with its public key. An entry whose
+/// slot holds no key (an interrupted registration) is ignored. A directory that cannot be read
+/// (e.g. a chip configured differently) only means "no sharing": a fresh slot is used.
+fn dir_find(rp: &[u8; 32]) -> Option<(u8, [u8; 64])> {
+    let d = dir_read().ok()?;
+    let tag = dir_tag(rp);
+    for i in 0..SLOTS as usize {
+        if d[i * DIR_ENTRY..(i + 1) * DIR_ENTRY] == tag {
+            let slot = FIRST_CRED_SLOT + i as u8;
+            if let Ok(pk) = cached_pubkey(slot) {
+                return Some((slot, pk));
+            }
+        }
+    }
+    None
+}
+
+/// Records that `slot` holds the key of `rp` (only the 32-byte blocks that change are written).
+/// Failure is not fatal: the key works, the RP just gets another slot next time.
+fn dir_record(slot: u8, rp: &[u8; 32]) {
+    let Ok(old) = dir_read() else { return };
+    let mut d = old;
+    let off = (slot - FIRST_CRED_SLOT) as usize * DIR_ENTRY;
+    d[off..off + DIR_ENTRY].copy_from_slice(&dir_tag(rp));
+    for b in 0..2usize {
+        let blk = &d[b * 32..b * 32 + 32];
+        if blk != &old[b * 32..b * 32 + 32] {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(blk);
+            if with_chip(|c| c.write_block(DIR_SLOT, b as u8, &a)).is_err() {
+                return;
+            }
+        }
+    }
+}
+
 pub struct SeEcdsa;
 
 impl Ecdsa for SeEcdsa {
@@ -174,7 +241,12 @@ impl EcSecretKey for SeSecretKey {
     type PublicKey = SePublicKey;
     type Signature = SeSignature;
 
-    fn random(_rng: &mut impl Rng) -> Self {
+    fn random(rng: &mut impl Rng) -> Self {
+        // This RP already has a key: use it again, no slot is consumed.
+        let rp = rng.take_rp_id_hash();
+        if let Some((slot, pubkey)) = rp.as_ref().and_then(dir_find) {
+            return SeSecretKey { slot, pubkey };
+        }
         // First free slot, in order. A slot that holds a key is skipped, never regenerated. If the
         // chip refuses GenKey in a free slot (e.g. one that cannot hold a P-256 private key) the
         // next one is tried, so such a slot is simply never used.
@@ -191,13 +263,16 @@ impl EcSecretKey for SeSecretKey {
                         let u = USED.borrow(cs);
                         u.set(u.get().map(|n| (n + 1).min(SLOTS)));
                     });
+                    if let Some(rp) = &rp {
+                        dir_record(slot, rp);
+                    }
                     return SeSecretKey { slot, pubkey };
                 }
                 Err(Error::Status(_)) => continue,
                 Err(_) => panic!("se: GenKey failed"),
             }
         }
-        panic!("se: no free key slot, refusing to overwrite an existing key")
+        panic!("se: no free key slot for a new site, refusing to overwrite an existing key")
     }
 
     fn public_key(&self) -> SePublicKey {

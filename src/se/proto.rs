@@ -15,6 +15,7 @@ pub const WORD_COMMAND: u8 = 0x03;
 pub const OP_COUNTER: u8 = 0x24;
 pub const OP_INFO: u8 = 0x30;
 pub const OP_READ: u8 = 0x02;
+pub const OP_WRITE: u8 = 0x12;
 pub const OP_GENKEY: u8 = 0x40;
 pub const OP_NONCE: u8 = 0x16;
 pub const OP_RANDOM: u8 = 0x1B;
@@ -108,6 +109,11 @@ pub const COUNTER_INC: u8 = 0x01;
 pub const RANDOM_MODE: u8 = 0x00; // update the EEPROM seed (normal use)
 pub const INFO_REVISION: u8 = 0x00; // 4 bytes: device revision (00 00 60 xx for the ATECC608)
 pub const READ_CONFIG_32: u8 = 0x80; // config zone, 32-byte block (bit 7 = 32 bytes, zone bits = 0)
+pub const ZONE_DATA_32: u8 = 0x82; // data zone, 32-byte block, in the clear (bit 7 = 32 bytes, zone 2 = data)
+/// Word address of 32-byte block `block` of data slot `slot`: block << 8 | slot << 3.
+pub const fn data_block_addr(slot: u8, block: u8) -> u16 {
+    ((block as u16) << 8) | ((slot as u16) << 3)
+}
 /// Read word address of config block `b` (32 bytes): block << 3.
 pub const fn config_block_addr(b: u8) -> u16 {
     (b as u16) << 3
@@ -163,6 +169,7 @@ pub fn max_exec_ms(opcode: u8) -> u32 {
         OP_COUNTER => 25,
         OP_INFO => 10,
         OP_READ => 10,
+        OP_WRITE => 26,
         OP_GENKEY => 115,
         OP_NONCE => 29,
         OP_RANDOM => 23,
@@ -177,6 +184,7 @@ pub fn typ_exec_ms(opcode: u8) -> u32 {
         OP_COUNTER => 20,
         OP_INFO => 1,
         OP_READ => 1,
+        OP_WRITE => 7,
         OP_GENKEY => 59,
         OP_NONCE => 7,
         OP_RANDOM => 15,

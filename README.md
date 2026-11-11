@@ -1,13 +1,13 @@
 # pico-fido-rs
 
 A FIDO2 / U2F security key for the Raspberry Pi Pico (RP2040) with an ATECC608A secure element, written
-in Rust with Embassy. The CTAP protocol is **Google's OpenSK library** (Apache-2.0, unmodified); this
+in Rust with Embassy. The CTAP protocol is **Google's OpenSK library** (Apache-2.0, plus one 14-line patch); this
 repository is the RP2040 platform layer around it. **Experimental. Read `SECURITY.md`.**
 
 ## What is where
 | In the ATECC608A (`src/se/`) | On the Pico |
 |---|---|
-| 9 credential private keys (GenKey, ECDSA signing; unlimited signatures) | OpenSK with its standard key-value store (`src/env/persist.rs`, `flash_store.rs`) |
+| 9 credential private keys, **one per site** (GenKey, ECDSA signing; unlimited signatures) and the site directory (data slot 13) | OpenSK with its standard key-value store (`src/env/persist.rs`, `flash_store.rs`) |
 | 1 attestation private key (slot 0, created once) | ClientPIN, PIN hash, credential-ID encryption keys, resident credentials: all OpenSK standard |
 | Public-key extraction | SHA-256 / HMAC / AES / HKDF / ECDH in software (`src/se/crypto.rs`) |
 | Random (the only entropy source) | RNG = ChaCha20 DRBG seeded and re-seeded from the chip (`src/env/rng.rs`) |
@@ -28,7 +28,10 @@ the packet pump run on a higher-priority interrupt executor (`SWI_IRQ_1`). OpenS
 `config_command`, `software_crypto`. `use_batch_attestation` is off (see `src/env/mod.rs`).
 
 ## OpenSK version
-Pinned in `third_party/OPENSK_REV` (`79e85b9a72a1ad99745e0d07aec9708d2f7ad6a9`) and used **unpatched**.
+Pinned in `third_party/OPENSK_REV` (`79e85b9a72a1ad99745e0d07aec9708d2f7ad6a9`) plus **one 14-line patch**,
+`third_party/opensk-rp-hint.patch`: OpenSK tells the RNG which site (RP ID hash) a new key is for, so the chip
+keeps one key per site (`src/se/ecdsa.rs`). It only adds two default methods to `Rng` and two calls; nothing else
+changes. `build.sh`, `host-test/run.sh` and CI apply it with `sh third_party/apply-opensk-patch.sh` (safe to run again).
 
 ## Flash layout
 The last **72 KiB** of flash (18 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store; `build.rs`
@@ -42,6 +45,7 @@ Needs the **nightly** pinned in `rust-toolchain.toml` and `flip-link`. Release b
     git submodule add --depth 1 https://github.com/google/OpenSK.git third_party/OpenSK
     git -C third_party/OpenSK fetch --depth 1 origin $(cat third_party/OPENSK_REV)
     git -C third_party/OpenSK checkout $(cat third_party/OPENSK_REV)
+    sh third_party/apply-opensk-patch.sh          # the RP-hint patch
 
     cargo build --release                         # 2 MiB board, no USB serial number
     cargo build --release --no-default-features --features rp2040_board,flash_4m,usb_serial
@@ -64,7 +68,9 @@ certificate, which is stored in the token once with OpenSK's `tools/configure.py
 ## Verification status
 **The `atecc1` code up to "OpenSK based ATECC support v2.1" was built and tested on browsers and operating
 systems** (reported by the maintainer, not independently verified). **Not compiled by their author:** the later changes (unlimited signatures, no counters, keys never overwritten, the chip page of the
-OLED, the Info/Read chip commands). Build, then run `host-test/run.sh` and the acceptance test in
+OLED, the Info/Read chip commands, one key per site). For the last one, `host-test/se` (26 tests, incl. the site directory against a
+software chip model) and OpenSK's own unit tests (353 / 374, with the patch applied) were run on a host; the firmware itself
+(thumbv6m, nightly) was not built and nothing was run on a real chip or in a browser. Build, then run `host-test/run.sh` and the acceptance test in
 `atecc608a/CONFIG.md` on a spare chip before locking a chip you care about. USB VID/PID
 (`0xc0de:0xcafe`) are prototype placeholders (`src/usb/mod.rs`).
 

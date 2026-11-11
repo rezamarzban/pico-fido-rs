@@ -95,6 +95,8 @@ if [ ! -f "$OPENSK_LIB" ]; then
 fi
 [ -f "$OPENSK_LIB" ] || { echo "error: $OPENSK_LIB is missing after fetching OpenSK" >&2; exit 1; }
 echo "OpenSK: $(git -C "$OPENSK_DIR" log -1 --format='%h %s' 2>/dev/null || echo 'unknown revision')"
+# The 14-line patch that gives the key generator the relying party (one chip key per site).
+sh third_party/apply-opensk-patch.sh
 
 # We pick the toolchain explicitly with +<toolchain>, so ignore the one pinned in the repo.
 rm -f rust-toolchain.toml rust-toolchain
