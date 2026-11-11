@@ -26,11 +26,6 @@ pub trait ChipOps {
     fn public_key(&mut self, slot: u8) -> Result<[u8; 64], Error>;
     /// ECDSA P-256 signature r||s over the 32-byte digest, made inside the chip.
     fn sign(&mut self, slot: u8, digest: &[u8; 32]) -> Result<[u8; 64], Error>;
-    /// Reads 32-byte block `block` of data slot `slot` in the clear (a slot configured as a
-    /// clear-readable data slot: atecc608a/CONFIG.md, slot 13).
-    fn read_block(&mut self, slot: u8, block: u8) -> Result<[u8; 32], Error>;
-    /// Writes 32 bytes into block `block` of data slot `slot` in the clear.
-    fn write_block(&mut self, slot: u8, block: u8, data: &[u8; 32]) -> Result<(), Error>;
     fn counter(&mut self, id: u8) -> Result<u32, Error>;
     fn counter_inc(&mut self, id: u8) -> Result<u32, Error>;
     /// Serial number, revision, I2C address and lock state (Info + two config-zone reads).
@@ -184,33 +179,6 @@ impl<B: Bus> ChipOps for Atecc<B> {
             }
             let n = c.command(proto::OP_SIGN, proto::SIGN_EXTERNAL, slot as u16, &[], &mut r)?;
             fixed::<64>(&r[..n])
-        })
-    }
-
-    fn read_block(&mut self, slot: u8, block: u8) -> Result<[u8; 32], Error> {
-        Self::check_slot(slot)?;
-        if block > 12 {
-            return Err(Error::Param);
-        }
-        self.session(|c| {
-            let mut r = [0u8; proto::MAX_RESP];
-            let n = c.command(proto::OP_READ, proto::ZONE_DATA_32, proto::data_block_addr(slot, block), &[], &mut r)?;
-            fixed::<32>(&r[..n])
-        })
-    }
-
-    fn write_block(&mut self, slot: u8, block: u8, data: &[u8; 32]) -> Result<(), Error> {
-        Self::check_slot(slot)?;
-        if block > 12 {
-            return Err(Error::Param);
-        }
-        self.session(|c| {
-            let mut r = [0u8; proto::MAX_RESP];
-            let n = c.command(proto::OP_WRITE, proto::ZONE_DATA_32, proto::data_block_addr(slot, block), data, &mut r)?;
-            if n != 0 {
-                return Err(Error::Param);
-            }
-            Ok(())
         })
     }
 

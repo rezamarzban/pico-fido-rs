@@ -109,11 +109,6 @@ pub const COUNTER_INC: u8 = 0x01;
 pub const RANDOM_MODE: u8 = 0x00; // update the EEPROM seed (normal use)
 pub const INFO_REVISION: u8 = 0x00; // 4 bytes: device revision (00 00 60 xx for the ATECC608)
 pub const READ_CONFIG_32: u8 = 0x80; // config zone, 32-byte block (bit 7 = 32 bytes, zone bits = 0)
-pub const ZONE_DATA_32: u8 = 0x82; // data zone, 32-byte block, in the clear (bit 7 = 32 bytes, zone 2 = data)
-/// Word address of 32-byte block `block` of data slot `slot`: block << 8 | slot << 3.
-pub const fn data_block_addr(slot: u8, block: u8) -> u16 {
-    ((block as u16) << 8) | ((slot as u16) << 3)
-}
 /// Read word address of config block `b` (32 bytes): block << 3.
 pub const fn config_block_addr(b: u8) -> u16 {
     (b as u16) << 3

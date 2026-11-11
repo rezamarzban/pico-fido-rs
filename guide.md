@@ -43,10 +43,13 @@ LED: fast blink (200 ms on/off) = ready; very fast flicker = busy (or the browse
 almost solid = waiting for your button press.
 
 ## 5. Things to know
-- **Nine sites at most, for the life of the chip.** Each *site* uses one key slot (1-9) in the secure element and keys
-  are never overwritten. Further accounts at a site that already has a key reuse that key and use no new slot (the
-  site can tell that those accounts come from the same key). Registering at a 10th site is refused (the key restarts;
-  unplug and replug), and a reset does not free slots. The OLED shows `KEYS n/9` (sites with a key).
+- **Nine sites at most.** Each *site* uses one key slot (1-9) in the secure element. A new site first takes a slot that
+  already holds a key and belongs to no other site; if there is none it takes an empty slot and a new key is generated
+  in it. Keys owned by a site are never overwritten. Further accounts at a site that already has a key reuse that key
+  and use no new slot (the site can tell that those accounts come from the same key). Registering at a 10th site is
+  refused (the key restarts; unplug and replug). The list of which site owns which slot is kept in the Pico's flash (not
+  in the chip); a FIDO reset does not clear it, erasing the whole flash does (the keys stay in the chip and are handed
+  out again to new sites). The OLED shows `KEYS n/9` (slots that hold a key).
 - **Unlimited signatures.** Signatures are not counted, there is no budget. (If your chip was provisioned with the old
   500-signature Counter 0, that counter is simply ignored now.)
 - **OLED.** Two pages, switching every 5 s: the device (state, USB, uptime, RAM, flash) and the ATECC608A (I2C
@@ -54,7 +57,7 @@ almost solid = waiting for your button press.
 - **Wrong PINs:** the usual CTAP rules apply: after 3 wrong PINs in a row, unplug and replug; after 8 wrong PINs
   without a correct one in between, the PIN is blocked. A correct PIN resets the counts.
 - **Forgotten or blocked PIN:** the only way out is a reset, which **deletes all credentials** from the key store (the
-  chip keys stay in their slots, which are not reused). Unplug, replug and run
+  chip keys stay in their slots and the site list is kept, so the same sites get the same keys again). Unplug, replug and run
   the reset (`fido2-token -R <device>` or the browser's "Reset" option) **immediately**: CTAP only accepts a reset
   shortly after power-up. Press the button when asked.
 - **Passkeys / U2F:** OpenSK supports discoverable credentials and U2F. U2F-only sites need the attestation key and

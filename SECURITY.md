@@ -21,14 +21,24 @@ Experimental firmware; read this before relying on it.
 * **The chip does not authenticate the Pico.** Code running on the Pico, or a probe on the I2C
   bus, can make the chip sign (without limit). User presence is the BOOTSEL button,
   checked by the Pico.
-* **Only 9 sites, for the life of the chip.** Keys in the chip slots are never overwritten or
-  regenerated; a registration at a 10th site is refused (firmware panic and restart) and a FIDO reset does not free
-  slots. Accounts at a site that already has a key reuse it. The firmware tells a free slot from a used one by asking the chip for the public key (status 0x0F =
-  no private key there); a bus error is never taken for "free".
+* **Only 9 sites.** A key that belongs to a site is never overwritten or regenerated; a registration at a
+  10th site is refused (firmware panic and restart). Accounts at a site that already has a key reuse it. The firmware
+  tells a free slot from a used one by asking the chip for the public key (status 0x0F = no private key there); a bus
+  error is never taken for "free". A slot that holds a key but belongs to no site is handed to the next new site as it
+  is (no GenKey).
 * **Accounts at the same site share one public key**, so that site can link them (different sites never share
-  one). The chip's data slot 13 lists, for every key slot, the first 7 bytes of the SHA-256 of the site name in the
-  clear: anyone holding the chip can test guesses of site names against it. A site name with the same 7-byte prefix
+  one). The site list (which site owns which key slot: the first 7 bytes of the SHA-256 of the site name, per slot) is in the Pico's flash page
+  below the OpenSK store, **not in the chip** and not encrypted: anyone who can read the Pico's flash can test guesses of site names against it
+  (the same flash also holds the PIN hash and the other OpenSK data, see above). The chip itself holds only keys. A site name with the same 7-byte prefix
   as another site would get that site's key (only the public key is shared, it cannot sign for the other site).
+* **If the site list is lost** (whole flash erased, or a power failure exactly while its page was rewritten),
+  the keys are still in the chip and are taken over again by new sites in slot order. Old credentials keep working
+  (their credential ID names the slot), but a new registration may be given a key that an earlier site already uses:
+  those two sites could then recognise the same public key. After erasing the flash, register at sites that matter
+  in the same order as before, or treat the old credentials as shared.
+* **Chips used with the previous firmware** kept their site list in data slot 13 (the firmware no longer reads or
+  writes it). It is not migrated: the first sites registered afterwards are matched to the existing keys in slot order,
+  not to the sites that used them before. The old list stays in the chip until you overwrite that slot yourself.
 * Attestation with the per-device key (`use_batch_attestation`, and always for U2F) lets sites
   recognise the device.
 

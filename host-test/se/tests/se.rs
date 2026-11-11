@@ -1,6 +1,7 @@
 //! Host tests for src/se: the real driver code runs against a byte-level software model of the
 //! ATECC608A (frame parsing, CRC, wake/idle/sleep, busy NACKs, GenKey/Sign/Counter/Random, the
-//! unlimited signing without any counter, chip identity, the attestation slot).
+//! unlimited signing without any counter, chip identity, the attestation slot) and the site directory,
+//! which lives in the Pico's flash (a `DirStore`), never in the chip.
 
 extern crate alloc;
 
@@ -13,6 +14,8 @@ mod se {
     pub mod ecdsa;
     #[path = "../../../../src/se/crypto.rs"]
     pub mod crypto;
+    #[path = "../../../../src/se/dirlog.rs"]
+    pub mod dirlog;
 }
 
 use opensk::api::crypto::ec_signing::{EcPublicKey, EcSecretKey, EcSignature};
@@ -24,7 +27,8 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{CryptoRng, RngCore, SeedableRng};
 use se::chip::{Atecc, Bus, ChipOps};
-use se::ecdsa::{self, SeEcdsa, SeSecretKey, ATTEST_SLOT, COUNTER_MAX, DIR_SLOT, FIRST_CRED_SLOT, HANDLE_ATTEST, SLOTS};
+use se::ecdsa::{self, DirStore, SeEcdsa, SeSecretKey, ATTEST_SLOT, COUNTER_MAX, DIR_LEN, FIRST_CRED_SLOT, HANDLE_ATTEST, SLOTS};
+use se::dirlog::{self, Plan};
 use se::proto::{self, Error};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
@@ -48,9 +52,9 @@ struct Model {
     no_genkey: Vec<usize>, // slots where GenKey fails (execution error)
     created: Vec<usize>,   // slots where GenKey(create) ran, in order
     config: Vec<u8>,       // 128-byte config zone (serial number, I2C address, lock bytes)
-    dir: Vec<u8>,          // data slot DIR_SLOT (72 bytes, clear read/write): the RP directory
-    dir_fails: bool,       // the chip refuses the data slot (a config that does not allow clear access)
-    dir_writes: u32,       // 32-byte block writes seen
+    dir: Vec<u8>,          // the site directory in the Pico's flash (DIR_LEN bytes), NOT in the chip
+    dir_fails: bool,       // the flash directory cannot be saved
+    dir_writes: u32,       // saves of the directory seen
 }
 
 fn frame(payload: &[u8]) -> Vec<u8> {
@@ -86,7 +90,7 @@ impl Model {
             limited,
             rng: Some(ChaCha8Rng::seed_from_u64(7)),
             config: config_zone(),
-            dir: vec![0u8; 72],
+            dir: vec![0u8; DIR_LEN],
             ..Default::default()
         }
     }
@@ -162,27 +166,7 @@ impl Model {
                 }
                 frame(&self.config[4..8])
             }
-            proto::OP_WRITE => {
-                let (block, slot) = ((p2 >> 8) as usize, ((p2 >> 3) & 0x1F) as usize);
-                if p1 != proto::ZONE_DATA_32 || data.len() != 32 || p2 & 7 != 0 {
-                    return status(0x03);
-                }
-                if self.dir_fails || slot != DIR_SLOT as usize || block > 1 {
-                    return status(0x0F);
-                }
-                self.dir[block * 32..block * 32 + 32].copy_from_slice(data);
-                self.dir_writes += 1;
-                status(0x00)
-            }
             proto::OP_READ => {
-                if p1 == proto::ZONE_DATA_32 {
-                    // Data zone, 32-byte blocks in the clear: only the directory slot, blocks 0 and 1.
-                    let (block, slot) = ((p2 >> 8) as usize, ((p2 >> 3) & 0x1F) as usize);
-                    if self.dir_fails || slot != DIR_SLOT as usize || block > 1 || p2 & 7 != 0 {
-                        return status(0x0F);
-                    }
-                    return frame(&self.dir[block * 32..block * 32 + 32]);
-                }
                 // Config zone, 32-byte blocks only (the only form the firmware uses).
                 let block = (p2 >> 3) as usize;
                 if p1 != proto::READ_CONFIG_32 || p2 & 7 != 0 || block > 3 {
@@ -262,6 +246,25 @@ impl Bus for FakeBus {
     fn delay_ms(&mut self, _ms: u32) {}
 }
 
+/// The directory store of the tests: the `dir` fields of the model stand for the Pico's flash page.
+struct MemDir(Arc<Mutex<Model>>);
+
+impl DirStore for MemDir {
+    fn load(&mut self) -> [u8; DIR_LEN] {
+        self.0.lock().unwrap().dir[..].try_into().unwrap()
+    }
+
+    fn save(&mut self, dir: &[u8; DIR_LEN]) -> Result<(), ()> {
+        let mut m = self.0.lock().unwrap();
+        if m.dir_fails {
+            return Err(());
+        }
+        m.dir = dir.to_vec();
+        m.dir_writes += 1;
+        Ok(())
+    }
+}
+
 fn chip(limited: bool, c0: u32) -> (Atecc<FakeBus>, Arc<Mutex<Model>>) {
     let m = Arc::new(Mutex::new(Model::new(limited, c0)));
     (Atecc::new(FakeBus(m.clone())), m)
@@ -281,11 +284,6 @@ fn crc_known_vectors() {
     // The longest frame we send (Nonce pass-through, 32 bytes) fits.
     let n = proto::build_command(&mut f, proto::OP_NONCE, proto::NONCE_PASSTHROUGH, 0, &[0u8; 32]).unwrap();
     assert_eq!(n, 40);
-    // Write of a 32-byte data block in the clear (same size) and its word address.
-    let n = proto::build_command(&mut f, proto::OP_WRITE, proto::ZONE_DATA_32, proto::data_block_addr(13, 1), &[0u8; 32]).unwrap();
-    assert_eq!(n, 40);
-    assert_eq!(proto::data_block_addr(13, 1), 0x0168);
-    assert_eq!(proto::data_block_addr(13, 0), 0x0068);
 }
 
 #[test]
@@ -324,17 +322,12 @@ fn chip_commands() {
     assert_eq!(c.counter_inc(1).unwrap(), 2);
     assert_eq!(c.gen_key(16), Err(Error::Param));
     assert_eq!(c.counter(2), Err(Error::Param));
-    // Data slot blocks in the clear (the RP directory slot).
-    c.write_block(DIR_SLOT, 1, &[7u8; 32]).unwrap();
-    assert_eq!(c.read_block(DIR_SLOT, 1).unwrap(), [7u8; 32]);
-    assert_eq!(c.read_block(DIR_SLOT, 0).unwrap(), [0u8; 32]);
-    assert_eq!(c.read_block(DIR_SLOT, 2), Err(Error::Status(0x0F)), "block 2 is only 8 bytes long");
-    assert_eq!(c.read_block(16, 0), Err(Error::Param));
-    assert_eq!(c.write_block(DIR_SLOT, 13, &[0u8; 32]), Err(Error::Param));
     // Signing with an empty slot is an execution error, not a hang.
     assert_eq!(c.sign(9, &digest), Err(Error::Status(0x0F)));
     // Every high-level call is wake ... idle: the chip is asleep between calls.
     assert!(!m.lock().unwrap().awake);
+    // Nothing is ever written into the chip's data zone: there is no such command any more.
+    assert!(!m.lock().unwrap().commands.contains(&proto::OP_WRITE));
 }
 
 #[test]
@@ -366,6 +359,7 @@ fn install(limited: bool, c0: u32) -> (std::sync::MutexGuard<'static, ()>, Arc<M
     ecdsa::uninstall();
     let (c, m) = chip(limited, c0);
     ecdsa::install(Box::leak(Box::new(c)));
+    ecdsa::install_dir(Box::leak(Box::new(MemDir(m.clone()))));
     (g, m)
 }
 
@@ -708,17 +702,21 @@ fn the_hint_is_used_once_and_without_it_every_key_is_new() {
 }
 
 #[test]
-fn the_directory_lives_in_the_chip_not_in_the_pico() {
+fn the_directory_lives_in_the_pico_flash_and_survives_a_restart() {
     let (_g, m) = install(false, 0);
     let mut rng = HintRng::new(22);
     let a = register(&mut rng, 1).export();
     let b = register(&mut rng, 2).export();
-    // "Another Pico": new driver, empty caches, same chip.
+    assert_eq!(&m.lock().unwrap().dir[..7], &[1u8; 7], "site 1 is in the flash directory, slot 1");
+    // A restart: new driver, empty caches, same chip, same flash.
     ecdsa::uninstall();
     ecdsa::install(Box::leak(Box::new(Atecc::new(FakeBus(m.clone())))));
+    ecdsa::install_dir(Box::leak(Box::new(MemDir(m.clone()))));
     assert_eq!(register(&mut rng, 2).export(), b);
     assert_eq!(register(&mut rng, 1).export(), a);
-    assert_eq!(m.lock().unwrap().created.len(), 2, "no new key was made");
+    let g = m.lock().unwrap();
+    assert_eq!(g.created.len(), 2, "no new key was made");
+    assert!(!g.commands.contains(&proto::OP_WRITE), "nothing was written into the chip, only GenKey");
 }
 
 #[test]
@@ -735,7 +733,6 @@ fn nine_sites_fill_the_chip_but_known_sites_keep_working() {
     assert_eq!(register(&mut rng, SLOTS).export()[1], FIRST_CRED_SLOT + SLOTS - 1);
     let g = m.lock().unwrap();
     assert_eq!(g.created.len(), SLOTS as usize, "nothing was regenerated");
-    // The 7-byte entries of slots 5 and 6 straddle the two 32-byte blocks: both survived.
     drop(g);
     for rp in 1..=SLOTS {
         assert_eq!(register(&mut rng, rp).export()[1], FIRST_CRED_SLOT + rp - 1);
@@ -743,15 +740,31 @@ fn nine_sites_fill_the_chip_but_known_sites_keep_working() {
 }
 
 #[test]
-fn a_chip_that_refuses_the_directory_still_registers_with_fresh_slots() {
+fn a_directory_that_cannot_be_saved_fails_the_registration_and_loses_no_slot() {
     let (_g, m) = install(false, 0);
     m.lock().unwrap().dir_fails = true;
     let mut rng = HintRng::new(24);
+    // The key is made, but the site cannot be recorded: nothing is handed out (no silent sharing).
+    assert!(register_panics(&mut rng, 1));
+    assert_eq!(m.lock().unwrap().dir_writes, 0);
+    assert_eq!(m.lock().unwrap().created, vec![FIRST_CRED_SLOT as usize]);
+    // Flash works again: the key that was made but never handed out is taken over, no new GenKey.
+    m.lock().unwrap().dir_fails = false;
+    let a = register(&mut rng, 1);
+    assert_eq!(a.export()[1], FIRST_CRED_SLOT);
+    assert_eq!(m.lock().unwrap().created.len(), 1, "the slot was reused, not regenerated");
+    check_sig(&a, b"works");
+}
+
+#[test]
+fn without_a_directory_store_nothing_is_shared_or_taken_over() {
+    let (_g, m) = install(false, 0);
+    ecdsa::uninstall();
+    ecdsa::install(Box::leak(Box::new(Atecc::new(FakeBus(m.clone())))));
+    let mut rng = HintRng::new(27);
     let a1 = register(&mut rng, 1);
     let a2 = register(&mut rng, 1);
-    assert_ne!(a1.export()[1], a2.export()[1], "no directory, no sharing, but no failure either");
-    check_sig(&a1, b"works");
-    check_sig(&a2, b"works");
+    assert_ne!(a1.export()[1], a2.export()[1], "no directory: every key is new");
     assert_eq!(m.lock().unwrap().dir_writes, 0);
 }
 
@@ -772,13 +785,180 @@ fn an_entry_without_a_key_behind_it_is_ignored() {
 }
 
 #[test]
-fn a_key_from_before_the_directory_existed_is_not_shared() {
+fn slots_that_already_hold_a_key_are_taken_over_one_per_site() {
     let (_g, m) = install(false, 0);
-    // Slots 1 and 2 hold keys but the directory is empty (keys made without an announcement).
+    // Slots 1 and 2 already hold keys, the flash directory is empty (e.g. a freshly erased Pico).
     let mut rng = HintRng::new(26);
     let _ = SeSecretKey::random(&mut rng);
     let _ = SeSecretKey::random(&mut rng);
-    let a = register(&mut rng, 1);
-    assert_eq!(a.export()[1], FIRST_CRED_SLOT + 2, "old keys are never claimed by a site");
+    assert_eq!(m.lock().unwrap().created.len(), 2);
+    let k1 = register(&mut rng, 1);
+    let k2 = register(&mut rng, 2);
+    assert_eq!(k1.export()[1], FIRST_CRED_SLOT, "site 1 takes the key in slot 1");
+    assert_eq!(k2.export()[1], FIRST_CRED_SLOT + 1, "site 2 takes the key in slot 2");
+    assert_eq!(m.lock().unwrap().created.len(), 2, "no GenKey: the existing keys were used as they are");
+    check_sig(&k1, b"existing key signs");
+    check_sig(&k2, b"existing key signs");
+    // Both are recorded: the same sites find the same slots again.
+    assert_eq!(register(&mut rng, 1).export(), k1.export());
+    assert_eq!(register(&mut rng, 2).export(), k2.export());
+    // Site 3: no key left to take over, so the first EMPTY slot gets a new key.
+    let k3 = register(&mut rng, 3);
+    assert_eq!(k3.export()[1], FIRST_CRED_SLOT + 2);
     assert_eq!(m.lock().unwrap().created.len(), 3);
+}
+
+#[test]
+fn a_mix_of_keyed_and_empty_slots_uses_the_keyed_ones_first() {
+    let (_g, m) = install(false, 0);
+    // Keys in slots 3 and 5 only (made directly in the chip), everything else empty.
+    {
+        let mut g = m.lock().unwrap();
+        for slot in [3usize, 5] {
+            let k = SigningKey::random(g.rng.as_mut().unwrap());
+            g.keys[slot] = Some(k);
+        }
+    }
+    let mut rng = HintRng::new(28);
+    let slots: Vec<u8> = (1..=4u8).map(|rp| register(&mut rng, rp).export()[1]).collect();
+    // Sites 1 and 2 take the existing keys (slots 3, 5); sites 3 and 4 get GenKey in slots 1, 2.
+    assert_eq!(slots, vec![3, 5, 1, 2]);
+    assert_eq!(m.lock().unwrap().created, vec![1, 2]);
+}
+
+#[test]
+fn a_slot_owned_by_another_site_is_never_taken_over() {
+    let (_g, m) = install(false, 0);
+    let mut rng = HintRng::new(29);
+    let slots: Vec<u8> = (1..=SLOTS).map(|rp| register(&mut rng, rp).export()[1]).collect();
+    assert_eq!(slots, (FIRST_CRED_SLOT..FIRST_CRED_SLOT + SLOTS).collect::<Vec<_>>());
+    // All nine slots hold keys and belong to sites 1..=9: a tenth site gets nothing.
+    assert!(register_panics(&mut rng, 50));
+    assert_eq!(m.lock().unwrap().created.len(), SLOTS as usize);
+    // After the Pico's flash was erased (directory gone) the same keys are handed out again, one per site.
+    m.lock().unwrap().dir = vec![0u8; DIR_LEN];
+    let again: Vec<u8> = (101..101 + SLOTS).map(|rp| register(&mut rng, rp).export()[1]).collect();
+    assert_eq!(again, slots, "every site gets one of the existing keys, no GenKey");
+    assert_eq!(m.lock().unwrap().created.len(), SLOTS as usize);
+}
+
+// ---------------------------------------------------------------- flash page of the directory
+
+/// A flash page: erased = 0xFF, programming only clears bits (AND), like the real thing.
+struct Page(Vec<u8>);
+impl Page {
+    fn blank() -> Self {
+        Page(vec![0xFF; dirlog::PAGE])
+    }
+    fn apply(&mut self, p: Plan) {
+        match p {
+            Plan::Nothing => {}
+            Plan::Append { offset, data } => self.program(offset, &data),
+            Plan::Rewrite { data } => {
+                self.0 = vec![0xFF; dirlog::PAGE];
+                self.program(0, &data);
+            }
+        }
+    }
+    fn program(&mut self, offset: usize, data: &[u8]) {
+        for (i, b) in data.iter().enumerate() {
+            self.0[offset + i] &= b;
+        }
+    }
+    fn save(&mut self, dir: &[u8; DIR_LEN]) {
+        let p = dirlog::plan(&self.0, dir);
+        self.apply(p);
+    }
+    fn load(&self) -> [u8; DIR_LEN] {
+        dirlog::scan(&self.0).0
+    }
+}
+
+fn dir_with(entries: &[(usize, u8)]) -> [u8; DIR_LEN] {
+    let mut d = [0u8; DIR_LEN];
+    for &(i, v) in entries {
+        d[i * 7..(i + 1) * 7].copy_from_slice(&[v; 7]);
+    }
+    d
+}
+
+#[test]
+fn a_blank_or_foreign_page_reads_as_an_empty_directory_and_is_formatted_on_the_first_save() {
+    assert_eq!(Page::blank().load(), [0u8; DIR_LEN]);
+    assert_eq!(dirlog::plan(&Page::blank().0, &[0u8; DIR_LEN]), Plan::Rewrite { data: dirlog::HEADER.to_vec() });
+    let mut old = Page(vec![0x5A; dirlog::PAGE]); // old firmware code
+    assert_eq!(old.load(), [0u8; DIR_LEN]);
+    let d = dir_with(&[(0, 1)]);
+    old.save(&d);
+    assert_eq!(old.load(), d);
+}
+
+#[test]
+fn sites_are_appended_without_an_erase_and_survive_reloading() {
+    let mut p = Page::blank();
+    let mut d = [0u8; DIR_LEN];
+    p.save(&dir_with(&[(0, 1)])); // formats
+    for (i, v) in [(0usize, 1u8), (1, 2), (2, 3), (8, 9)] {
+        d[i * 7..(i + 1) * 7].copy_from_slice(&[v; 7]);
+        let plan = dirlog::plan(&p.0, &d);
+        if i != 0 {
+            assert!(matches!(plan, Plan::Append { .. }), "adding a site never erases the page");
+        }
+        p.apply(plan);
+        assert_eq!(p.load(), d);
+    }
+    assert_eq!(dirlog::plan(&p.0, &d), Plan::Nothing, "saving the same directory writes nothing");
+}
+
+#[test]
+fn a_half_written_record_is_ignored_and_the_old_entries_stay() {
+    let mut p = Page::blank();
+    let d1 = dir_with(&[(0, 1), (1, 2)]);
+    p.save(&d1);
+    // Power fails while programming the record of slot index 2: only some of its bytes are written.
+    let d2 = dir_with(&[(0, 1), (1, 2), (2, 3)]);
+    if let Plan::Append { offset, data } = dirlog::plan(&p.0, &d2) {
+        p.program(offset, &data[..11]);
+    } else {
+        panic!("expected an append");
+    }
+    assert_eq!(p.load(), d1, "the torn record fails its check");
+    // The next save goes after the torn record and works.
+    p.save(&d2);
+    assert_eq!(p.load(), d2);
+}
+
+#[test]
+fn the_latest_record_of_a_slot_wins_and_a_full_log_is_compacted() {
+    let mut p = Page::blank();
+    p.save(&dir_with(&[(0, 1)]));
+    // Rewrite the same slot over and over: the log fills up, then the page is formatted again.
+    let mut erased = 0;
+    for v in 2..=255u8 {
+        let d = dir_with(&[(0, v), (1, 77)]);
+        if matches!(dirlog::plan(&p.0, &d), Plan::Rewrite { .. }) {
+            erased += 1;
+        }
+        p.save(&d);
+        assert_eq!(p.load(), d);
+    }
+    for v in 1..=255u8 {
+        let d = dir_with(&[(0, v), (1, 77)]);
+        p.save(&d);
+        assert_eq!(p.load(), d);
+    }
+    assert!(erased >= 1 || dirlog::MAX_RECS > 255, "a full log is compacted, entries are kept");
+}
+
+#[test]
+fn a_record_with_a_wrong_check_or_slot_index_is_ignored() {
+    let mut p = Page::blank();
+    p.save(&dir_with(&[(3, 5)]));
+    assert_eq!(p.load(), dir_with(&[(3, 5)]));
+    let rec = dirlog::HEADER.len();
+    p.0[rec + 1] ^= 0x01; // a flipped tag bit: check fails
+    assert_eq!(p.load(), [0u8; DIR_LEN]);
+    p.0[rec + 1] ^= 0x01;
+    p.0[rec] = SLOTS; // slot index out of range (the check is over the index too)
+    assert_eq!(p.load(), [0u8; DIR_LEN]);
 }
