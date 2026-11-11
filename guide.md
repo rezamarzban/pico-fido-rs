@@ -50,6 +50,10 @@ almost solid = waiting for your button press.
   refused (the key restarts; unplug and replug). The list of which site owns which slot is kept in the Pico's flash (not
   in the chip); a FIDO reset does not clear it, erasing the whole flash does (the keys stay in the chip and are handed
   out again to new sites). The OLED's chip page shows `KEYS n/9 PRESENT` (slots that really hold a key, asked from the chip) and `SITES n/9 ASSIGNED` (slots that belong to a site, from the flash directory) separately, then `SIGNS` (total signatures).
+- **Several chips.** Each chip is recognised by its unique serial number; the site list and the signature count are kept
+  per chip in the Pico's flash. After swapping the chip (unplug the key first), the key uses the information of the chip
+  that is connected now, and a chip it has never seen starts empty. Your PIN is shared by all chips; accounts registered
+  with chip A do not work while chip B is connected and work again when A is back.
 - **Unlimited signatures.** Signatures are not counted, there is no budget. (If your chip was provisioned with the old
   500-signature Counter 0, that counter is simply ignored now.)
 - **OLED.** Two pages, switching every 5 s: the device (state, USB, uptime, RAM, flash) and the ATECC608A (I2C

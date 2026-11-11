@@ -13,7 +13,7 @@
 //! * `proto`  - wire protocol (pure, host-tested)
 //! * `chip`   - command layer over an abstract `Bus` (host-tested with a fake chip)
 //! * `ecdsa`  - OpenSK `Ecdsa` whose private keys live in chip slots (host-tested)
-//! * `dirlog` - page format of the site directory kept in the Pico's flash (pure, host-tested)
+//! * `dirlog` - page format of the site directories (one per chip serial number) kept in the Pico's flash (pure, host-tested)
 //! * `tallylog` - page format of the lifetime signature counter kept in the Pico's flash (pure, host-tested)
 //! * `crypto` - OpenSK `Crypto` using that ECDSA and the software primitives for the rest
 //! * `i2c`    - the RP2040 bus (I2C1, GP14 SDA / GP15 SCL), firmware only

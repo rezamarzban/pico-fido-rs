@@ -15,6 +15,11 @@
 //!   comes from OpenSK through `Rng::take_rp_id_hash` (third_party/opensk-rp-hint.patch); without
 //!   it (`None`), or without an installed directory, nothing is adopted or recorded and every call
 //!   takes a fresh (empty) slot.
+//! * **Several chips.** Every ATECC608A has a unique 9-byte serial number. The directory and the
+//!   signature count are kept per serial number (`DirStore::select`, `SigTally::select`): whichever
+//!   chip is connected, its own information is used, and swapping the chip switches to the other
+//!   chip's information. The serial is read from the chip at start-up (`chip_info`) and again
+//!   before every new registration.
 //! * `export()` is a 32-byte *handle*: [version][slot][6-byte public-key fingerprint][zeros].
 //!   OpenSK stores it inside the encrypted credential ID, exactly like a wrapped software key.
 //! * `import()` checks that the slot still holds the key the handle was made for (fingerprint).
@@ -49,17 +54,25 @@ pub const SLOTS: u8 = 9;
 pub const DIR_ENTRY: usize = 7;
 pub const DIR_LEN: usize = SLOTS as usize * DIR_ENTRY;
 
-/// Where the site directory is kept. `load` returns the whole directory image (zeros when nothing
-/// is stored); `save` stores the whole image and must be power-fail safe (an interrupted `save`
-/// leaves the old or the new directory, or an empty one: never a wrong one).
+/// Serial number of an ATECC608A (9 bytes, unique per chip).
+pub type ChipSerial = [u8; 9];
+
+/// Where the site directories are kept (the Pico's flash), one per chip. `select` says which chip
+/// is connected; `load` then returns the whole directory image of THAT chip (zeros when nothing
+/// is stored for it, or before any `select`); `save` stores the image for that chip and must be
+/// power-fail safe (an interrupted `save` leaves the old or the new directory, or an empty one:
+/// never a wrong one, and never another chip's).
 pub trait DirStore {
+    fn select(&mut self, chip: &ChipSerial);
     fn load(&mut self) -> [u8; DIR_LEN];
     fn save(&mut self, dir: &[u8; DIR_LEN]) -> Result<(), ()>;
 }
 
-/// Where the lifetime signature count is kept (the Pico's flash: the chip counts nothing). `bump`
-/// is called once for every signature the chip made; it may fail silently (the count then lags).
+/// Where the lifetime signature counts are kept (the Pico's flash: the chips count nothing), one
+/// per chip. `select` says which chip is connected (its count is the one that goes on). `bump` is
+/// called once for every signature the chip made; it may fail silently (the count then lags).
 pub trait SigTally {
+    fn select(&mut self, chip: &ChipSerial);
     fn bump(&mut self);
 }
 
@@ -101,6 +114,8 @@ type Tally = &'static mut (dyn SigTally + Send);
 static CHIP: Mutex<RefCell<Option<Chip>>> = Mutex::new(RefCell::new(None));
 static DIR: Mutex<RefCell<Option<Dir>>> = Mutex::new(RefCell::new(None));
 static TALLY: Mutex<RefCell<Option<Tally>>> = Mutex::new(RefCell::new(None));
+/// Serial number of the connected chip (`None` until it was read).
+static SERIAL: Mutex<Cell<Option<ChipSerial>>> = Mutex::new(Cell::new(None));
 /// Slots (bit n = slot n, 0 = attestation) known to hold a key (`None` until `scan_slots` ran).
 static KEYS: Mutex<Cell<Option<u16>>> = Mutex::new(Cell::new(None));
 /// Chip status of GenKey(public) on a slot without a private key (execution error).
@@ -118,11 +133,17 @@ pub fn install(chip: Chip) {
 /// recorded and no existing key is taken over (see the module documentation).
 pub fn install_dir(dir: Dir) {
     critical_section::with(|cs| *DIR.borrow(cs).borrow_mut() = Some(dir));
+    if let Some(serial) = chip_serial() {
+        let _ = with_dir(|d| d.select(&serial));
+    }
 }
 
 /// Registers the lifetime signature counter (the Pico's flash). Without it signatures are not counted.
 pub fn install_tally(t: Tally) {
     critical_section::with(|cs| *TALLY.borrow(cs).borrow_mut() = Some(t));
+    if let Some(serial) = chip_serial() {
+        with_tally(|t| t.select(&serial));
+    }
 }
 
 /// Removes the drivers again (host tests).
@@ -132,6 +153,7 @@ pub fn uninstall() {
         *DIR.borrow(cs).borrow_mut() = None;
         *TALLY.borrow(cs).borrow_mut() = None;
         KEYS.borrow(cs).set(None);
+        SERIAL.borrow(cs).set(None);
         *PUBKEYS.borrow(cs).borrow_mut() = [None; 16];
         USED.borrow(cs).set(None);
     });
@@ -155,8 +177,37 @@ pub fn with_chip<R>(f: impl FnOnce(&mut dyn ChipOps) -> Result<R, Error>) -> Res
 }
 
 /// Serial number, revision, I2C address and lock state of the chip (`None`: chip not reachable).
+///
+/// Reading the identity also makes this chip the active one: from now on its own directory and its
+/// own signature count are used. If a different chip than before answers, everything remembered
+/// about the previous chip's key slots is dropped.
 pub fn chip_info() -> Option<ChipInfo> {
-    with_chip(|c| c.info()).ok()
+    let info = with_chip(|c| c.info()).ok()?;
+    activate(info.serial);
+    Some(info)
+}
+
+/// Serial number of the connected chip, as of the last `chip_info()`.
+pub fn chip_serial() -> Option<ChipSerial> {
+    critical_section::with(|cs| SERIAL.borrow(cs).get())
+}
+
+/// Makes `serial` the active chip (see `chip_info`). No-op if it already is.
+fn activate(serial: ChipSerial) {
+    let prev = critical_section::with(|cs| SERIAL.borrow(cs).replace(Some(serial)));
+    if prev == Some(serial) {
+        return;
+    }
+    if prev.is_some() {
+        // Another chip than before: its key slots are unknown until the next scan.
+        critical_section::with(|cs| {
+            KEYS.borrow(cs).set(None);
+            USED.borrow(cs).set(None);
+            *PUBKEYS.borrow(cs).borrow_mut() = [None; 16];
+        });
+    }
+    let _ = with_dir(|d| d.select(&serial));
+    with_tally(|t| t.select(&serial));
 }
 
 /// Is a private key present in `slot`? `Ok(false)` only for the chip's "no key here" answer;
@@ -251,13 +302,18 @@ fn with_dir<R>(f: impl FnOnce(&mut dyn DirStore) -> R) -> Option<R> {
     Some(r)
 }
 
-/// Counts one signature (no-op without a tally).
-fn tally_bump() {
+/// Runs `f` with the signature counter (no-op without a tally).
+fn with_tally(f: impl FnOnce(&mut dyn SigTally)) {
     let t = critical_section::with(|cs| TALLY.borrow(cs).borrow_mut().take());
     if let Some(t) = t {
-        t.bump();
+        f(&mut *t);
         critical_section::with(|cs| *TALLY.borrow(cs).borrow_mut() = Some(t));
     }
+}
+
+/// Counts one signature (no-op without a tally).
+fn tally_bump() {
+    with_tally(|t| t.bump());
 }
 
 /// The directory entry of an RP (never all zero, that means "empty").
@@ -336,6 +392,11 @@ impl EcSecretKey for SeSecretKey {
 
     fn random(rng: &mut impl Rng) -> Self {
         let rp = rng.take_rp_id_hash();
+        // Which chip is connected right now decides whose directory is used (a swapped chip is
+        // noticed here at the latest).
+        if rp.is_some() && chip_info().is_none() {
+            panic!("se: cannot read the chip serial number");
+        }
         // The directory comes from the Pico's flash. Without a hint or without a store nothing can
         // be recorded, so no key is shared or taken over then.
         let mut dir = if rp.is_some() { with_dir(|d| d.load()) } else { None };

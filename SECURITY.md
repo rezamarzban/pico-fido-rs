@@ -31,6 +31,11 @@ Experimental firmware; read this before relying on it.
   below the OpenSK store, **not in the chip** and not encrypted: anyone who can read the Pico's flash can test guesses of site names against it
   (the same flash also holds the PIN hash and the other OpenSK data, see above). The chip itself holds only keys. A site name with the same 7-byte prefix
   as another site would get that site's key (only the public key is shared, it cannot sign for the other site).
+* **Chip serial numbers are stored in the Pico's flash** (site list and signature count of every chip this key has
+  been used with, next to the other unprotected data). Anyone who can read the flash can see which chips were used and,
+  with the site-name guessing described above, which sites each one has. The serial number is read from the chip
+  without authentication: a clone that reports the same serial would simply get that chip's site list (it would have to
+  hold the same keys to be of any use).
 * **If the site list is lost** (whole flash erased, or a power failure exactly while its page was rewritten),
   the keys are still in the chip and are taken over again by new sites in slot order. Old credentials keep working
   (their credential ID names the slot), but a new registration may be given a key that an earlier site already uses:

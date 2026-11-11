@@ -50,6 +50,18 @@ GenKey. Slots owned by another site are never touched. If the directory is lost 
 the chip and are taken over again, one per site, in slot order; credentials registered earlier keep working (their
 credential ID names the slot), but a site may then end up with another site's old key (see `SECURITY.md`).
 
+## Several chips
+Every ATECC608A has a unique 9-byte serial number. The Pico's flash keeps the **site directory** and the **signature count**
+separately for each serial number (`src/se/dirlog.rs`, `src/se/tallylog.rs`). The serial is read from the chip at start-up
+(and again before each new registration), and from then on that chip's own information is used; swapping the chip
+(with the key unplugged) switches to the information of the chip that is now connected, and a chip that was never seen
+starts empty. Up to 14 completely used chips fit in the directory page (127 records); the signature log keeps the 32 chips
+with the highest totals. The OLED chip page shows the serial of the chip that is in use.
+What is NOT per chip: the PIN, the credential-ID encryption keys and resident credentials are OpenSK's single store.
+A credential made with chip A cannot sign while chip B is connected (the handle in its credential ID names a key B does
+not have); it works again when A is back. After updating from a build with the single-chip pages, the directory and the
+count start empty once (the keys stay in the chip and are taken over again, see above).
+
 ## Build
 Needs the **nightly** pinned in `rust-toolchain.toml` and `flip-link`. Release builds are size-optimised.
 
