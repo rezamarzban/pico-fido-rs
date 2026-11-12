@@ -7,8 +7,8 @@
 //! counters are plain flash contents. The private keys of the credentials are not in it (they are
 //! in the secure element); a credential ID only holds a slot handle.
 use alloc::boxed::Box;
-use core::cell::RefCell;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use defmt::{error, warn};
 use opensk::api::persist::{Persist, PersistIter};
 use opensk::ctap::status_code::{Ctap2StatusCode, CtapResult};
@@ -30,9 +30,16 @@ impl PicoPersist {
             Ok(store) => store,
             // A flash I/O or argument error says nothing about the data: never erase the store
             // (credentials, pending reset marker) because of it. Stop; a re-plug retries.
-            Err((StoreError::StorageError, _)) => defmt::panic!("flash: I/O error opening the key-value store - not formatting, re-plug"),
-            Err((StoreError::InvalidArgument | StoreError::NoCapacity | StoreError::NoLifetime, _)) => {
-                defmt::panic!("flash: unexpected error opening the key-value store - not formatting")
+            Err((StoreError::StorageError, _)) => defmt::panic!(
+                "flash: I/O error opening the key-value store - not formatting, re-plug"
+            ),
+            Err((
+                StoreError::InvalidArgument | StoreError::NoCapacity | StoreError::NoLifetime,
+                _,
+            )) => {
+                defmt::panic!(
+                    "flash: unexpected error opening the key-value store - not formatting"
+                )
             }
             // InvalidStorage: foreign data, the layout of an older firmware, or corruption (the
             // store cannot tell them apart). Only this case is erased and started empty.
@@ -55,7 +62,9 @@ impl PicoPersist {
 fn convert(error: StoreError) -> Ctap2StatusCode {
     match error {
         // Expected: the store is full or the flash is out of life.
-        StoreError::NoCapacity | StoreError::NoLifetime => Ctap2StatusCode::CTAP2_ERR_KEY_STORE_FULL,
+        StoreError::NoCapacity | StoreError::NoLifetime => {
+            Ctap2StatusCode::CTAP2_ERR_KEY_STORE_FULL
+        }
         // Expected if a precondition is violated (e.g. a value that is too long).
         StoreError::InvalidArgument => Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR,
         // Not expected: the storage has been tampered with.
@@ -74,7 +83,12 @@ impl PicoPersist {
     pub fn stats(&self) -> Option<(u32, u32, u32, u32)> {
         let c = self.store.capacity().ok()?;
         let l = self.store.lifetime().ok()?;
-        Some((c.used() as u32, c.total() as u32, l.used() as u32, l.total() as u32))
+        Some((
+            c.used() as u32,
+            c.total() as u32,
+            l.used() as u32,
+            l.total() as u32,
+        ))
     }
 }
 

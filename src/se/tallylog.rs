@@ -91,9 +91,16 @@ pub fn usage(page: &[u8]) -> (Vec<ChipSerial>, usize) {
         return (Vec::new(), 0);
     }
     let n = (0..MAX_RECS)
-        .take_while(|&i| page[HEADER.len() + i * REC..][..REC].iter().any(|&b| b != 0xFF))
+        .take_while(|&i| {
+            page[HEADER.len() + i * REC..][..REC]
+                .iter()
+                .any(|&b| b != 0xFF)
+        })
         .count();
-    (totals(page).into_iter().map(|e| e.0).collect(), HEADER.len() + n * REC)
+    (
+        totals(page).into_iter().map(|e| e.0).collect(),
+        HEADER.len() + n * REC,
+    )
 }
 
 /// How to bring the page to the new `total` of chip `serial` (the other chips keep theirs).
@@ -103,7 +110,10 @@ pub fn plan(page: &[u8], serial: &ChipSerial, total: u32) -> Plan {
         return Plan::Nothing;
     }
     if valid && used < MAX_RECS {
-        return Plan::Append { offset: HEADER.len() + used * REC, data: record(serial, total).to_vec() };
+        return Plan::Append {
+            offset: HEADER.len() + used * REC,
+            data: record(serial, total).to_vec(),
+        };
     }
     let mut others: Vec<(ChipSerial, u32)> = if valid { totals(page) } else { Vec::new() };
     others.retain(|e| &e.0 != serial);

@@ -3,30 +3,47 @@
 //! several chips and always works with the directory of the chip that is connected.
 //!
 //! It used to live in data slot 13 of the chip; now NOTHING but keys is stored in the chip. The
-//! directory has its own 4 KiB flash page directly below the OpenSK key-value store (build.rs keeps
-//! that page out of the linker's FLASH region, like the store). It is separate from the store on
-//! purpose: OpenSK's own reset and the store's "format" never touch it. The page format (an
-//! append-only record log, no erase to add a site) is in `se/dirlog.rs`, which is host-tested.
-//! A directory that is lost is not fatal: the keys stay in the chip, and `se::ecdsa` takes over
-//! slots that hold a key but belong to nobody.
+//! directory has its own two 4 KiB flash sectors (A directly below the OpenSK key-value store, B
+//! below the signature-counter page; build.rs keeps them out of the linker's FLASH region, like the
+//! store). They are separate from the store on purpose: OpenSK's own reset and the store's "format"
+//! never touch them. The format (an append-only record log, no erase to add a site, copy-on-write
+//! between the two sectors to compact it, so a power failure never loses the directory) is in
+//! `se/dirlog.rs`, which is host-tested. If the flash is erased from outside the directory is gone
+//! and `se::ecdsa` takes over slots that hold a key but belong to nobody (see SECURITY.md).
 
 use core::cell::RefCell;
 
 use super::flash_store::{PAGE_SIZE, STORE_START, XIP_BASE};
 use crate::keys::Fl;
-use crate::se::dirlog::{self, Plan};
+use crate::se::dirlog::{self, DirPlan, Step};
 use crate::se::ecdsa::{ChipSerial, DirStore, DIR_LEN};
 
 const _: () = assert!(PAGE_SIZE == dirlog::PAGE);
 
-/// The directory page: the 4 KiB right below the key-value store.
+/// Directory sector A: the 4 KiB right below the key-value store.
 pub const DIR_START: usize = STORE_START - PAGE_SIZE;
+/// Directory sector B: below the signature-counter page (which keeps the place it always had, right
+/// below sector A, so a build that already had the counter there keeps its count).
+pub const DIR_B_START: usize = DIR_START - 2 * PAGE_SIZE;
 
-/// The directory page, read straight through the XIP window (also used by the status display).
-pub fn page() -> &'static [u8] {
-    // SAFETY: DIR_START..DIR_START+PAGE_SIZE lies inside the memory-mapped flash, outside the
-    // firmware image (build.rs) and outside the store; nothing writes it concurrently.
-    unsafe { core::slice::from_raw_parts((XIP_BASE + DIR_START) as *const u8, PAGE_SIZE) }
+fn sector_start(sector: usize) -> usize {
+    if sector == 0 {
+        DIR_START
+    } else {
+        DIR_B_START
+    }
+}
+
+fn sector_slice(start: usize) -> &'static [u8] {
+    // SAFETY: `start..start+PAGE_SIZE` lies inside the memory-mapped flash, outside the firmware
+    // image (build.rs) and outside the store; it is only written by `FlashDir::save`, never while
+    // it is being read.
+    unsafe { core::slice::from_raw_parts((XIP_BASE + start) as *const u8, PAGE_SIZE) }
+}
+
+/// Both directory sectors, read straight through the XIP window (also used by the status display).
+pub fn pages() -> [&'static [u8]; 2] {
+    [sector_slice(DIR_START), sector_slice(DIR_B_START)]
 }
 
 pub struct FlashDir {
@@ -54,28 +71,43 @@ impl DirStore for FlashDir {
 
     fn load(&mut self) -> [u8; DIR_LEN] {
         match &self.chip {
-            Some(chip) => dirlog::scan(page(), chip).0,
+            Some(chip) => dirlog::scan(pages(), chip).0,
             None => [0u8; DIR_LEN],
         }
     }
 
     fn save(&mut self, dir: &[u8; DIR_LEN]) -> Result<(), ()> {
         let chip = self.chip.ok_or(())?;
-        match dirlog::plan(page(), &chip, dir) {
-            Plan::Nothing => Ok(()),
-            Plan::Full => Err(()),
-            Plan::Append { offset, data } => self
-                .flash
-                .borrow_mut()
-                .blocking_write((DIR_START + offset) as u32, &data)
-                .map_err(|_| ()),
-            Plan::Rewrite { data } => {
-                let mut flash = self.flash.borrow_mut();
-                flash
-                    .blocking_erase(DIR_START as u32, (DIR_START + PAGE_SIZE) as u32)
-                    .map_err(|_| ())?;
-                flash.blocking_write(DIR_START as u32, &data).map_err(|_| ())
+        let plan = dirlog::plan(pages(), &chip, dir);
+        if plan == DirPlan::Full {
+            return Err(());
+        }
+        let mut flash = self.flash.borrow_mut();
+        // Copy-on-write (see se/dirlog.rs): a rewrite only ever touches the inactive sector and ends
+        // with the header, which is the commit. Every program step is read back before the next one
+        // runs, so a header is never written after a records write that did not take.
+        for step in plan.steps() {
+            match step {
+                Step::Erase { sector } => {
+                    let start = sector_start(sector);
+                    flash
+                        .blocking_erase(start as u32, (start + PAGE_SIZE) as u32)
+                        .map_err(|_| ())?;
+                }
+                Step::Program {
+                    sector,
+                    offset,
+                    data,
+                } => {
+                    flash
+                        .blocking_write((sector_start(sector) + offset) as u32, &data)
+                        .map_err(|_| ())?;
+                    if pages()[sector][offset..offset + data.len()] != data[..] {
+                        return Err(());
+                    }
+                }
             }
         }
+        Ok(())
     }
 }

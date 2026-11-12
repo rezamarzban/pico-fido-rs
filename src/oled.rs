@@ -114,7 +114,11 @@ const FONT: [[u8; 5]; 64] = [
 
 fn glyph(c: u8) -> &'static [u8; 5] {
     let c = c.to_ascii_uppercase();
-    let i = if (32..=95).contains(&c) { c - 32 } else { b'?' - 32 };
+    let i = if (32..=95).contains(&c) {
+        c - 32
+    } else {
+        b'?' - 32
+    };
     &FONT[i as usize]
 }
 
@@ -154,7 +158,7 @@ struct FlashStats {
 }
 
 fn flash_stats() -> FlashStats {
-    let (mut all, dir_bytes) = dirlog::usage(dir_flash::page());
+    let (mut all, dir_bytes) = dirlog::usage(dir_flash::pages());
     let (sig, sig_bytes) = tallylog::usage(tally_flash::page());
     let dir_chips = all.len();
     for s in &sig {
@@ -258,9 +262,17 @@ impl Oled {
         put_line(b, 0, "FLASH: DATA OF CHIPS");
         put_fmt(b, 1, format_args!("CHIPS STORED {}", f.all_chips));
         put_fmt(b, 2, format_args!("SITE DIR {} CHIPS", f.dir_chips));
-        put_fmt(b, 3, format_args!("  USED {}B {}%", d, d * 100 / FLASH_PAGE));
+        put_fmt(
+            b,
+            3,
+            format_args!("  USED {}B {}%", d, d * 100 / FLASH_PAGE),
+        );
         put_fmt(b, 4, format_args!("SIG COUNT {} CHIPS", f.sig_chips));
-        put_fmt(b, 5, format_args!("  USED {}B {}%", t, t * 100 / FLASH_PAGE));
+        put_fmt(
+            b,
+            5,
+            format_args!("  USED {}B {}%", t, t * 100 / FLASH_PAGE),
+        );
         put_fmt(b, 6, format_args!("TOTAL {}B/{}B", d + t, 2 * FLASH_PAGE));
         put_fmt(b, 7, format_args!("FREE {}B", 2 * FLASH_PAGE - d - t));
     }
@@ -311,7 +323,11 @@ impl Oled {
         } else {
             put_fmt(b, 6, format_args!("SITES {}/{} ASSIGNED", sites, SLOTS));
         }
-        put_fmt(b, 7, format_args!("SIGNS {}", st::SIGS_TOTAL.load(Ordering::Relaxed)));
+        put_fmt(
+            b,
+            7,
+            format_args!("SIGNS {}", st::SIGS_TOTAL.load(Ordering::Relaxed)),
+        );
     }
 
     /// Page 1: state of the firmware and the Pico.
@@ -324,7 +340,11 @@ impl Oled {
         };
 
         // ---- 0: FIDO state, USB
-        let state = if st::BUSY.load(Ordering::Relaxed) { "BUSY" } else { "READY" };
+        let state = if st::BUSY.load(Ordering::Relaxed) {
+            "BUSY"
+        } else {
+            "READY"
+        };
         let usb = match st::USB.load(Ordering::Relaxed) {
             st::USB_CONFIGURED => "OK",
             st::USB_SUSPENDED => "SLP",
@@ -349,7 +369,14 @@ impl Oled {
         let up = Instant::now().as_secs();
         let pk = st::PKTS.load(Ordering::Relaxed);
         line(&mut self.buf, 2, &|s| {
-            let _ = write!(s, "UP {}:{:02}:{:02} P{}", up / 3600, up / 60 % 60, up % 60, pk);
+            let _ = write!(
+                s,
+                "UP {}:{:02}:{:02} P{}",
+                up / 3600,
+                up / 60 % 60,
+                up % 60,
+                pk
+            );
         });
 
         // ---- 3: RAM
@@ -358,7 +385,8 @@ impl Oled {
             let sdata = &raw const __sdata as usize;
             (
                 (&raw const __ebss as usize).saturating_sub(sdata),
-                (&raw const __sidata as usize) + (&raw const __edata as usize).saturating_sub(sdata),
+                (&raw const __sidata as usize)
+                    + (&raw const __edata as usize).saturating_sub(sdata),
                 &raw const _stack_start as usize,
             )
         };
@@ -415,7 +443,11 @@ impl Oled {
                     self.retry_ms = now;
                     return;
                 }
-                self.next_page = if (p as usize) + 1 < PAGES { Some(p + 1) } else { None };
+                self.next_page = if (p as usize) + 1 < PAGES {
+                    Some(p + 1)
+                } else {
+                    None
+                };
             }
             None => {
                 if now.wrapping_sub(self.last_frame_ms) >= FRAME_MS {

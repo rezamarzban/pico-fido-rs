@@ -5,9 +5,9 @@
 //! through the two queues in `env::hid`.
 use defmt::warn;
 use embassy_futures::select::{select, select3, Either, Either3};
-use embassy_time::Timer;
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
+use embassy_time::Timer;
 use embassy_usb::class::hid::{HidReader, HidWriter};
 
 use crate::env::hid::{epoch, IN_CH, OUT_CH, RESET_SIG};

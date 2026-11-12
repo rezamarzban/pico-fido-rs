@@ -6,3 +6,5 @@ target/
 out/
 !atecc608a/out/
 work/
+# fetched by third_party/fetch-opensk.sh (not a submodule)
+third_party/OpenSK/

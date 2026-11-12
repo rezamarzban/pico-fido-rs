@@ -154,7 +154,9 @@ pub fn counter_value(payload: &[u8]) -> Result<u32, Error> {
     if payload.len() != 4 {
         return Err(Error::Param);
     }
-    Ok(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]))
+    Ok(u32::from_le_bytes([
+        payload[0], payload[1], payload[2], payload[3],
+    ]))
 }
 
 /// Worst-case execution time (ms) of a command on the ATECC608A at 2.5-5 V (datasheet table),

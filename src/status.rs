@@ -36,8 +36,14 @@ pub static SIGS_BOOT: AtomicU32 = AtomicU32::new(0);
 /// Stores the chip identity read at start-up.
 pub fn set_se(i: &crate::se::proto::ChipInfo) {
     let s = &i.serial;
-    SE_SN_A.store(u32::from_be_bytes([s[0], s[1], s[2], s[3]]), Ordering::Relaxed);
-    SE_SN_B.store(u32::from_be_bytes([s[4], s[5], s[6], s[7]]), Ordering::Relaxed);
+    SE_SN_A.store(
+        u32::from_be_bytes([s[0], s[1], s[2], s[3]]),
+        Ordering::Relaxed,
+    );
+    SE_SN_B.store(
+        u32::from_be_bytes([s[4], s[5], s[6], s[7]]),
+        Ordering::Relaxed,
+    );
     SE_SN_C.store(s[8], Ordering::Relaxed);
     SE_REV.store(u32::from_be_bytes(i.revision), Ordering::Relaxed);
     SE_ADDR.store(i.i2c_addr, Ordering::Relaxed);

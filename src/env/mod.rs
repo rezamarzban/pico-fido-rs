@@ -15,10 +15,10 @@ mod user_presence;
 
 use clock::PicoClock;
 pub use dir_flash::FlashDir;
-pub use tally_flash::FlashTally;
 use hid::PicoHidConnection;
 pub use persist::PicoPersist;
 use rng::PicoRng;
+pub use tally_flash::FlashTally;
 pub use user_presence::PicoUserPresence;
 
 use core::fmt;

@@ -70,8 +70,8 @@ once_cell = { version = "1.19.0", default-features = false, features = [
 # this crate in with its `std` feature, so it is a direct dependency here (same version as OpenSK).
 wasefire-store = { version = "0.2.4", default-features = false }
 
-# Google OpenSK CTAP core, as a git submodule (see .gitmodules):
-#   git submodule add https://github.com/google/OpenSK.git third_party/OpenSK
+# Google OpenSK CTAP core, fetched at the commit pinned in third_party/OPENSK_REV (not a git submodule):
+#   sh third_party/fetch-opensk.sh
 # Do NOT init OpenSK's own nested submodules (third_party/wasefire): this library does not use them.
 # `ctap1` = U2F (needs an attestation key, provisioned with OpenSK's tools/configure.py),
 # `config_command` = vendor/authenticatorConfig commands used by that tool.

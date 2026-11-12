@@ -32,10 +32,10 @@ mod usb;
 
 use core::cell::RefCell;
 use env::{FlashDir, FlashTally, PicoEnv, PicoPersist, PicoUserPresence};
-use static_cell::StaticCell;
 use opensk::api::connection::{HidConnection as _, UsbEndpoint};
 use opensk::env::Env as _;
 use opensk::{Ctap, Transport};
+use static_cell::StaticCell;
 
 // Flash size is a deliberate board setting: enable exactly one `flash_*` Cargo feature.
 // build.rs derives the linker script (memory.x) from the same feature.
@@ -52,9 +52,10 @@ pub const FLASH_SIZE: usize = FLASH_MB * 1024 * 1024;
 /// Pages of 4 KiB at the end of flash for OpenSK's key-value store (72 KiB). build.rs keeps the
 /// same area out of the linker's FLASH region: change them together.
 pub const STORE_PAGES: usize = 18;
-// One more 4 KiB page directly below the store holds the site directory (src/env/dir_flash.rs);
-// the signature counter (src/env/tally_flash.rs) has the page below that; build.rs leaves both out
-// of the linker's FLASH region too (72 + 4 + 4 = 80 KiB).
+// One more 4 KiB page directly below the store is site directory sector A (src/env/dir_flash.rs);
+// the signature counter (src/env/tally_flash.rs) has the page below that and directory sector B the
+// one below the counter; build.rs leaves all three out of the linker's FLASH region too
+// (72 + 4 + 4 + 4 = 84 KiB).
 
 // Heap for OpenSK (alloc): credentials, CBOR, the P-256 software crypto, message buffers.
 const HEAP_SIZE: usize = 128 * 1024;
@@ -191,7 +192,11 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
         let wink = ctap.should_wink();
         if wink != winking {
             winking = wink;
-            LED_SIGNAL.signal(if wink { LedState::Processing } else { LedState::Active });
+            LED_SIGNAL.signal(if wink {
+                LedState::Processing
+            } else {
+                LedState::Active
+            });
         }
 
         // Block for a packet; wake up regularly while something needs polling.
