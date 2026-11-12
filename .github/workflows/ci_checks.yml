@@ -17,11 +17,11 @@ jobs:
         os: [ubuntu-latest, macOS-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      # `submodules: true` fetches third_party/OpenSK but NOT its nested submodules, which is what we want
-      # (the opensk library does not use third_party/wasefire).
+      # OpenSK is not a git submodule of this repository (no gitlink in the tree): fetch the commit pinned
+      # in third_party/OPENSK_REV. Its nested submodules are not needed (the opensk library does not use them).
       - uses: actions/checkout@v4
-        with:
-          submodules: true
+      - name: Fetch OpenSK (pinned commit)
+        run: sh third_party/fetch-opensk.sh
       - name: Apply the OpenSK patch (one key per relying party)
         run: sh third_party/apply-opensk-patch.sh
       - uses: dtolnay/rust-toolchain@master
@@ -44,8 +44,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
+      - name: Fetch OpenSK (pinned commit)
+        run: sh third_party/fetch-opensk.sh
       - name: Apply the OpenSK patch (one key per relying party)
         run: sh third_party/apply-opensk-patch.sh
       - uses: dtolnay/rust-toolchain@master
@@ -57,8 +57,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
+      - name: Fetch OpenSK (pinned commit)
+        run: sh third_party/fetch-opensk.sh
       - name: Apply the OpenSK patch (one key per relying party)
         run: sh third_party/apply-opensk-patch.sh
       - uses: dtolnay/rust-toolchain@master

@@ -29,8 +29,8 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{CryptoRng, RngCore, SeedableRng};
 use se::chip::{Atecc, Bus, ChipOps};
-use se::ecdsa::{self, ChipSerial, DirStore, SeEcdsa, SigTally, SeSecretKey, ATTEST_SLOT, COUNTER_MAX, DIR_LEN, FIRST_CRED_SLOT, HANDLE_ATTEST, SLOTS};
-use se::dirlog::{self, Plan};
+use se::ecdsa::{self, ChipSerial, DirStore, SeEcdsa, SigTally, SeSecretKey, ATTEST_SLOT, COUNTER_MAX, DIR_ENTRY, DIR_LEN, FIRST_CRED_SLOT, HANDLE_ATTEST, SLOTS};
+use se::dirlog::{self, DirPlan, Plan, Step};
 use se::tallylog;
 use se::proto::{self, Error};
 use sha2::{Digest, Sha256};
@@ -55,10 +55,11 @@ struct Model {
     no_genkey: Vec<usize>, // slots where GenKey fails (execution error)
     created: Vec<usize>,   // slots where GenKey(create) ran, in order
     config: Vec<u8>,       // 128-byte config zone (serial number, I2C address, lock bytes)
-    page: Vec<u8>,         // the directory page of the Pico's flash (all chips), NOT in the chip
+    pages: [Vec<u8>; 2],   // the two directory sectors of the Pico's flash (all chips), NOT in the chip
     tpage: Vec<u8>,        // the signature-count page of the Pico's flash (all chips)
     stash: Vec<(ChipSerial, Vec<Option<SigningKey>>)>, // chips that are currently "unplugged": their keys
     dir_fails: bool,       // the flash directory cannot be saved
+    dir_cut: Option<(usize, usize)>, // power fails during the next directory save: (whole steps done, bytes of the next step written)
     dir_writes: u32,       // saves of the directory seen
 }
 
@@ -71,12 +72,39 @@ fn apply(page: &mut Vec<u8>, p: Plan) -> bool {
     };
     match p {
         Plan::Nothing => {}
-        Plan::Full => return false,
         Plan::Append { offset, data } => program(page, offset, &data),
         Plan::Rewrite { data } => {
             *page = vec![0xFF; dirlog::PAGE];
             program(page, 0, &data);
         }
+    }
+    true
+}
+
+/// The two directory sectors as the slices `dirlog` works on.
+fn sec(p: &[Vec<u8>; 2]) -> [&[u8]; 2] {
+    [&p[0], &p[1]]
+}
+
+/// One flash operation of a directory update on the model: erased = 0xFF, programming only clears bits.
+fn apply_step(pages: &mut [Vec<u8>; 2], step: &Step) {
+    match step {
+        Step::Erase { sector } => pages[*sector].fill(0xFF),
+        Step::Program { sector, offset, data } => {
+            for (i, b) in data.iter().enumerate() {
+                pages[*sector][offset + i] &= b;
+            }
+        }
+    }
+}
+
+/// Runs a whole directory update (`false`: it does not fit).
+fn apply_dir(pages: &mut [Vec<u8>; 2], p: DirPlan) -> bool {
+    if p == DirPlan::Full {
+        return false;
+    }
+    for st in p.steps() {
+        apply_step(pages, &st);
     }
     true
 }
@@ -107,12 +135,12 @@ impl Model {
 
     /// The site directory of the connected chip, read from the flash page.
     fn dir(&self) -> [u8; DIR_LEN] {
-        dirlog::scan(&self.page, &self.serial()).0
+        dirlog::scan(sec(&self.pages), &self.serial()).0
     }
 
     fn set_dir(&mut self, d: [u8; DIR_LEN]) {
-        let p = dirlog::plan(&self.page, &self.serial(), &d);
-        assert!(apply(&mut self.page, p));
+        let p = dirlog::plan(sec(&self.pages), &self.serial(), &d);
+        assert!(apply_dir(&mut self.pages, p));
     }
 
     /// Signatures counted for chip `serial`.
@@ -154,7 +182,7 @@ impl Model {
             limited,
             rng: Some(ChaCha8Rng::seed_from_u64(7)),
             config: config_zone(),
-            page: vec![0xFF; dirlog::PAGE],
+            pages: [vec![0xFF; dirlog::PAGE], vec![0xFF; dirlog::PAGE]],
             tpage: vec![0xFF; dirlog::PAGE],
             ..Default::default()
         }
@@ -325,7 +353,7 @@ impl DirStore for MemDir {
 
     fn load(&mut self) -> [u8; DIR_LEN] {
         match &self.chip {
-            Some(c) => dirlog::scan(&self.m.lock().unwrap().page, c).0,
+            Some(c) => dirlog::scan(sec(&self.m.lock().unwrap().pages), c).0,
             None => [0u8; DIR_LEN],
         }
     }
@@ -336,11 +364,27 @@ impl DirStore for MemDir {
         if m.dir_fails {
             return Err(());
         }
-        let p = dirlog::plan(&m.page, &chip, dir);
-        if p == Plan::Nothing {
+        let p = dirlog::plan(sec(&m.pages), &chip, dir);
+        if p == DirPlan::Nothing {
             return Ok(());
         }
-        if !apply(&mut m.page, p) {
+        if let Some((done, torn)) = m.dir_cut {
+            // The power fails: only a prefix of the steps runs, the next one only partly.
+            let steps = p.steps();
+            for st in steps.iter().take(done) {
+                apply_step(&mut m.pages, st);
+            }
+            match steps.get(done) {
+                Some(Step::Program { sector, offset, data }) => {
+                    let n = torn.min(data.len());
+                    apply_step(&mut m.pages, &Step::Program { sector: *sector, offset: *offset, data: data[..n].to_vec() });
+                }
+                Some(Step::Erase { sector }) => m.pages[*sector][..torn.min(dirlog::PAGE)].fill(0xFF),
+                None => {}
+            }
+            return Err(());
+        }
+        if !apply_dir(&mut m.pages, p) {
             return Err(());
         }
         m.dir_writes += 1;
@@ -813,7 +857,7 @@ fn the_directory_lives_in_the_pico_flash_and_survives_a_restart() {
     let mut rng = HintRng::new(22);
     let a = register(&mut rng, 1).export();
     let b = register(&mut rng, 2).export();
-    assert_eq!(&m.lock().unwrap().dir()[..7], &[1u8; 7], "site 1 is in the flash directory, slot 1");
+    assert_eq!(&m.lock().unwrap().dir()[..DIR_ENTRY], &[1u8; DIR_ENTRY], "site 1 is in the flash directory, slot 1");
     // A restart: new driver, empty caches, same chip, same flash.
     ecdsa::uninstall();
     ecdsa::install(Box::leak(Box::new(Atecc::new(FakeBus(m.clone())))));
@@ -881,7 +925,7 @@ fn an_entry_without_a_key_behind_it_is_ignored() {
     {
         let mut g = m.lock().unwrap();
         let mut d = g.dir();
-        d[2 * 7..3 * 7].copy_from_slice(&[1u8; 7]);
+        d[2 * DIR_ENTRY..3 * DIR_ENTRY].copy_from_slice(&[1u8; DIR_ENTRY]);
         g.set_dir(d);
     }
     let mut rng = HintRng::new(25);
@@ -943,7 +987,7 @@ fn a_slot_owned_by_another_site_is_never_taken_over() {
     assert!(register_panics(&mut rng, 50));
     assert_eq!(m.lock().unwrap().created.len(), SLOTS as usize);
     // After the Pico's flash was erased (directory gone) the same keys are handed out again, one per site.
-    m.lock().unwrap().page = vec![0xFF; dirlog::PAGE]; // the Pico's flash was erased
+    m.lock().unwrap().pages = [vec![0xFF; dirlog::PAGE], vec![0xFF; dirlog::PAGE]]; // the Pico's flash was erased
     let again: Vec<u8> = (101..101 + SLOTS).map(|rp| register(&mut rng, rp).export()[1]).collect();
     assert_eq!(again, slots, "every site gets one of the existing keys, no GenKey");
     assert_eq!(m.lock().unwrap().created.len(), SLOTS as usize);
@@ -955,32 +999,35 @@ fn a_slot_owned_by_another_site_is_never_taken_over() {
 const S1: ChipSerial = [0x01, 0x23, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0xEE];
 const S2: ChipSerial = [0x01, 0x23, 0xA1, 0xB2, 0xC3, 0xD4, 0x77, 0xF6, 0xEE];
 
-struct Page(Vec<u8>);
+/// The two directory sectors of the Pico's flash.
+#[derive(Clone)]
+struct Page([Vec<u8>; 2]);
 impl Page {
     fn blank() -> Self {
-        Page(vec![0xFF; dirlog::PAGE])
+        Page([vec![0xFF; dirlog::PAGE], vec![0xFF; dirlog::PAGE]])
     }
-    fn apply(&mut self, p: Plan) {
-        assert!(apply(&mut self.0, p), "page full");
+    fn s(&self) -> [&[u8]; 2] {
+        sec(&self.0)
     }
-    fn program(&mut self, offset: usize, data: &[u8]) {
-        for (i, b) in data.iter().enumerate() {
-            self.0[offset + i] &= b;
-        }
+    fn apply(&mut self, p: DirPlan) {
+        assert!(apply_dir(&mut self.0, p), "page full");
+    }
+    fn program(&mut self, sector: usize, offset: usize, data: &[u8]) {
+        apply_step(&mut self.0, &Step::Program { sector, offset, data: data.to_vec() });
     }
     fn save(&mut self, dir: &[u8; DIR_LEN]) {
-        let p = dirlog::plan(&self.0, &S1, dir);
+        let p = dirlog::plan(self.s(), &S1, dir);
         self.apply(p);
     }
     fn load(&self) -> [u8; DIR_LEN] {
-        dirlog::scan(&self.0, &S1).0
+        dirlog::scan(self.s(), &S1).0
     }
 }
 
 fn dir_with(entries: &[(usize, u8)]) -> [u8; DIR_LEN] {
     let mut d = [0u8; DIR_LEN];
     for &(i, v) in entries {
-        d[i * 7..(i + 1) * 7].copy_from_slice(&[v; 7]);
+        d[i * DIR_ENTRY..(i + 1) * DIR_ENTRY].copy_from_slice(&[v; DIR_ENTRY]);
     }
     d
 }
@@ -988,8 +1035,8 @@ fn dir_with(entries: &[(usize, u8)]) -> [u8; DIR_LEN] {
 #[test]
 fn a_blank_or_foreign_page_reads_as_an_empty_directory_and_is_formatted_on_the_first_save() {
     assert_eq!(Page::blank().load(), [0u8; DIR_LEN]);
-    assert_eq!(dirlog::plan(&Page::blank().0, &S1, &[0u8; DIR_LEN]), Plan::Rewrite { data: dirlog::HEADER.to_vec() });
-    let mut old = Page(vec![0x5A; dirlog::PAGE]); // old firmware code
+    assert_eq!(dirlog::plan(Page::blank().s(), &S1, &[0u8; DIR_LEN]), DirPlan::Nothing, "nothing to store: no erase");
+    let mut old = Page([vec![0x5A; dirlog::PAGE], vec![0x5A; dirlog::PAGE]]); // old firmware code
     assert_eq!(old.load(), [0u8; DIR_LEN]);
     let d = dir_with(&[(0, 1)]);
     old.save(&d);
@@ -1002,15 +1049,15 @@ fn sites_are_appended_without_an_erase_and_survive_reloading() {
     let mut d = [0u8; DIR_LEN];
     p.save(&dir_with(&[(0, 1)])); // formats
     for (i, v) in [(0usize, 1u8), (1, 2), (2, 3), (8, 9)] {
-        d[i * 7..(i + 1) * 7].copy_from_slice(&[v; 7]);
-        let plan = dirlog::plan(&p.0, &S1, &d);
+        d[i * DIR_ENTRY..(i + 1) * DIR_ENTRY].copy_from_slice(&[v; DIR_ENTRY]);
+        let plan = dirlog::plan(p.s(), &S1, &d);
         if i != 0 {
-            assert!(matches!(plan, Plan::Append { .. }), "adding a site never erases the page");
+            assert!(matches!(plan, DirPlan::Append { .. }), "adding a site never erases the page");
         }
         p.apply(plan);
         assert_eq!(p.load(), d);
     }
-    assert_eq!(dirlog::plan(&p.0, &S1, &d), Plan::Nothing, "saving the same directory writes nothing");
+    assert_eq!(dirlog::plan(p.s(), &S1, &d), DirPlan::Nothing, "saving the same directory writes nothing");
 }
 
 #[test]
@@ -1020,8 +1067,8 @@ fn a_half_written_record_is_ignored_and_the_old_entries_stay() {
     p.save(&d1);
     // Power fails while programming the record of slot index 2: only some of its bytes are written.
     let d2 = dir_with(&[(0, 1), (1, 2), (2, 3)]);
-    if let Plan::Append { offset, data } = dirlog::plan(&p.0, &S1, &d2) {
-        p.program(offset, &data[..11]);
+    if let DirPlan::Append { sector, offset, data } = dirlog::plan(p.s(), &S1, &d2) {
+        p.program(sector, offset, &data[..11]);
     } else {
         panic!("expected an append");
     }
@@ -1039,7 +1086,7 @@ fn the_latest_record_of_a_slot_wins_and_a_full_log_is_compacted() {
     let mut erased = 0;
     for v in 2..=255u8 {
         let d = dir_with(&[(0, v), (1, 77)]);
-        if matches!(dirlog::plan(&p.0, &S1, &d), Plan::Rewrite { .. }) {
+        if matches!(dirlog::plan(p.s(), &S1, &d), DirPlan::Rewrite { .. }) {
             erased += 1;
         }
         p.save(&d);
@@ -1058,12 +1105,269 @@ fn a_record_with_a_wrong_check_or_slot_index_is_ignored() {
     let mut p = Page::blank();
     p.save(&dir_with(&[(3, 5)]));
     assert_eq!(p.load(), dir_with(&[(3, 5)]));
-    let rec = dirlog::HEADER.len();
-    p.0[rec + 10] ^= 0x01; // a flipped tag bit: check fails
+    let rec = dirlog::HEADER_LEN;
+    p.0[0][rec + 10] ^= 0x01; // a flipped tag bit: check fails
     assert_eq!(p.load(), [0u8; DIR_LEN]);
-    p.0[rec + 10] ^= 0x01;
-    p.0[rec + 9] = SLOTS; // slot index out of range (the check is over the index too)
+    p.0[0][rec + 10] ^= 0x01;
+    p.0[0][rec + 9] = SLOTS; // slot index out of range (the check is over the index too)
     assert_eq!(p.load(), [0u8; DIR_LEN]);
+}
+
+// ---------------------------------------------------------------- power failure during a directory update
+
+/// Rewrites one slot of chip S1 until the active log has no free record position left, so the next
+/// change has to compact (a rewrite into the other sector). Returns S1's directory as it is then.
+fn fill_log(p: &mut Page, mut d: [u8; DIR_LEN]) -> [u8; DIR_LEN] {
+    let mut v = 1u8;
+    loop {
+        let (_, used, _) = dirlog::scan(p.s(), &S1);
+        if used >= dirlog::MAX_RECS {
+            return d;
+        }
+        v = v.wrapping_add(1).max(1);
+        d[8 * DIR_ENTRY..9 * DIR_ENTRY].copy_from_slice(&[v; DIR_ENTRY]);
+        p.save(&d);
+    }
+}
+
+/// Every state the flash can be in if the power fails during `plan`: after 0..n whole steps, and in
+/// the middle of the step after them (a few torn lengths of a program, a part of an erase).
+fn cut_states(base: &Page, plan: &DirPlan) -> Vec<Page> {
+    let steps = plan.steps();
+    let mut out = Vec::new();
+    for k in 0..steps.len() {
+        let mut whole = base.clone();
+        for st in &steps[..k] {
+            apply_step(&mut whole.0, st);
+        }
+        out.push(whole.clone());
+        match &steps[k] {
+            Step::Program { sector, offset, data } => {
+                for n in [1, 5, 11, 16, 17, data.len() / 2, data.len().saturating_sub(1)] {
+                    if n > 0 && n < data.len() {
+                        let mut t = whole.clone();
+                        t.program(*sector, *offset, &data[..n]);
+                        out.push(t);
+                    }
+                }
+            }
+            Step::Erase { sector } => {
+                for n in [16, dirlog::PAGE / 2, dirlog::PAGE - 1] {
+                    let mut t = whole.clone();
+                    t.0[*sector][..n].fill(0xFF);
+                    out.push(t);
+                }
+                // an erase that leaves garbage behind
+                let mut t = whole.clone();
+                for (i, b) in t.0[*sector].iter_mut().enumerate() {
+                    *b = (i as u8).wrapping_mul(37);
+                }
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// The invariant: after a power failure at ANY point of an update from `old` to `new` the directory
+/// of S1 reads as `old` or as `new` (never empty or truncated), S2's is untouched, and the next
+/// save still works.
+fn assert_power_safe(base: &Page, new: &[u8; DIR_LEN], s2: &[u8; DIR_LEN]) {
+    let old = base.load();
+    let plan = dirlog::plan(base.s(), &S1, new);
+    let states = cut_states(base, &plan);
+    assert!(!states.is_empty());
+    for (n, st) in states.iter().enumerate() {
+        let got = st.load();
+        assert!(got == old || got == *new, "state {n}: neither the old nor the new directory");
+        assert_eq!(dirlog::scan(st.s(), &S2_SERIAL).0, *s2, "state {n}: the other chip's directory changed");
+        if dirlog::active(base.s()).is_some() {
+            assert!(dirlog::active(st.s()).is_some(), "state {n}: the directory was lost");
+        }
+        let mut again = st.clone();
+        again.save(new);
+        assert_eq!(again.load(), *new, "state {n}: the next save does not work");
+        assert_eq!(dirlog::scan(again.s(), &S2_SERIAL).0, *s2);
+    }
+}
+
+const S2_SERIAL: ChipSerial = S2;
+
+#[test]
+fn a_power_cut_during_an_append_never_changes_the_directory() {
+    let mut p = Page::blank();
+    p.save(&dir_with(&[(0, 1), (1, 2)]));
+    let b = dir_with(&[(3, 8), (4, 9)]);
+    let plan = dirlog::plan(p.s(), &S2, &b);
+    p.apply(plan);
+    assert_power_safe(&p, &dir_with(&[(0, 1), (1, 2), (2, 3)]), &b);
+}
+
+#[test]
+fn a_power_cut_during_the_first_format_leaves_nothing_wrong() {
+    let base = Page::blank();
+    assert_power_safe(&base, &dir_with(&[(0, 1)]), &[0u8; DIR_LEN]);
+}
+
+#[test]
+fn a_power_cut_during_a_compaction_never_loses_the_directory() {
+    let mut p = Page::blank();
+    p.save(&dir_with(&[(0, 1), (1, 2)]));
+    let b = dir_with(&[(3, 8), (4, 9)]);
+    let plan = dirlog::plan(p.s(), &S2, &b);
+    p.apply(plan);
+    let d = fill_log(&mut p, dir_with(&[(0, 1), (1, 2)]));
+    assert_eq!(dirlog::active(p.s()), Some((0, 1)));
+    let mut new = d;
+    new[2 * DIR_ENTRY..3 * DIR_ENTRY].copy_from_slice(&[3u8; DIR_ENTRY]);
+    assert!(matches!(dirlog::plan(p.s(), &S1, &new), DirPlan::Rewrite { sector: 1, .. }), "the full log is compacted into sector B");
+    assert_power_safe(&p, &new, &b);
+
+    // And again, from sector B back into sector A (generation 3).
+    p.save(&new);
+    assert_eq!(dirlog::active(p.s()), Some((1, 2)));
+    let d = fill_log(&mut p, new);
+    let mut new2 = d;
+    new2[5 * DIR_ENTRY..6 * DIR_ENTRY].copy_from_slice(&[6u8; DIR_ENTRY]);
+    assert!(matches!(dirlog::plan(p.s(), &S1, &new2), DirPlan::Rewrite { sector: 0, .. }));
+    assert_power_safe(&p, &new2, &b);
+    p.save(&new2);
+    assert_eq!(dirlog::active(p.s()), Some((0, 3)));
+}
+
+#[test]
+fn a_rewrite_never_touches_the_active_sector_and_commits_with_the_header_last() {
+    let mut p = Page::blank();
+    p.save(&dir_with(&[(0, 1)]));
+    let d = fill_log(&mut p, dir_with(&[(0, 1)]));
+    let before = p.0[0].clone();
+    let plan = dirlog::plan(p.s(), &S1, &dir_with(&[(0, 1), (1, 2)]));
+    let steps = plan.steps();
+    assert_eq!(steps.len(), 3);
+    assert!(steps.iter().all(|st| match st {
+        Step::Erase { sector } | Step::Program { sector, .. } => *sector == 1,
+    }));
+    assert!(matches!(steps[0], Step::Erase { .. }));
+    assert!(matches!(steps[1], Step::Program { offset, .. } if offset == dirlog::HEADER_LEN));
+    assert!(matches!(steps[2], Step::Program { offset: 0, .. }), "the header is written last");
+    p.apply(plan);
+    assert_eq!(p.0[0], before, "the old sector is left exactly as it was");
+    assert_eq!(dirlog::active(p.s()), Some((1, 2)));
+    let _ = d;
+}
+
+#[test]
+fn the_sector_with_the_highest_valid_generation_is_the_active_one() {
+    let mut w = Page::blank();
+    assert_eq!(dirlog::active(w.s()), None);
+    w.program(0, 0, &dirlog::header(5));
+    assert_eq!(dirlog::active(w.s()), Some((0, 5)));
+    w.program(1, 0, &dirlog::header(6));
+    assert_eq!(dirlog::active(w.s()), Some((1, 6)));
+    // equal generations (cannot happen in normal use): sector A
+    let mut t = Page::blank();
+    t.program(0, 0, &dirlog::header(9));
+    t.program(1, 0, &dirlog::header(9));
+    assert_eq!(dirlog::active(t.s()), Some((0, 9)));
+    // the generation counter wraps around
+    let mut c = Page::blank();
+    c.program(0, 0, &dirlog::header(u32::MAX));
+    c.program(1, 0, &dirlog::header(0));
+    assert_eq!(dirlog::active(c.s()), Some((1, 0)));
+    // a header with a flipped bit, or only partly written, is not valid: the other sector stays active
+    let mut bad = Page::blank();
+    bad.program(0, 0, &dirlog::header(3));
+    let mut h = dirlog::header(4);
+    h[9] ^= 0x01;
+    bad.program(1, 0, &h);
+    assert_eq!(dirlog::active(bad.s()), Some((0, 3)));
+    let mut torn = Page::blank();
+    torn.program(0, 0, &dirlog::header(3));
+    torn.program(1, 0, &dirlog::header(4)[..13]);
+    assert_eq!(dirlog::active(torn.s()), Some((0, 3)));
+}
+
+#[test]
+fn the_rp_tag_is_128_bits() {
+    assert_eq!(DIR_ENTRY, 16);
+    let (_g, _m) = install(false, 0);
+    let mut rng = HintRng::new(60);
+    // Two RP ID hashes that agree in their first 7 bytes (the old 56-bit tag) but not in the 16 now used.
+    let h1 = [7u8; 32];
+    let mut h2 = h1;
+    h2[12] ^= 0x01;
+    rng.set_rp_id_hash(&h1);
+    let k1 = SeSecretKey::random(&mut rng);
+    rng.set_rp_id_hash(&h2);
+    let k2 = SeSecretKey::random(&mut rng);
+    assert_ne!(k1.export()[1], k2.export()[1], "different sites never share a key slot");
+    rng.set_rp_id_hash(&h1);
+    assert_eq!(SeSecretKey::random(&mut rng).export(), k1.export(), "the same site still gets its own key back");
+}
+
+#[test]
+fn a_power_cut_while_the_directory_is_compacted_never_frees_a_used_key() {
+    let (_g, m) = install(false, 0);
+    let mut rng = HintRng::new(61);
+    let a = register(&mut rng, 1).export();
+    let b = register(&mut rng, 2).export();
+    // Fill the active log (stale records of slot 9) so that the next registration has to compact.
+    {
+        let mut g = m.lock().unwrap();
+        let mut pg = Page(g.pages.clone());
+        let serial = g.serial();
+        let mut d = dirlog::scan(pg.s(), &serial).0;
+        let mut v = 1u8;
+        loop {
+            let (_, used, _) = dirlog::scan(pg.s(), &serial);
+            if used >= dirlog::MAX_RECS {
+                break;
+            }
+            v = v.wrapping_add(1).max(1);
+            d[8 * DIR_ENTRY..9 * DIR_ENTRY].copy_from_slice(&[v; DIR_ENTRY]);
+            let plan = dirlog::plan(pg.s(), &serial, &d);
+            pg.apply(plan);
+        }
+        g.pages = pg.0;
+    }
+    let snapshot = m.lock().unwrap().pages.clone();
+    // (whole steps done, bytes of the next step written): erase / records / header of the rewrite
+    let cuts = [(0, 0), (0, 16), (0, 2000), (1, 1), (1, 40), (1, 100), (2, 0), (2, 5), (2, 13), (2, 15)];
+    for (done, torn) in cuts {
+        m.lock().unwrap().pages = snapshot.clone();
+        m.lock().unwrap().dir_cut = Some((done, torn));
+        assert!(register_panics(&mut rng, 3), "the registration cannot complete when the power fails");
+        // Restart: new driver, empty caches, same chip, same flash.
+        {
+            let mut g = m.lock().unwrap();
+            g.dir_cut = None;
+        }
+        ecdsa::uninstall();
+        ecdsa::install(Box::leak(Box::new(Atecc::new(FakeBus(m.clone())))));
+        ecdsa::install_dir(Box::leak(Box::new(MemDir { m: m.clone(), chip: None })));
+        // A new site is never handed a key that another site already uses (it comes FIRST, before
+        // the old sites show up again, so a directory that had been lost could not hide behind the
+        // slot order) ...
+        let c = register(&mut rng, 4).export();
+        assert!(c[1] != a[1] && c[1] != b[1], "cut {done}/{torn}: a used key was given to another site");
+        // ... and the sites that had keys still have exactly those keys.
+        assert_eq!(register(&mut rng, 1).export(), a, "cut {done}/{torn}");
+        assert_eq!(register(&mut rng, 2).export(), b, "cut {done}/{torn}");
+    }
+}
+
+#[test]
+fn a_chip_that_cannot_sign_is_a_hard_error_not_a_zero_signature() {
+    let (_g, m) = install(false, 0);
+    let mut rng = TestRng(ChaCha8Rng::seed_from_u64(62));
+    let k = SeSecretKey::random(&mut rng);
+    m.lock().unwrap().fail_next_wake = 1000;
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = k.sign(b"nobody gets a bogus signature");
+    }));
+    assert!(r.is_err());
+    m.lock().unwrap().fail_next_wake = 0;
+    check_sig(&k, b"the chip is back");
 }
 
 // ---------------------------------------------------------------- several chips
@@ -1072,30 +1376,30 @@ fn a_record_with_a_wrong_check_or_slot_index_is_ignored() {
 fn each_chip_has_its_own_directory_page_records() {
     let mut p = Page::blank();
     let (da, db) = (dir_with(&[(0, 1), (1, 2)]), dir_with(&[(0, 9), (4, 8)]));
-    let pa = dirlog::plan(&p.0, &S1, &da);
+    let pa = dirlog::plan(p.s(), &S1, &da);
     p.apply(pa);
-    let pb = dirlog::plan(&p.0, &S2, &db);
-    assert!(matches!(pb, Plan::Append { .. }), "a second chip is appended, nothing is erased");
+    let pb = dirlog::plan(p.s(), &S2, &db);
+    assert!(matches!(pb, DirPlan::Append { .. }), "a second chip is appended, nothing is erased");
     p.apply(pb);
-    assert_eq!(dirlog::scan(&p.0, &S1).0, da);
-    assert_eq!(dirlog::scan(&p.0, &S2).0, db);
-    assert_eq!(dirlog::scan(&p.0, &[0u8; 9]).0, [0u8; DIR_LEN], "a chip never seen has an empty directory");
-    assert_eq!(dirlog::chips(&p.0), vec![S1, S2]);
+    assert_eq!(dirlog::scan(p.s(), &S1).0, da);
+    assert_eq!(dirlog::scan(p.s(), &S2).0, db);
+    assert_eq!(dirlog::scan(p.s(), &[0u8; 9]).0, [0u8; DIR_LEN], "a chip never seen has an empty directory");
+    assert_eq!(dirlog::chips(p.s()), vec![S1, S2]);
 }
 
 #[test]
 fn usage_counts_chips_and_bytes_for_the_display() {
     // Blank / foreign page: nothing stored.
     let blank = vec![0xFFu8; dirlog::PAGE];
-    assert_eq!(dirlog::usage(&blank), (vec![], 0));
+    assert_eq!(dirlog::usage([&blank, &blank]), (vec![], 0));
     assert_eq!(tallylog::usage(&blank), (vec![], 0));
 
     let mut p = Page::blank();
-    p.apply(dirlog::plan(&p.0, &S1, &dir_with(&[(0, 5), (1, 6)])));
-    p.apply(dirlog::plan(&p.0, &S2, &dir_with(&[(2, 7)])));
-    let (chips, bytes) = dirlog::usage(&p.0);
+    p.apply(dirlog::plan(p.s(), &S1, &dir_with(&[(0, 5), (1, 6)])));
+    p.apply(dirlog::plan(p.s(), &S2, &dir_with(&[(2, 7)])));
+    let (chips, bytes) = dirlog::usage(p.s());
     assert_eq!(chips, vec![S1, S2]);
-    assert_eq!(bytes, dirlog::HEADER.len() + 3 * dirlog::REC);
+    assert_eq!(bytes, dirlog::HEADER_LEN + 3 * dirlog::REC);
 
     let mut t = vec![0xFFu8; dirlog::PAGE];
     for (n, s) in [(1u32, S1), (2, S1), (1, S2)] {
@@ -1117,17 +1421,17 @@ fn usage_counts_chips_and_bytes_for_the_display() {
 fn compaction_keeps_every_other_chip() {
     let mut p = Page::blank();
     let other = dir_with(&[(2, 5), (3, 6)]);
-    let pb = dirlog::plan(&p.0, &S2, &other);
+    let pb = dirlog::plan(p.s(), &S2, &other);
     p.apply(pb);
     // Chip 1 rewrites one slot until the log is full and compacted.
     let mut compacted = false;
     for v in 1..=200u8 {
         let d = dir_with(&[(0, v), (1, 7)]);
-        let plan = dirlog::plan(&p.0, &S1, &d);
-        compacted |= matches!(plan, Plan::Rewrite { .. });
+        let plan = dirlog::plan(p.s(), &S1, &d);
+        compacted |= matches!(plan, DirPlan::Rewrite { .. });
         p.apply(plan);
-        assert_eq!(dirlog::scan(&p.0, &S1).0, d);
-        assert_eq!(dirlog::scan(&p.0, &S2).0, other, "the other chip's entries survive compaction");
+        assert_eq!(dirlog::scan(p.s(), &S1).0, d);
+        assert_eq!(dirlog::scan(p.s(), &S2).0, other, "the other chip's entries survive compaction");
     }
     assert!(compacted);
 }
@@ -1139,33 +1443,36 @@ fn a_page_that_cannot_hold_another_entry_refuses_instead_of_forgetting_a_chip() 
     for c in 0..14u8 {
         let mut s = S1;
         s[8] = c;
-        let plan = dirlog::plan(&p.0, &s, &dir_with(&(0..9).map(|i| (i, 1 + c)).collect::<Vec<_>>()));
+        let plan = dirlog::plan(p.s(), &s, &dir_with(&(0..9).map(|i| (i, 1 + c)).collect::<Vec<_>>()));
         p.apply(plan);
     }
     let mut last = S1;
     last[8] = 100;
-    let plan = dirlog::plan(&p.0, &last, &dir_with(&[(0, 50)]));
+    let plan = dirlog::plan(p.s(), &last, &dir_with(&[(0, 50)]));
     p.apply(plan);
     let before = p.0.clone();
-    assert_eq!(dirlog::plan(&p.0, &last, &dir_with(&[(0, 50), (1, 51)])), Plan::Full);
+    assert_eq!(dirlog::plan(p.s(), &last, &dir_with(&[(0, 50), (1, 51)])), DirPlan::Full);
     assert_eq!(p.0, before);
     for c in 0..14u8 {
         let mut s = S1;
         s[8] = c;
-        assert_eq!(dirlog::scan(&p.0, &s).0, dir_with(&(0..9).map(|i| (i, 1 + c)).collect::<Vec<_>>()));
+        assert_eq!(dirlog::scan(p.s(), &s).0, dir_with(&(0..9).map(|i| (i, 1 + c)).collect::<Vec<_>>()));
     }
 }
 
 #[test]
-fn a_page_of_the_older_single_chip_format_is_not_read_as_a_directory() {
+fn a_sector_of_an_older_format_is_not_read_as_a_directory() {
     let mut p = Page::blank();
-    let mut old = dirlog::HEADER;
-    old[12] = 1; // version 1 had no serial number in its records
-    p.0[..16].copy_from_slice(&old);
-    p.0[16..32].copy_from_slice(&[7u8; 16]);
-    assert_eq!(dirlog::scan(&p.0, &S1), ([0u8; DIR_LEN], 0, false));
+    // Version 2 of the format (16-byte header "PFRS-SITEDIR\x02", 7-byte tags) and version 1.
+    for ver in [1u8, 2] {
+        let mut old = *b"PFRS-SITEDIR\x02\0\0\0";
+        old[12] = ver;
+        p.0[0][..16].copy_from_slice(&old);
+        p.0[0][16..32].copy_from_slice(&[7u8; 16]);
+        assert_eq!(dirlog::scan(p.s(), &S1), ([0u8; DIR_LEN], 0, false));
+    }
     let d = dir_with(&[(0, 3)]);
-    p.save(&d); // formats the page
+    p.save(&d); // formats sector A
     assert_eq!(p.load(), d);
 }
 

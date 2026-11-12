@@ -118,7 +118,10 @@ impl<B: Bus> Atecc<B> {
             self.idle();
             match r {
                 Ok(v) => return Ok(v),
-                Err(Error::Status(0xFF)) | Err(Error::Status(0xEE)) | Err(Error::Crc) | Err(Error::Bus) => {
+                Err(Error::Status(0xFF))
+                | Err(Error::Status(0xEE))
+                | Err(Error::Crc)
+                | Err(Error::Bus) => {
                     last = r.err().unwrap_or(Error::Bus);
                 }
                 Err(e) => return Err(e),
@@ -128,7 +131,11 @@ impl<B: Bus> Atecc<B> {
     }
 
     fn check_slot(slot: u8) -> Result<(), Error> {
-        if slot < 16 { Ok(()) } else { Err(Error::Param) }
+        if slot < 16 {
+            Ok(())
+        } else {
+            Err(Error::Param)
+        }
     }
 }
 
@@ -154,7 +161,13 @@ impl<B: Bus> ChipOps for Atecc<B> {
         Self::check_slot(slot)?;
         self.session(|c| {
             let mut r = [0u8; proto::MAX_RESP];
-            let n = c.command(proto::OP_GENKEY, proto::GENKEY_CREATE, slot as u16, &[], &mut r)?;
+            let n = c.command(
+                proto::OP_GENKEY,
+                proto::GENKEY_CREATE,
+                slot as u16,
+                &[],
+                &mut r,
+            )?;
             fixed::<64>(&r[..n])
         })
     }
@@ -163,7 +176,13 @@ impl<B: Bus> ChipOps for Atecc<B> {
         Self::check_slot(slot)?;
         self.session(|c| {
             let mut r = [0u8; proto::MAX_RESP];
-            let n = c.command(proto::OP_GENKEY, proto::GENKEY_PUBLIC, slot as u16, &[], &mut r)?;
+            let n = c.command(
+                proto::OP_GENKEY,
+                proto::GENKEY_PUBLIC,
+                slot as u16,
+                &[],
+                &mut r,
+            )?;
             fixed::<64>(&r[..n])
         })
     }
@@ -177,7 +196,13 @@ impl<B: Bus> ChipOps for Atecc<B> {
             if n != 0 {
                 return Err(Error::Param);
             }
-            let n = c.command(proto::OP_SIGN, proto::SIGN_EXTERNAL, slot as u16, &[], &mut r)?;
+            let n = c.command(
+                proto::OP_SIGN,
+                proto::SIGN_EXTERNAL,
+                slot as u16,
+                &[],
+                &mut r,
+            )?;
             fixed::<64>(&r[..n])
         })
     }
@@ -188,7 +213,13 @@ impl<B: Bus> ChipOps for Atecc<B> {
         }
         self.session(|c| {
             let mut r = [0u8; proto::MAX_RESP];
-            let n = c.command(proto::OP_COUNTER, proto::COUNTER_READ, id as u16, &[], &mut r)?;
+            let n = c.command(
+                proto::OP_COUNTER,
+                proto::COUNTER_READ,
+                id as u16,
+                &[],
+                &mut r,
+            )?;
             proto::counter_value(&r[..n])
         })
     }
@@ -199,7 +230,13 @@ impl<B: Bus> ChipOps for Atecc<B> {
         }
         self.session(|c| {
             let mut r = [0u8; proto::MAX_RESP];
-            let n = c.command(proto::OP_COUNTER, proto::COUNTER_INC, id as u16, &[], &mut r)?;
+            let n = c.command(
+                proto::OP_COUNTER,
+                proto::COUNTER_INC,
+                id as u16,
+                &[],
+                &mut r,
+            )?;
             proto::counter_value(&r[..n])
         })
     }
@@ -209,9 +246,21 @@ impl<B: Bus> ChipOps for Atecc<B> {
             let mut r = [0u8; proto::MAX_RESP];
             let n = c.command(proto::OP_INFO, proto::INFO_REVISION, 0, &[], &mut r)?;
             let revision: [u8; 4] = fixed(&r[..n])?;
-            let n = c.command(proto::OP_READ, proto::READ_CONFIG_32, proto::config_block_addr(0), &[], &mut r)?;
+            let n = c.command(
+                proto::OP_READ,
+                proto::READ_CONFIG_32,
+                proto::config_block_addr(0),
+                &[],
+                &mut r,
+            )?;
             let block0: [u8; 32] = fixed(&r[..n])?;
-            let n = c.command(proto::OP_READ, proto::READ_CONFIG_32, proto::config_block_addr(2), &[], &mut r)?;
+            let n = c.command(
+                proto::OP_READ,
+                proto::READ_CONFIG_32,
+                proto::config_block_addr(2),
+                &[],
+                &mut r,
+            )?;
             let block2: [u8; 32] = fixed(&r[..n])?;
             proto::parse_info(&revision, &block0, &block2)
         })

@@ -48,10 +48,11 @@ pub const ATTEST_SLOT: u8 = 0;
 pub const FIRST_CRED_SLOT: u8 = 1;
 /// Number of credential slots (a registration at a 10th site is refused: keys are never overwritten).
 pub const SLOTS: u8 = 9;
-/// Directory entry of one credential slot: the first `DIR_ENTRY` bytes of the SHA-256 of the RP ID
-/// it belongs to (all zero = no RP recorded). The directory has one entry per credential slot, in
+/// Directory entry of one credential slot: the first `DIR_ENTRY` (16) bytes of the SHA-256 of the RP
+/// ID it belongs to (128 bits: two sites sharing a key by chance or by a crafted site name is out of
+/// reach; all zero = no RP recorded). The directory has one entry per credential slot, in
 /// slot order, and is kept by a `DirStore` (the Pico's flash), never in the chip.
-pub const DIR_ENTRY: usize = 7;
+pub const DIR_ENTRY: usize = 16;
 pub const DIR_LEN: usize = SLOTS as usize * DIR_ENTRY;
 
 /// Serial number of an ATECC608A (9 bytes, unique per chip).
@@ -60,8 +61,9 @@ pub type ChipSerial = [u8; 9];
 /// Where the site directories are kept (the Pico's flash), one per chip. `select` says which chip
 /// is connected; `load` then returns the whole directory image of THAT chip (zeros when nothing
 /// is stored for it, or before any `select`); `save` stores the image for that chip and must be
-/// power-fail safe (an interrupted `save` leaves the old or the new directory, or an empty one:
-/// never a wrong one, and never another chip's).
+/// power-fail safe: an interrupted `save` leaves the complete old or the complete new directory
+/// (never an empty or a truncated one once a directory existed, never a wrong one, never another
+/// chip's), because an existing key must never become assignable to another site by a power failure.
 pub trait DirStore {
     fn select(&mut self, chip: &ChipSerial);
     fn load(&mut self) -> [u8; DIR_LEN];
@@ -399,7 +401,11 @@ impl EcSecretKey for SeSecretKey {
         }
         // The directory comes from the Pico's flash. Without a hint or without a store nothing can
         // be recorded, so no key is shared or taken over then.
-        let mut dir = if rp.is_some() { with_dir(|d| d.load()) } else { None };
+        let mut dir = if rp.is_some() {
+            with_dir(|d| d.load())
+        } else {
+            None
+        };
         // 1. This RP already has a key: use it again, no slot is consumed.
         if let (Some(rp), Some(dir)) = (&rp, &dir) {
             if let Some((slot, pubkey)) = dir_find(dir, rp) {
@@ -475,14 +481,20 @@ impl EcSecretKey for SeSecretKey {
                 s.copy_from_slice(&sig[32..]);
                 SeSignature { r, s }
             }
-            // The trait cannot report errors. A refused signature (chip gone) becomes an
-            // all-zero signature that no verifier accepts.
-            Err(_) => SeSignature { r: [0; 32], s: [0; 32] },
+            // The trait cannot report errors, and a bogus signature would look like a successful
+            // response that only fails later at the relying party. Like every other chip failure
+            // here this is a hard stop (the command layer already retried once from the wake-up):
+            // the host sees the device fail instead of a CTAP success.
+            Err(_) => panic!("se: the chip refused to sign"),
         }
     }
 
     fn export(&self) -> Vec<u8> {
-        let version = if self.slot == ATTEST_SLOT { HANDLE_ATTEST } else { HANDLE_CRED };
+        let version = if self.slot == ATTEST_SLOT {
+            HANDLE_ATTEST
+        } else {
+            HANDLE_CRED
+        };
         handle(version, self.slot, &self.pubkey)
     }
 

@@ -21,7 +21,7 @@ Chip details, wiring, slot layout and provisioning: `atecc608a/CONFIG.md`.
 | Main loop, flash layout constants | `src/main.rs` |
 | `opensk::env::Env` for the Pico | `src/env/mod.rs` |
 | Chip: protocol, commands, OpenSK `Ecdsa`, I2C bus | `src/se/{proto,chip,ecdsa,crypto,i2c}.rs` |
-| Site directory in the Pico's flash | `src/se/dirlog.rs` (page format), `src/env/dir_flash.rs` (flash access) |
+| Site directory in the Pico's flash | `src/se/dirlog.rs` (two-sector copy-on-write format), `src/env/dir_flash.rs` (flash access) |
 | Status display (optional, feature `oled`) | `src/oled.rs`, `src/status.rs` |
 
 OpenSK blocks (waiting for the button, waiting for the chip), so it runs in thread mode. USB, the LED and
@@ -35,18 +35,23 @@ keeps one key per site (`src/se/ecdsa.rs`). It only adds two default methods to 
 changes. `build.sh`, `host-test/run.sh` and CI apply it with `sh third_party/apply-opensk-patch.sh` (safe to run again).
 
 ## Flash layout
-The last **76 KiB** of flash are kept out of the linker's FLASH region by `build.rs` (derived from the single `flash_*`
-feature): **72 KiB** (18 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store, and the **4 KiB page right below
-it** holds the site directory (`src/env/dir_flash.rs`). The directory page is not part of the store: OpenSK's reset
-and the store's format never touch it. Erasing the whole flash clears it too (see "Key slots" below).
+The last **84 KiB** of flash are kept out of the linker's FLASH region by `build.rs` (derived from the single `flash_*`
+feature). From the end of flash downwards: **72 KiB** (18 pages of 4 KiB, `STORE_PAGES`) are the OpenSK key-value store;
+**4 KiB** site directory sector A (`src/env/dir_flash.rs`); **4 KiB** signature counter (`src/env/tally_flash.rs`);
+**4 KiB** site directory sector B. The directory is two sectors because it is updated copy-on-write: a compaction
+writes the complete new directory into the inactive sector and only then makes it the active one (generation number in
+its header, written last), so a power failure can never leave an empty or truncated directory (`src/se/dirlog.rs`).
+The directory sectors are not part of the store: OpenSK's reset and the store's format never touch them. Erasing the
+whole flash clears them too (see "Key slots" below).
 This differs from the previous revision (which also had a vault and PUF sectors): **erase the whole flash
-before the first install**; credentials of the old firmware are not usable anyway.
+before the first install**; credentials of the old firmware are not usable anyway. The directory record format also
+changed (16-byte site tag, two sectors): a directory written by an earlier build is not read.
 
 ## Key slots (one key per site)
 The site directory (which site owns which of the 9 credential slots) is in the Pico's flash, not in the chip. For a
 site that has no slot yet, `se/ecdsa.rs` takes, in this order: (1) the first slot that already **holds a private key**
 and belongs to no other site (the key is used as it is, no GenKey); (2) otherwise the first **empty** slot, where it runs
-GenKey. Slots owned by another site are never touched. If the directory is lost (flash erased), the keys are still in
+GenKey. Slots owned by another site are never touched. A power failure cannot lose the directory (see above). If it is lost anyway (flash erased from outside), the keys are still in
 the chip and are taken over again, one per site, in slot order; credentials registered earlier keep working (their
 credential ID names the slot), but a site may then end up with another site's old key (see `SECURITY.md`).
 
@@ -55,7 +60,7 @@ Every ATECC608A has a unique 9-byte serial number. The Pico's flash keeps the **
 separately for each serial number (`src/se/dirlog.rs`, `src/se/tallylog.rs`). The serial is read from the chip at start-up
 (and again before each new registration), and from then on that chip's own information is used; swapping the chip
 (with the key unplugged) switches to the information of the chip that is now connected, and a chip that was never seen
-starts empty. Up to 14 completely used chips fit in the directory page (127 records); the signature log keeps the 32 chips
+starts empty. Up to 14 completely used chips fit in a directory sector (127 records); the signature log keeps the 32 chips
 with the highest totals. The OLED chip page shows the serial of the chip that is in use.
 What is NOT per chip: the PIN, the credential-ID encryption keys and resident credentials are OpenSK's single store.
 A credential made with chip A cannot sign while chip B is connected (the handle in its credential ID names a key B does
@@ -92,7 +97,7 @@ certificate, which is stored in the token once with OpenSK's `tools/configure.py
 **The `atecc1` code up to "OpenSK based ATECC support v2.1" was built and tested on browsers and operating
 systems** (reported by the maintainer, not independently verified). **Not compiled by their author:** the later changes (unlimited signatures, no counters, keys never overwritten, the chip page of the
 OLED, the Info/Read chip commands, one key per site, **and the move of the site directory from chip slot 13 to the Pico's flash with taking over existing keys**; the
-latter was written without a compiler and has not been built or run). `host-test/se` (the directory tests now use a flash-page model and a `DirStore`; run them to see the current count) and OpenSK's own unit tests (353 / 374, with the patch applied) were run on a host; the firmware itself
+latter was written without a compiler and has not been built or run). `host-test/se` (the directory tests use a two-sector flash model and a `DirStore`, and cut the power after every step of every kind of update and in the middle of every program/erase step; run them to see the current count) and OpenSK's own unit tests (353 / 374, with the patch applied) were run on a host; the firmware itself
 (thumbv6m, nightly) was not built and nothing was run on a real chip or in a browser. Build, then run `host-test/run.sh` and the acceptance test in
 `atecc608a/CONFIG.md` on a spare chip before locking a chip you care about. USB VID/PID
 (`0xc0de:0xcafe`) are prototype placeholders (`src/usb/mod.rs`).

@@ -55,7 +55,9 @@ impl Bus for RpBus {
 
 fn pull_ups() {
     for pin in [14usize, 15] {
-        embassy_rp::pac::PADS_BANK0.gpio(pin).modify(|w| w.set_pue(true));
+        embassy_rp::pac::PADS_BANK0
+            .gpio(pin)
+            .modify(|w| w.set_pue(true));
     }
 }
 

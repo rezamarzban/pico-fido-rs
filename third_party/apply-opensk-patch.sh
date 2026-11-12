@@ -5,7 +5,7 @@
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$(dirname "$HERE")"
-[ -f third_party/OpenSK/libraries/opensk/src/api/rng.rs ] || { echo "error: third_party/OpenSK is missing" >&2; exit 1; }
+[ -f third_party/OpenSK/libraries/opensk/src/api/rng.rs ] || { echo "error: third_party/OpenSK is missing (run: sh third_party/fetch-opensk.sh)" >&2; exit 1; }
 if git apply --directory=third_party/OpenSK -R --check third_party/opensk-rp-hint.patch >/dev/null 2>&1; then
   echo "OpenSK patch: already applied"
   exit 0

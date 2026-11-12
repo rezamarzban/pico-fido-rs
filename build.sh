@@ -80,18 +80,8 @@ OPENSK_DIR="third_party/OpenSK"
 OPENSK_LIB="$OPENSK_DIR/libraries/opensk/Cargo.toml"
 OPENSK_REV="${OPENSK_REV:-$(tr -d '[:space:]' < third_party/OPENSK_REV 2>/dev/null || true)}"
 if [ ! -f "$OPENSK_LIB" ]; then
-  if git ls-files --stage -- "$OPENSK_DIR" | grep -q '^160000'; then
-    echo "Fetching the OpenSK submodule (the commit recorded in the repository)"
-    git submodule update --init --depth 1 -- "$OPENSK_DIR"
-  else
-    [ -n "$OPENSK_REV" ] || { echo "error: no OpenSK submodule and no pinned commit (third_party/OPENSK_REV, or set OPENSK_REV)" >&2; exit 1; }
-    echo "Fetching OpenSK $OPENSK_REV from $OPENSK_URL"
-    rm -rf "$OPENSK_DIR"; mkdir -p "$OPENSK_DIR"
-    git -C "$OPENSK_DIR" init -q
-    git -C "$OPENSK_DIR" remote add origin "$OPENSK_URL"
-    git -C "$OPENSK_DIR" fetch -q --depth 1 origin "$OPENSK_REV"
-    git -C "$OPENSK_DIR" checkout -q FETCH_HEAD
-  fi
+  [ -n "$OPENSK_REV" ] || { echo "error: no pinned OpenSK commit (third_party/OPENSK_REV, or set OPENSK_REV)" >&2; exit 1; }
+  OPENSK_URL="$OPENSK_URL" OPENSK_REV="$OPENSK_REV" sh third_party/fetch-opensk.sh
 fi
 [ -f "$OPENSK_LIB" ] || { echo "error: $OPENSK_LIB is missing after fetching OpenSK" >&2; exit 1; }
 echo "OpenSK: $(git -C "$OPENSK_DIR" log -1 --format='%h %s' 2>/dev/null || echo 'unknown revision')"
