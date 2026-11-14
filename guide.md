@@ -56,9 +56,16 @@ almost solid = waiting for your button press.
   with chip A do not work while chip B is connected and work again when A is back.
 - **Unlimited signatures.** Signatures are not counted, there is no budget. (If your chip was provisioned with the old
   500-signature Counter 0, that counter is simply ignored now.)
-- **OLED.** Three pages, switching every 5 s: the device (state, USB, uptime, RAM, flash), the ATECC608A (I2C
-  address, serial number, revision, config/data lock state, key slots in use) and the flash data about chips (how many
-  different chips are stored, chips and bytes used in the site-directory page and in the signature-counter page).
+- **OLED.** Four pages, switching every 5 s: the device (state, USB, uptime, RAM, flash), the ATECC608A (I2C
+  address, serial number, revision, config/data lock state, key slots in use), the flash data about chips (how many
+  different chips are stored, chips and bytes used in the site-directory page and in the signature-counter page) and the
+  SRAM PUF (state, bit errors of this boot's sample, share of ones, whether this boot was a power-on reset, whether this
+  chip has a backup of the PUF secret and how many chips do, and whether the key came from the PUF or from the backup).
+  If the flash key is not available the key halts (LED blinks 3x) and the display stays on that page and says why.
+- **Backup of the PUF secret.** The first time the PUF works with a chip connected, that chip gets a record of the PUF
+  secret in the Pico's flash (sealed with the chip's slot-0 public key). If the PUF later fails, connect a chip that has
+  a record and the key restores itself; unplug and replug once to let it write a new helper sector. (Known weakness:
+  anyone with a copy of the flash and a public key of one of your chips can open that backup; `SECURITY.md`.)
 - **Wrong PINs:** the usual CTAP rules apply: after 3 wrong PINs in a row, unplug and replug; after 8 wrong PINs
   without a correct one in between, the PIN is blocked. A correct PIN resets the counts.
 - **Forgotten or blocked PIN:** the only way out is a reset, which **deletes all credentials** from the key store (the

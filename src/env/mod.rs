@@ -4,6 +4,7 @@
 //! this board. Everything blocking (user presence, flash, packet I/O) lives here; the USB stack
 //! runs on a separate, higher-priority executor and talks to OpenSK through `hid`.
 
+pub mod backup_flash;
 mod clock;
 pub mod dir_flash;
 mod flash_io;

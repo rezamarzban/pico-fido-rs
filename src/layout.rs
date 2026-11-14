@@ -8,7 +8,8 @@
 //!    8 KiB   site directory sector B                     (every record sealed, env/dir_flash.rs)
 //!   12 KiB   signature counter                           (every record sealed, env/tally_flash.rs)
 //!    4 KiB   SRAM-PUF helper data                        (public by design, puf.rs)
-//!   ---- 104 KiB in total ----
+//!    4 KiB   backup of the PUF secret, one record per chip (sealed with the chip's slot-0 public key, puf_backup.rs)
+//!   ---- 108 KiB in total ----
 //!   firmware image
 //! ```
 //!
@@ -37,6 +38,10 @@ pub const TALLY_START: usize = DIR_B_START - TALLY_PHYS;
 /// SRAM-PUF helper sector.
 pub const PUF_START: usize = TALLY_START - PAGE;
 
-/// Everything from `PUF_START` to the end of flash is outside the firmware image.
-pub const RESERVED: usize = FLASH_SIZE - PUF_START;
-const _: () = core::assert!(RESERVED == 104 * 1024, "build.rs reserves 104 KiB");
+/// Backup of the PUF secret. It lies BELOW the helper sector, outside the area that the first start
+/// wipes (`PUF_START + PAGE ..`), so a lost helper sector does not take the backup with it.
+pub const BACKUP_START: usize = PUF_START - PAGE;
+
+/// Everything from `BACKUP_START` to the end of flash is outside the firmware image.
+pub const RESERVED: usize = FLASH_SIZE - BACKUP_START;
+const _: () = core::assert!(RESERVED == 108 * 1024, "build.rs reserves 108 KiB");

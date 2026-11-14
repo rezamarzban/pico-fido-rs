@@ -40,6 +40,9 @@ pub enum Domain {
     Dir,
     /// Signature counter (`env/tally_flash.rs`).
     Tally,
+    /// Backup of the SRAM-PUF secret, one record per chip (`puf_backup.rs`); its "root" is derived
+    /// from the public key of the chip's slot 0, not from the PUF.
+    Backup,
 }
 
 impl Domain {
@@ -48,6 +51,7 @@ impl Domain {
             Domain::Store => b"store",
             Domain::Dir => b"dir",
             Domain::Tally => b"tally",
+            Domain::Backup => b"backup",
         }
     }
 }

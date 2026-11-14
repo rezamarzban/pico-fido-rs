@@ -1,5 +1,5 @@
 //! Generates the linker memory map (`memory.x`) from the selected `flash_*` Cargo feature and
-//! puts it where the linker finds it. The last 104 KiB of flash are left out of the FLASH region
+//! puts it where the linker finds it. The last 108 KiB of flash are left out of the FLASH region
 //! (src/layout.rs): 72 KiB OpenSK key-value store (STORE_PAGES in src/main.rs), 2 x 8 KiB site
 //! directory sectors, 12 KiB signature counter (all sealed with AES-256-GCM) and one 4 KiB sector of
 //! SRAM-PUF helper data. The top 4 KiB of the striped SRAM (0x2003F000) are also taken out of the
@@ -34,8 +34,8 @@ fn main() {
     let memory = format!(
         "MEMORY {{\n\
          \x20   BOOT2 : ORIGIN = 0x10000000, LENGTH = 0x100\n\
-         \x20   /* last 104K of the {flash_kib}K flash: PUF helper (4K) + counter (12K) + directory B (8K) + directory A (8K) + key-value store (72K) */\n\
-         \x20   FLASH : ORIGIN = 0x10000100, LENGTH = {flash_kib}K - 0x100 - 104K\n\
+         \x20   /* last 108K of the {flash_kib}K flash: PUF-secret backup (4K) + PUF helper (4K) + counter (12K) + directory B (8K) + directory A (8K) + key-value store (72K) */\n\
+         \x20   FLASH : ORIGIN = 0x10000100, LENGTH = {flash_kib}K - 0x100 - 108K\n\
          \x20   RAM   : ORIGIN = 0x20000000, LENGTH = 252K\n\
          \x20   PUF   : ORIGIN = 0x2003F000, LENGTH = 4K\n\
          }}\n"

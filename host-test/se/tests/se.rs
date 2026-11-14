@@ -5,6 +5,8 @@
 
 extern crate alloc;
 
+#[path = "../../../src/puf_backup.rs"]
+mod puf_backup;
 #[path = "../../../src/puf_code.rs"]
 mod puf_code;
 #[path = "../../../src/seal.rs"]
@@ -2090,5 +2092,217 @@ mod spill_tests {
             assert_eq!(kv.find(key).unwrap(), value(1023, i as u8));
         }
         assert_eq!(kv.keys(), vec![2000, 2001, 2002, 2003]);
+    }
+}
+
+
+// ---------------------------------------------------------------- backup of the PUF secret (puf_backup.rs)
+
+mod backup_tests {
+    use super::puf_backup::*;
+
+    fn pk(n: u8) -> [u8; 64] {
+        let mut k = [0u8; 64];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = n.wrapping_mul(31).wrapping_add(i as u8);
+        }
+        k
+    }
+    fn secret(n: u8) -> [u8; SECRET_LEN] {
+        [n; SECRET_LEN]
+    }
+    fn blank() -> Vec<u8> {
+        vec![0xFF; PAGE]
+    }
+    /// A flash sector as the firmware changes it: erase = 0xFF, programming only clears bits.
+    fn apply(sector: &mut Vec<u8>, plan: &Plan) -> bool {
+        match plan {
+            Plan::Nothing => true,
+            Plan::Full => false,
+            Plan::Append { offset, data } => {
+                for (i, b) in data.iter().enumerate() {
+                    sector[offset + i] &= b;
+                }
+                true
+            }
+            Plan::Format { data } => {
+                sector.fill(0xFF);
+                for (i, b) in data.iter().enumerate() {
+                    sector[i] &= b;
+                }
+                true
+            }
+        }
+    }
+    fn back_up(sector: &mut Vec<u8>, n: u8, s: u8) {
+        let p = plan(sector, &pk(n), &secret(s));
+        assert!(apply(sector, &p));
+    }
+
+    #[test]
+    fn a_chip_gets_its_secret_back_with_its_own_public_key_only() {
+        let mut sec = blank();
+        assert!(find(&sec, &pk(1)).is_none(), "a blank sector has no backup");
+        let p = plan(&sec, &pk(1), &secret(7));
+        assert!(matches!(p, Plan::Format { .. }), "no valid header: format");
+        assert!(apply(&mut sec, &p));
+        assert_eq!(&*find(&sec, &pk(1)).unwrap(), &secret(7));
+        assert!(find(&sec, &pk(2)).is_none(), "another chip's public key opens nothing");
+        let mut wrong = pk(1);
+        wrong[63] ^= 1;
+        assert!(find(&sec, &wrong).is_none());
+        assert_eq!(usage(&sec), (1, 1));
+        // The sector holds neither the secret, nor the public key, in the clear.
+        assert!(!sec.windows(8).any(|w| w == &secret(7)[..8]));
+        assert!(!sec.windows(8).any(|w| w == &pk(1)[..8]));
+    }
+
+    #[test]
+    fn every_chip_gets_one_record_and_nothing_is_written_twice() {
+        let mut sec = blank();
+        back_up(&mut sec, 1, 7);
+        assert_eq!(plan(&sec, &pk(1), &secret(7)), Plan::Nothing, "already backed up");
+        let p = plan(&sec, &pk(2), &secret(7));
+        assert!(matches!(p, Plan::Append { offset, .. } if offset == HEADER_LEN + REC));
+        assert!(apply(&mut sec, &p));
+        assert_eq!(usage(&sec), (2, 2));
+        // Any chip with a record brings the same secret back.
+        assert_eq!(&*find(&sec, &pk(1)).unwrap(), &*find(&sec, &pk(2)).unwrap());
+        assert_eq!(plan(&sec, &pk(2), &secret(7)), Plan::Nothing);
+    }
+
+    #[test]
+    fn a_changed_secret_is_appended_and_the_newest_record_wins() {
+        let mut sec = blank();
+        back_up(&mut sec, 1, 7);
+        back_up(&mut sec, 1, 9); // the device was enrolled again
+        assert_eq!(&*find(&sec, &pk(1)).unwrap(), &secret(9));
+        assert_eq!(usage(&sec), (1, 2));
+    }
+
+    #[test]
+    fn a_half_written_or_damaged_record_is_skipped_and_the_older_one_counts() {
+        let mut sec = blank();
+        back_up(&mut sec, 1, 7);
+        let p = plan(&sec, &pk(1), &secret(9));
+        let Plan::Append { offset, data } = p else { panic!() };
+        // Power fails 20 bytes into the record: the check fails, the old secret is still there.
+        for (i, b) in data[..20].iter().enumerate() {
+            sec[offset + i] &= b;
+        }
+        assert_eq!(&*find(&sec, &pk(1)).unwrap(), &secret(7));
+        // The torn position is used up: the next attempt goes after it and works.
+        let p2 = plan(&sec, &pk(1), &secret(9));
+        assert!(matches!(p2, Plan::Append { offset: o, .. } if o == offset + REC));
+        assert!(apply(&mut sec, &p2));
+        assert_eq!(&*find(&sec, &pk(1)).unwrap(), &secret(9));
+        // A bit flip in the sealed secret: the record's check fails, the previous record counts.
+        let rec1 = HEADER_LEN;
+        sec[rec1 + ID_LEN + 5] ^= 0x01;
+        assert!(find(&sec, &pk(1)).is_some());
+    }
+
+    #[test]
+    fn a_forged_record_fails_the_authentication_tag() {
+        let mut sec = blank();
+        back_up(&mut sec, 1, 7);
+        // Change the sealed bytes and recompute the (keyless) record check: the GCM tag still rejects it.
+        let rec = HEADER_LEN;
+        sec[rec + ID_LEN + 3] ^= 0x40;
+        let mut h = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut h, b"pfrs-pbk-rec1");
+        sha2::Digest::update(&mut h, &sec[rec..rec + REC - 6]);
+        let c = sha2::Digest::finalize(h);
+        sec[rec + REC - 6..rec + REC].copy_from_slice(&c[..6]);
+        assert!(find(&sec, &pk(1)).is_none());
+        // A record moved to another chip id fails too (the id is part of the associated data).
+        let mut sec2 = blank();
+        back_up(&mut sec2, 1, 7);
+        let id2 = chip_id(&pk(2));
+        sec2[rec..rec + ID_LEN].copy_from_slice(&id2);
+        let mut h = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut h, b"pfrs-pbk-rec1");
+        sha2::Digest::update(&mut h, &sec2[rec..rec + REC - 6]);
+        let c = sha2::Digest::finalize(h);
+        sec2[rec + REC - 6..rec + REC].copy_from_slice(&c[..6]);
+        assert!(find(&sec2, &pk(2)).is_none());
+        assert!(find(&sec2, &pk(1)).is_none());
+    }
+
+    #[test]
+    fn a_torn_format_leaves_nothing_wrong_and_a_foreign_sector_is_formatted() {
+        // The first backup: header and record in one program. Power fails inside the header: the
+        // sector is not valid, the next boot formats it again.
+        let mut sec = blank();
+        let p = plan(&sec, &pk(1), &secret(7));
+        let Plan::Format { data } = &p else { panic!() };
+        for n in [1usize, 8, 12, 15] {
+            let mut torn = blank();
+            for (i, b) in data[..n].iter().enumerate() {
+                torn[i] &= b;
+            }
+            assert!(find(&torn, &pk(1)).is_none());
+            assert!(matches!(plan(&torn, &pk(1), &secret(7)), Plan::Format { .. }));
+        }
+        // Header written, record torn: valid sector without a record: the record is appended.
+        let mut half = blank();
+        for (i, b) in data[..HEADER_LEN + 10].iter().enumerate() {
+            half[i] &= b;
+        }
+        assert!(find(&half, &pk(1)).is_none());
+        assert!(matches!(plan(&half, &pk(1), &secret(7)), Plan::Append { .. }));
+        // Old firmware image bytes or older formats: formatted.
+        for fill in [0x00u8, 0x5A] {
+            let junk = vec![fill; PAGE];
+            assert!(matches!(plan(&junk, &pk(1), &secret(7)), Plan::Format { .. }));
+        }
+        assert!(apply(&mut sec, &p));
+        assert_eq!(&*find(&sec, &pk(1)).unwrap(), &secret(7));
+    }
+
+    #[test]
+    fn a_full_sector_refuses_a_new_chip_and_keeps_what_it_has() {
+        let mut sec = blank();
+        for n in 0..MAX_RECS as u8 {
+            back_up(&mut sec, n, 7);
+        }
+        assert_eq!(usage(&sec), (MAX_RECS, MAX_RECS));
+        let before = sec.clone();
+        assert_eq!(plan(&sec, &pk(200), &secret(7)), Plan::Full);
+        assert_eq!(sec, before);
+        for n in 0..MAX_RECS as u8 {
+            assert_eq!(&*find(&sec, &pk(n)).unwrap(), &secret(7), "chip {n}");
+        }
+        // A chip that already has its record is still "nothing to do".
+        assert_eq!(plan(&sec, &pk(3), &secret(7)), Plan::Nothing);
+    }
+
+    #[test]
+    fn the_record_geometry_fits_the_sector() {
+        assert_eq!(REC, 74);
+        assert_eq!(MAX_RECS, 55);
+        assert!(HEADER_LEN + MAX_RECS * REC <= PAGE);
+        assert_eq!(chip_id(&pk(1)), chip_id(&pk(1)));
+        assert_ne!(chip_id(&pk(1)), chip_id(&pk(2)));
+    }
+
+    #[test]
+    fn the_start_up_policy_never_wipes_what_another_chip_could_unlock() {
+        use Helper::*;
+        // The PUF works: nothing to do, whatever the backup says.
+        for (b, c, r) in [(false, 0, true), (true, 3, true), (false, 2, false)] {
+            assert_eq!(boot_decision(Ready, b, c, r), Boot::Go);
+        }
+        // The PUF cannot give its secret but this chip has a record: restore, in every such state.
+        for h in [Blank, Damaged, Noisy] {
+            assert_eq!(boot_decision(h, true, 1, true), Boot::Restore, "{h:?}");
+        }
+        // No record for this chip: noisy and damaged halt (as before the backup existed) ...
+        assert_eq!(boot_decision(Noisy, false, 0, true), Boot::Halt(Halt::Noisy));
+        assert_eq!(boot_decision(Damaged, false, 4, true), Boot::Halt(Halt::Damaged));
+        // ... a blank helper is a first start only if the backup sector holds no chip at all and is readable.
+        assert_eq!(boot_decision(Blank, false, 0, true), Boot::FirstStart);
+        assert_eq!(boot_decision(Blank, false, 2, true), Boot::Halt(Halt::Lost), "other chips' records: do not wipe");
+        assert_eq!(boot_decision(Blank, false, 0, false), Boot::Halt(Halt::Lost), "unreadable backup: do not wipe");
     }
 }

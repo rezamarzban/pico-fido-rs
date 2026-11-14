@@ -197,6 +197,13 @@ pub fn chip_info() -> Option<ChipInfo> {
 }
 
 /// Serial number of the connected chip, as of the last `chip_info()`.
+/// The public key (X || Y) of the key in slot 0, the attestation key, read from the chip (never
+/// from the cache: slot 0 may be provisioned after the firmware looked at it). `None`: no chip, or
+/// slot 0 holds no key. It is the "password" of the PUF-secret backup (`puf_backup.rs`).
+pub fn attestation_pubkey() -> Option<[u8; 64]> {
+    with_chip(|c| c.public_key(ATTEST_SLOT)).ok()
+}
+
 pub fn chip_serial() -> Option<ChipSerial> {
     critical_section::with(|cs| SERIAL.borrow(cs).get())
 }

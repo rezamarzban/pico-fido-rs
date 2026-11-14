@@ -22,7 +22,7 @@ Chip details, wiring, slot layout and provisioning: `atecc608a/CONFIG.md`.
 | `opensk::env::Env` for the Pico | `src/env/mod.rs` |
 | Chip: protocol, commands, OpenSK `Ecdsa`, I2C bus | `src/se/{proto,chip,ecdsa,crypto,i2c}.rs` |
 | Site directory in the Pico's flash | `src/se/dirlog.rs` (two-sector copy-on-write format, plaintext page image), `src/env/dir_flash.rs` (sealed flash access) |
-| Flash encryption | `src/seal.rs` (AES-256-GCM), `src/sealed_log.rs` (log pages <-> sealed sectors), `src/puf.rs` (SRAM PUF key), `src/layout.rs` |
+| Flash encryption | `src/seal.rs` (AES-256-GCM), `src/sealed_log.rs` (log pages <-> sealed sectors), `src/puf.rs` (SRAM PUF key), `src/puf_backup.rs` + `src/env/backup_flash.rs` (backup of the PUF secret), `src/layout.rs` |
 | Status display (optional, feature `oled`) | `src/oled.rs`, `src/status.rs` |
 
 OpenSK blocks (waiting for the button, waiting for the chip), so it runs in thread mode. USB, the LED and
@@ -40,7 +40,7 @@ answer a refused registration or signature with a CTAP error instead of stopping
 
 ## Flash layout and encryption
 Everything sensitive in the Pico's flash is encrypted with **AES-256-GCM**; the key comes from the **SRAM PUF**
-(`src/puf.rs`, `src/seal.rs`, `src/sealed_log.rs`, `src/layout.rs`). The last **104 KiB** of flash are kept out of the
+(`src/puf.rs`, `src/seal.rs`, `src/sealed_log.rs`, `src/layout.rs`). The last **108 KiB** of flash are kept out of the
 linker's FLASH region by `build.rs`. From the end of flash downwards:
 
 | Area | Size | Content |
@@ -49,6 +49,7 @@ linker's FLASH region by `build.rs`. From the end of flash downwards:
 | Site directory sectors A, B | 2 x 8 KiB | **every record sealed** (chip serials, site hashes), `src/env/dir_flash.rs` |
 | Signature counter | 12 KiB | **every record sealed**, `src/env/tally_flash.rs` |
 | SRAM-PUF helper data | 4 KiB | public by design (useless without this chip's SRAM pattern) |
+| Backup of the PUF secret | 4 KiB | one sealed record per chip, `src/puf_backup.rs` (see below); below the helper sector, so the first-start wipe never touches it |
 
 * **Key.** 4 KiB at the TOP of the striped SRAM (0x2003F000..0x20040000) are carved out of the linker's RAM
   (`build.rs`) and never written (at the top so that flip-link's stack, at the bottom of RAM, still faults on overflow).
@@ -58,12 +59,23 @@ linker's FLASH region by `build.rs`. From the end of flash downwards:
   ones is refused at enrolment (a biased chip would give a weaker secret, see SECURITY.md). Root key =
   HMAC-SHA-256(secret, label); per area two keys are derived from it (AES-256 key and a nonce key). The root key is never
   stored: it is rebuilt from the RAM for every flash operation and wiped.
+* **Backup of the PUF secret.** Whenever the PUF works and a chip with a key in slot 0 is connected, the PUF secret is
+  also written once to the backup sector: AES-256-GCM sealed with a key derived (SHA-256) from that chip's **slot-0 public
+  key**, one record per chip (55 fit). If a later start cannot read the PUF (the sample does not decode, the helper sector
+  is damaged or erased), connecting any chip that has a record brings the secret back and with it every key; if the
+  sample allows it (power-on reset, balanced pattern) a new helper sector is written from the current power-up pattern, so
+  the next starts use the PUF again, otherwise the secret stays in RAM for that power cycle. Nothing is wiped on this
+  path. A blank helper sector with records of *other* chips only (or an unreadable backup) halts instead of wiping.
+  **Trade-off:** a public key is not secret (it is in the attestation certificate), and the secret is the same for every chip,
+  so a copy of the flash plus the slot-0 public key of any one chip with a record opens the backup and then everything
+  (`SECURITY.md`). The backup buys availability, not confidentiality.
 * **Format.** `nonce(12) || ciphertext || tag(16)`; associated data = store key id / record position. Nonces are
   derived (HMAC of the data), so no counter or RNG is needed and a nonce is never used for two different messages.
 * **First start.** With an erased helper sector the firmware wipes store, directory and counter (an older firmware left
   plaintext there), then writes the helper sector (the commit). This needs a **power-on reset: unplug the key and plug it
   in again after flashing**; otherwise the LED shows 3 short blinks + pause and nothing runs. The same blink means
-  "no usable key" later (damaged helper sector, sample does not decode: re-plug; still failing: erase the flash).
+  "no usable key" later (damaged helper sector, sample does not decode and the connected chip has no backup record: re-plug,
+  or connect a chip that has one; still failing: erase the flash). The OLED then stays on its SRAM PUF page and says why.
 * **Upgrading** from an unencrypted build, or from an earlier encrypted one (the helper format is now `PUF3`, 4 KiB of RAM,
   and the store entries have a new format): erase the whole flash first (BOOTSEL `flash_nuke.uf2`). Credentials of the old
   firmware are not kept; the chip's keys stay and are taken over again (see "Key slots"). Directory capacity: unchanged.
@@ -125,10 +137,11 @@ encryption, was checked like this (stable Rust 1.99 with `RUSTC_BOOTSTRAP=1`, `-
 * `cargo check`, `cargo clippy -- --deny=warnings` and `cargo build --release` for `thumbv6m-none-eabi` pass (linked with
   `rust-lld`; flip-link is not installed in that setup); the image is about 230 KB, `.data`+`.bss` end well below the
   PUF region, and `rustfmt --check` is clean.
-* `host-test/se` (67 tests): the chip model and the OpenSK adapter, the two-sector directory with the power cut after
+* `host-test/se` (76 tests): the chip model and the OpenSK adapter, the two-sector directory with the power cut after
   every step and in the middle of every program/erase step, the sealed log layouts with known-answer vectors from
   `host-test/seal_ref.py`, the PUF arithmetic (bit-sliced majority against a naive one, noise at 10 %, bias
-  refusal) and the long-value splitting.
+  refusal), the long-value splitting and the PUF-secret backup (record format, torn writes, forgery, capacity, and the
+  start-up policy that decides between restore, first start and halt).
 * OpenSK's own unit tests pass at the pinned revision with the patch applied (350, and 401 with `config_command,ctap1`).
 * **Not done:** nothing was run on a Pico, a real ATECC608A or real SRAM. **Before relying on the flash encryption, flash a spare Pico and
   read the `puf: ... bit errors ... ones: raw ... pairs ...` line at several boots, temperatures and on several

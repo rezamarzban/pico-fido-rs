@@ -18,9 +18,23 @@ Experimental firmware; read this before relying on it.
 * **Flash is encrypted, RAM is not.** The PIN hash, the master keys that encrypt credential IDs, resident-credential
   data, counters, the site directory and the signature counts are AES-256-GCM ciphertext in flash (README, "Flash layout
   and encryption"); the key is rebuilt from the SRAM power-up pattern and never stored. A copy of the flash (dump,
-  backup, chip read in a programmer) therefore does not allow offline PIN guessing. Anyone who can **run code** on the
+  backup, chip read in a programmer) therefore does not allow offline PIN guessing, **unless the attacker also knows the slot-0 public key of a chip that has a
+  record in the PUF-secret backup (next bullets)**. Anyone who can **run code** on the
   Pico (BOOTSEL / SWD) can read the same RAM and derive the key: this is protection against flash theft, not against
   a device that is attacked live.
+* **The PUF-secret backup weakens the flash encryption to "nobody knows a slot-0 public key".** The secret that every
+  flash key is derived from is also stored in the backup sector, sealed with SHA-256 of a chip's slot-0 PUBLIC key. That
+  key is not secret: it is in the attestation certificate that every relying party receives at registration (always for
+  U2F), and the secret is the same for every chip. Anyone with a copy of the flash and the public key of ANY chip that
+  has a record can therefore open the backup, then derive every flash key and read the store, the directory and the
+  counter. Without the backup the same attacker has to read the SRAM of the device. The backup was added on purpose, for
+  availability: with it a noisy SRAM sample, a damaged or erased helper sector or a failing PUF no longer locks the key
+  out. It is exactly as strong as the secrecy of the slot-0 public key (the same weakness as using the public key as a
+  password), and only while no one holds a copy of the flash AND a certificate. A secret held in the chip (and not only a
+  public key) would remove this; it needs a chip configuration change.
+* **Records in the backup sector are never removed.** A chip gets one record (another only if the secret changed after a
+  re-enrolment); 55 fit, then new chips get no backup (the OLED says FULL). The record shows how many chips were used
+  (an 8-byte id derived from the public key), not their serial numbers.
 * **The device in hand beats the flash encryption.** BOOTSEL plus `picotool` can very likely read RAM (including the
   PUF region) without any code of ours, and the chip does not check who talks to it (see below), so a stolen device
   can be made to sign without the PIN by anyone who can reflash it. What it does stop: cloning the keys (they never

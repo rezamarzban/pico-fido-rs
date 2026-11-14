@@ -10,7 +10,8 @@
 //! * While a command is being processed (signature, flash compaction) the display keeps the last
 //!   frame; the BUSY state shows up in the next one.
 //!
-//! Three pages of 8 lines (21 characters per line, upper case only), switched every `PAGE_MS`.
+//! Four pages of 8 lines (21 characters per line, upper case only), switched every `PAGE_MS`. If the flash
+//! key is not available (the firmware halts with the fault blink) the SRAM PUF page stays on screen.
 //!
 //! Page 1, the device:
 //! ```text
@@ -43,6 +44,18 @@
 //! TOTAL 640B/8192B            both pages together
 //! FREE 7552B
 //! ```
+//! Page 4, the SRAM PUF and its backup:
+//! ```text
+//! SRAM PUF: READY             READY (key from the RAM sample), BACKUP RAM / BACKUP HEALED (the
+//!                             sample did not decode, the secret came from the backup), FAIL ...
+//! ERR 312/16128 1.9%          bit errors of this boot's sample (about 10% is the limit)
+//! RAW 49.8 PAIR 50.2%         share of ones in the raw cells and in the XOR-ed pairs
+//! POR YES RAM@2003F000        power-on reset this boot (a helper sector can only be written then)
+//! CHIP BACKUP: OK             OK (has a record) / NEW (written now) / NONE (no key in slot 0)
+//!                             / FULL / ERROR
+//! BACKUPS 2/55 CHIPS          chips with a record in the backup sector, and its capacity
+//! KEY FROM PUF                PUF / BACKUP (RAM) / BACKUP+HELPER (helper sector rewritten)
+//! ```
 use core::cell::UnsafeCell;
 use core::fmt::Write as _;
 
@@ -68,7 +81,7 @@ const FRAME_MS: u32 = 500;
 /// The flash pages are re-read (checksums included) at most this often while page 3 is shown.
 const FLASH_STATS_MS: u32 = 2_000;
 const FLASH_PAGE: usize = 4096;
-/// Each of the three pages stays this long.
+/// Each of the four pages stays this long.
 const PAGE_MS: u32 = 5_000;
 const RETRY_MS: u32 = 5_000;
 /// The first retry after a failed start-up probe comes this early (modules need up to ~100 ms
@@ -243,12 +256,100 @@ impl Oled {
     }
 
     fn render(&mut self) {
-        // Three pages, switched every PAGE_MS (the display only has 8 lines).
-        match (now_ms() / PAGE_MS) % 3 {
+        // Four pages, switched every PAGE_MS (the display only has 8 lines). While the flash key is
+        // not available the firmware halts and the reason stays on the SRAM PUF page.
+        let page = if st::PUF_STATE.load(Ordering::Relaxed) >= st::PUF_FAIL_NOISY {
+            3
+        } else {
+            (now_ms() / PAGE_MS) % 4
+        };
+        match page {
             0 => self.render_device(),
             1 => self.render_chip(),
-            _ => self.render_flash(),
+            2 => self.render_flash(),
+            _ => self.render_puf(),
         }
+    }
+
+    /// Page 4: the SRAM PUF (quality of this boot's sample, where the key came from) and the backup of
+    /// its secret.
+    fn render_puf(&mut self) {
+        let state = st::PUF_STATE.load(Ordering::Relaxed);
+        let title = match state {
+            st::PUF_OK => "SRAM PUF: READY",
+            st::PUF_BACKUP_RAM => "SRAM PUF: BACKUP RAM",
+            st::PUF_HEALED => "SRAM PUF: HEALED",
+            st::PUF_FAIL_NOISY => "PUF FAIL: NOISY",
+            st::PUF_FAIL_DAMAGED => "PUF FAIL: DAMAGED",
+            st::PUF_FAIL_ENROL => "PUF FAIL: ENROL",
+            st::PUF_FAIL_LOST => "PUF FAIL: HELPER LOST",
+            st::PUF_FAIL_RESTORE => "PUF FAIL: RESTORE",
+            _ => "SRAM PUF: STARTING",
+        };
+        let errors = st::PUF_ERRORS.load(Ordering::Relaxed) as usize;
+        let (raw, pair) = (
+            st::PUF_RAW_PM.load(Ordering::Relaxed),
+            st::PUF_PAIR_PM.load(Ordering::Relaxed),
+        );
+        let bits = crate::puf_code::CODE_BITS;
+        let por = st::PUF_POR.load(Ordering::Relaxed);
+        let (bk, chips) = (
+            st::BACKUP_STATE.load(Ordering::Relaxed),
+            st::BACKUP_CHIPS.load(Ordering::Relaxed),
+        );
+        let bk_text = match bk {
+            st::BK_HAVE => "OK",
+            st::BK_NEW => "NEW",
+            st::BK_FULL => "FULL",
+            st::BK_ERR => "ERROR",
+            _ => "NONE",
+        };
+        let b = &mut self.buf;
+        put_line(b, 0, title);
+        // Per mille of the pair bits, one decimal place.
+        let e = errors * 1000 / bits;
+        put_fmt(
+            b,
+            1,
+            format_args!("ERR {}/{} {}.{}%", errors, bits, e / 10, e % 10),
+        );
+        put_fmt(
+            b,
+            2,
+            format_args!(
+                "RAW {}.{} PAIR {}.{}%",
+                raw / 10,
+                raw % 10,
+                pair / 10,
+                pair % 10
+            ),
+        );
+        put_fmt(
+            b,
+            3,
+            format_args!(
+                "POR {} RAM@{:X}",
+                if por { "YES" } else { "NO" },
+                crate::puf::REGION_ADDR
+            ),
+        );
+        put_fmt(b, 4, format_args!("CHIP BACKUP: {}", bk_text));
+        put_fmt(
+            b,
+            5,
+            format_args!("BACKUPS {}/{} CHIPS", chips, crate::puf_backup::MAX_RECS),
+        );
+        put_line(
+            b,
+            6,
+            match state {
+                st::PUF_BACKUP_RAM => "KEY FROM BACKUP (RAM)",
+                st::PUF_HEALED => "KEY: BACKUP+HELPER",
+                st::PUF_OK => "KEY FROM PUF",
+                _ => "NO KEY: HALTED",
+            },
+        );
+        put_line(b, 7, "");
     }
 
     /// Page 3: how many chips the flash knows and how much data it keeps about them.

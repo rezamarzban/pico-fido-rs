@@ -28,6 +28,7 @@ mod layout;
 #[cfg(feature = "oled")]
 mod oled;
 mod puf;
+mod puf_backup;
 mod puf_code;
 mod se;
 mod seal;
@@ -59,8 +60,9 @@ pub const FLASH_SIZE: usize = FLASH_MB * 1024 * 1024;
 /// same area out of the linker's FLASH region: change them together.
 pub const STORE_PAGES: usize = 18;
 // Below the store: site directory sectors A and B (8 KiB each, src/env/dir_flash.rs), the signature
-// counter (12 KiB, src/env/tally_flash.rs) and the SRAM-PUF helper sector (4 KiB, src/puf.rs): 104 KiB
-// in all, see src/layout.rs. Everything but the helper sector is sealed with AES-256-GCM.
+// counter (12 KiB, src/env/tally_flash.rs), the SRAM-PUF helper sector (4 KiB, src/puf.rs) and the
+// backup of the PUF secret (4 KiB, src/puf_backup.rs): 108 KiB in all, see src/layout.rs. Everything
+// but the helper sector is sealed with AES-256-GCM.
 
 // Heap for OpenSK (alloc): credentials, CBOR, the P-256 software crypto, message buffers.
 const HEAP_SIZE: usize = 128 * 1024;
@@ -105,7 +107,8 @@ async fn usb_executor_init(parts: AssertSend<UsbParts>) {
 }
 
 /// Blinks 3 short flashes and a pause forever: the flash key is not available (see SECURITY.md).
-/// USB is not running: nothing is served, nothing is read from or written to flash.
+/// USB is not running: nothing is served, nothing is read from or written to flash. The display
+/// (if there is one) shows the reason on its SRAM PUF page.
 fn halt_with_fault(led: &mut Output<'static>) -> ! {
     loop {
         for _ in 0..3 {
@@ -113,48 +116,165 @@ fn halt_with_fault(led: &mut Output<'static>) -> ! {
             embassy_time::block_for(Duration::from_millis(120));
             led.set_low();
             embassy_time::block_for(Duration::from_millis(180));
+            #[cfg(feature = "oled")]
+            oled::poll();
         }
         embassy_time::block_for(Duration::from_millis(1200));
+        #[cfg(feature = "oled")]
+        oled::poll();
     }
+}
+
+/// Publishes why the key is not available for the display, then halts.
+fn fail(led: &mut Output<'static>, reason: u8) -> ! {
+    status::PUF_STATE.store(reason, portable_atomic::Ordering::Relaxed);
+    halt_with_fault(led)
 }
 
 /// Starts the SRAM PUF and installs it as the source of the flash encryption keys.
 ///
 /// * helper sector valid and this boot's RAM sample decodes: go on.
-/// * helper sector erased (new device, or the first start of this firmware over an older one): wipe
-///   every area that is protected by the key (an older firmware left PLAINTEXT there), THEN write the
-///   helper sector. The helper sector is the commit: a power cut before it repeats the wipe, so the
-///   flash never holds plaintext secrets next to an enrolled key. Needs a power-on reset (unplug and
-///   replug after flashing the firmware).
-/// * anything else (damaged helper, sample does not decode, no power-on reset when one is needed):
-///   halt with the fault blink; nothing is read or written. A re-plug fixes a noisy sample.
+/// * helper sector erased and no backup anywhere (new device, or the first start of this firmware
+///   over an older one): wipe every area that is protected by the key (an older firmware left
+///   PLAINTEXT there), THEN write the helper sector. The helper sector is the commit: a power cut
+///   before it repeats the wipe, so the flash never holds plaintext secrets next to an enrolled
+///   key. Needs a power-on reset (unplug and replug after flashing the firmware).
+/// * the PUF cannot give its secret (sample does not decode, helper damaged, or helper lost) but
+///   the connected chip has a record in the backup sector (`puf_backup.rs`, sealed with the public
+///   key of its slot 0): the secret comes from there, and a new helper sector is written from this
+///   boot's power-up pattern if that is possible (power-on reset, plausible sample), otherwise the
+///   secret stays in RAM for this power cycle. Nothing is wiped.
+/// * helper erased but the backup sector has records of OTHER chips only, or the backup cannot be
+///   read: halt (wiping would destroy data that another chip could still unlock). Connect a chip
+///   that has a record, or erase the whole flash.
+/// * anything else: halt with the fault blink; nothing is read or written.
+///
+/// Whenever the key is available and a chip with a key in slot 0 is connected, its record of the
+/// secret is written once.
 fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) {
+    use portable_atomic::Ordering::Relaxed;
+    use puf_backup::Plan;
+
     let mut puf = puf::Puf::open(flash);
-    if puf.status() == puf::Status::Blank {
-        if !puf.can_enroll() {
-            error!("puf: cannot enrol now - unplug the key for 10 s and plug it in again");
-            halt_with_fault(led);
-        }
-        let secret = match se::ecdsa::chip_random() {
-            Ok(r) => zeroize::Zeroizing::new(r),
-            Err(_) => {
-                defmt::panic!("puf: the secure element gave no random bytes for the enrolment")
+    // The password of the backup is the public key of slot 0 of the connected chip.
+    let pubkey = se::ecdsa::attestation_pubkey();
+    let sector = env::backup_flash::read(flash);
+    let stats = puf.stats();
+    status::PUF_POR.store(puf.por(), Relaxed);
+    status::PUF_ERRORS.store(stats.errors, Relaxed);
+    status::PUF_RAW_PM.store(stats.raw_pm, Relaxed);
+    status::PUF_PAIR_PM.store(stats.pair_pm, Relaxed);
+    let backed_up = match (&pubkey, &sector) {
+        (Some(pk), Some(s)) => puf_backup::find(s, pk),
+        _ => None,
+    };
+    let chips_backed_up = sector.as_deref().map_or(0, |s| puf_backup::usage(s).0);
+
+    let helper = match puf.status() {
+        puf::Status::Ready => puf_backup::Helper::Ready,
+        puf::Status::Blank => puf_backup::Helper::Blank,
+        puf::Status::Noisy => puf_backup::Helper::Noisy,
+        puf::Status::Damaged => puf_backup::Helper::Damaged,
+    };
+    match puf_backup::boot_decision(
+        helper,
+        backed_up.is_some(),
+        chips_backed_up,
+        sector.is_some(),
+    ) {
+        puf_backup::Boot::Go => {}
+        puf_backup::Boot::Restore => {
+            warn!("puf: the PUF cannot give its secret, restoring it from the backup of this chip");
+            let restored = match backed_up {
+                Some(secret) => puf.restore(flash, secret),
+                None => false,
+            };
+            if !restored {
+                fail(led, status::PUF_FAIL_RESTORE);
             }
-        };
-        warn!("first start with flash encryption: erasing the store, directory and counter");
-        let wiped = flash
-            .borrow_mut()
-            .blocking_erase((layout::PUF_START + layout::PAGE) as u32, FLASH_SIZE as u32)
-            .is_ok();
-        if !wiped || !puf.enroll(flash, &secret) {
-            error!("puf: enrolment failed");
-            halt_with_fault(led);
+        }
+        puf_backup::Boot::Halt(why) => {
+            error!("puf: no usable key and no backup for this chip - halting");
+            fail(
+                led,
+                match why {
+                    puf_backup::Halt::Noisy => status::PUF_FAIL_NOISY,
+                    puf_backup::Halt::Damaged => status::PUF_FAIL_DAMAGED,
+                    puf_backup::Halt::Lost => status::PUF_FAIL_LOST,
+                },
+            );
+        }
+        puf_backup::Boot::FirstStart => {
+            if !puf.can_enroll() {
+                error!("puf: cannot enrol now - unplug the key for 10 s and plug it in again");
+                fail(led, status::PUF_FAIL_ENROL);
+            }
+            let secret = match se::ecdsa::chip_random() {
+                Ok(r) => zeroize::Zeroizing::new(r),
+                Err(_) => {
+                    error!("puf: the secure element gave no random bytes for the enrolment");
+                    fail(led, status::PUF_FAIL_ENROL)
+                }
+            };
+            warn!("first start with flash encryption: erasing the store, directory and counter");
+            let wiped = flash
+                .borrow_mut()
+                .blocking_erase((layout::PUF_START + layout::PAGE) as u32, FLASH_SIZE as u32)
+                .is_ok();
+            if !wiped || !puf.enroll(flash, &secret) {
+                error!("puf: enrolment failed");
+                fail(led, status::PUF_FAIL_ENROL);
+            }
         }
     }
     if puf.status() != puf::Status::Ready {
         error!("puf: no usable key (status {}) - halting", puf.status());
-        halt_with_fault(led);
+        fail(led, status::PUF_FAIL_RESTORE);
     }
+
+    // Back up the secret for the connected chip (once; again only if the secret changed).
+    let mut chips = chips_backed_up;
+    let backup_state = match (&pubkey, puf.secret(), &sector) {
+        (Some(pk), Some(secret), Some(s)) => match puf_backup::plan(s, pk, &secret) {
+            Plan::Nothing => status::BK_HAVE,
+            Plan::Full => {
+                warn!("puf: the backup sector is full, this chip gets no backup");
+                status::BK_FULL
+            }
+            plan => {
+                if env::backup_flash::apply(flash, &plan) {
+                    info!("puf: secret backed up for this chip");
+                    chips =
+                        env::backup_flash::read(flash).map_or(chips, |s| puf_backup::usage(&s).0);
+                    status::BK_NEW
+                } else {
+                    warn!("puf: could not write the backup");
+                    status::BK_ERR
+                }
+            }
+        },
+        (_, _, None) => status::BK_ERR,
+        _ => {
+            info!("puf: no key in slot 0 of a connected chip: no backup possible");
+            status::BK_UNKNOWN
+        }
+    };
+    status::BACKUP_STATE.store(backup_state, Relaxed);
+    status::BACKUP_CHIPS.store(chips as u32, Relaxed);
+    status::PUF_STATE.store(
+        match puf.restored() {
+            puf::Restored::No => status::PUF_OK,
+            puf::Restored::Ram => status::PUF_BACKUP_RAM,
+            puf::Restored::Healed => status::PUF_HEALED,
+        },
+        Relaxed,
+    );
+    // The statistics of the sample after a healing are those of the new helper sector.
+    let stats = puf.stats();
+    status::PUF_ERRORS.store(stats.errors, Relaxed);
+    status::PUF_RAW_PM.store(stats.raw_pm, Relaxed);
+    status::PUF_PAIR_PM.store(stats.pair_pm, Relaxed);
+
     static PUF: StaticCell<puf::Puf> = StaticCell::new();
     puf::install(PUF.init(puf));
 }
