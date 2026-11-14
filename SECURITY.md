@@ -7,11 +7,11 @@ Experimental firmware; read this before relying on it.
   A copy of the Pico's flash contains no private key, only credential handles (slot number +
   fingerprint) inside OpenSK's encrypted credential IDs.
 * **No signature limit**: signatures are not counted (the former Counter 0 budget was removed).
-  The chip signs as often as it is asked. If the chip refuses to sign, OpenSK gets an error and the host a failed command (since OpenSK
-  #835 signing can fail) instead of a dummy signature that would only fail later at the relying party. Consequence: anyone who can run code on the Pico or talk
+  The chip signs as often as it is asked. If the chip refuses to sign, the host gets a CTAP error instead of a
+  dummy signature that would only fail later at the relying party. Consequence: anyone who can run code on the Pico or talk
   to the chip's I2C bus (see below) is no longer stopped by a budget; user presence (BOOTSEL) is
   the only gate for normal use.
-* **Randomness** comes only from the chip's TRNG (an HMAC-DRBG seeded from it and re-seeded every
+* **Randomness** comes only from the chip's TRNG (a ChaCha20 DRBG seeded from it and re-seeded every
   1 KiB of output). If the chip stops answering the firmware halts; there is no weaker fallback.
 
 ## What is not protected
@@ -21,20 +21,29 @@ Experimental firmware; read this before relying on it.
   backup, chip read in a programmer) therefore does not allow offline PIN guessing. Anyone who can **run code** on the
   Pico (BOOTSEL / SWD) can read the same RAM and derive the key: this is protection against flash theft, not against
   a device that is attacked live.
-* **PUF caveats.** 256 bits is an upper bound; the real strength is the min-entropy of this chip's SRAM pattern (the
-  public helper data leaks some of it). The error rate is logged at every boot; above ~10 % the key may fail to rebuild
-  (then the LED blinks 3x and the key stays locked until a re-plug). Temperature/voltage extremes and ageing change
+* **The device in hand beats the flash encryption.** BOOTSEL plus `picotool` can very likely read RAM (including the
+  PUF region) without any code of ours, and the chip does not check who talks to it (see below), so a stolen device
+  can be made to sign without the PIN by anyone who can reflash it. What it does stop: cloning the keys (they never
+  leave the chip) and reading a copy of the flash alone.
+* **PUF caveats.** 256 bits is an upper bound. The helper data of a repetition code gives away the majority of every
+  column, so a biased SRAM weakens the secret: under a model of independent cells with a known bias of the pair stream
+  (`host-test/puf_sim.py`) it keeps ~256 bits at 50 % ones, 244 at 52 %, 212 at 54 %, 167 at 56 %, 77 at 60 %. Pairs of
+  cells are XORed first (70 % ones raw is 42 % after the XOR) and enrolment is refused outside 46..54 % pair ones, but
+  the model ignores cells whose bias is the same on every chip of this model (an attacker with several boards could
+  use that): **measure real boards** (`puf: ... ones: raw .. pairs ..` is logged at every boot). The error rate is
+  logged too; above ~10 % raw the key may fail to rebuild (then the LED blinks 3x and the key stays locked until a
+  re-plug). Temperature/voltage extremes and ageing change
   the pattern. If the helper sector is lost or the SRAM of the chip changes for good, **all sealed data is
   unrecoverable** (the chip's keys stay, credentials do not): there is no backup of the key by design.
 * **Not hidden:** store key ids, value lengths and write timing; there is **no rollback protection** (an old copy of the
-  flash can be restored with its old, valid ciphertext). Large-blob shards are split over two store entries (one transaction); other values over 994 bytes are refused.
-* A stack overflow of less than 1 KiB runs into the reserved PUF RAM (flip-link's guard is the end of RAM): the key can
-  then no longer be rebuilt and the firmware halts, by design.
+  flash can be restored with its old, valid ciphertext, e.g. the PIN retry counter).
+* The PUF RAM is at the top of the striped SRAM, so flip-link's stack guard (the bottom of RAM) still works: a stack
+  overflow runs into unmapped memory and faults. The two 4 KiB scratch banks above it are unused.
 * **The chip does not authenticate the Pico.** Code running on the Pico, or a probe on the I2C
   bus, can make the chip sign (without limit). User presence is the BOOTSEL button,
   checked by the Pico.
 * **Only 9 sites.** A key that belongs to a site is never overwritten or regenerated; a registration at a
-  10th site is refused (OpenSK answers the host with a CTAP error). Accounts at a site that already has a key reuse it. The firmware
+  10th site is refused (a CTAP error). Accounts at a site that already has a key reuse it. The firmware
   tells a free slot from a used one by asking the chip for the public key (status 0x0F = no private key there); a bus
   error is never taken for "free". A slot that holds a key but belongs to no site is handed to the next new site as it
   is (no GenKey).

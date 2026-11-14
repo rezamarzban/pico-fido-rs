@@ -19,10 +19,10 @@
 //! `host-test/seal_ref.py` is a Python reference of exactly this construction; the host tests check
 //! known-answer vectors from it.
 
-use aes_gcm::aead::{AeadInPlace, KeyInit as _}; // aes-gcm 0.10 (crypto-common 0.1); hmac 0.13 has its own `KeyInit`
+use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
 use alloc::vec::Vec;
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -53,7 +53,7 @@ impl Domain {
 }
 
 fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC takes any key length");
+    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC takes any key length");
     for p in parts {
         m.update(p);
     }
@@ -77,7 +77,10 @@ impl Sealer {
     }
 
     fn nonce(&self, aad: &[u8], plain: &[u8]) -> [u8; NONCE_LEN] {
-        let h = hmac(&self.siv[..], &[&(aad.len() as u32).to_le_bytes(), aad, plain]);
+        let h = hmac(
+            &self.siv[..],
+            &[&(aad.len() as u32).to_le_bytes(), aad, plain],
+        );
         let mut n = [0u8; NONCE_LEN];
         n.copy_from_slice(&h[..NONCE_LEN]);
         n

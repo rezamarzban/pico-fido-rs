@@ -27,7 +27,7 @@ pub fn program(flash: &mut Fl, addr: usize, data: &[u8]) -> Result<(), ()> {
 
 /// Erases `len` bytes (a multiple of the 4 KiB sector) at flash offset `start`.
 pub fn erase(flash: &mut Fl, start: usize, len: usize) -> Result<(), ()> {
-    debug_assert!(start % PAGE == 0 && len % PAGE == 0);
+    debug_assert!(start.is_multiple_of(PAGE) && len.is_multiple_of(PAGE));
     flash
         .blocking_erase(start as u32, (start + len) as u32)
         .map_err(|_| ())

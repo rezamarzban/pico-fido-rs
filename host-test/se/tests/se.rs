@@ -5,10 +5,14 @@
 
 extern crate alloc;
 
+#[path = "../../../src/puf_code.rs"]
+mod puf_code;
 #[path = "../../../src/seal.rs"]
 mod seal;
 #[path = "../../../src/sealed_log.rs"]
 mod sealed_log;
+#[path = "../../../src/spill.rs"]
+mod spill;
 
 mod se {
     #[path = "../../../../src/se/proto.rs"]
@@ -27,13 +31,12 @@ mod se {
 
 use opensk::api::crypto::ec_signing::{EcPublicKey, EcSecretKey, EcSignature};
 use opensk::api::crypto::Crypto;
-use opensk::api::rng::rand_core as rc10; // rand_core 0.10, the one OpenSK uses
 use opensk::api::rng::Rng;
 use p256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use rand_chacha::ChaCha8Rng;
-use rand_core::{RngCore, SeedableRng};
+use rand_core::{CryptoRng, RngCore, SeedableRng};
 use se::chip::{Atecc, Bus, ChipOps};
 use se::ecdsa::{self, ChipSerial, DirStore, SeEcdsa, SigTally, SeSecretKey, ATTEST_SLOT, COUNTER_MAX, DIR_ENTRY, DIR_LEN, FIRST_CRED_SLOT, HANDLE_ATTEST, SLOTS};
 use se::dirlog::{self, DirPlan, Plan, Step};
@@ -500,13 +503,13 @@ fn wake_is_retried_then_fails() {
 static SERIAL: Mutex<()> = Mutex::new(());
 
 struct TestRng(ChaCha8Rng);
-impl rc10::TryRng for TestRng {
+impl rand_core10::TryRng for TestRng {
     type Error = core::convert::Infallible;
     fn try_next_u32(&mut self) -> Result<u32, Self::Error> { Ok(self.0.next_u32()) }
     fn try_next_u64(&mut self) -> Result<u64, Self::Error> { Ok(self.0.next_u64()) }
     fn try_fill_bytes(&mut self, d: &mut [u8]) -> Result<(), Self::Error> { self.0.fill_bytes(d); Ok(()) }
 }
-impl rc10::TryCryptoRng for TestRng {}
+impl rand_core10::TryCryptoRng for TestRng {}
 impl Rng for TestRng {}
 
 fn install(limited: bool, c0: u32) -> (std::sync::MutexGuard<'static, ()>, Arc<Mutex<Model>>) {
@@ -567,7 +570,7 @@ fn key_lifecycle_through_opensk_traits() {
     assert!(SeSecretKey::import(&bad).is_none());
 }
 
-/// A registration that cannot be served is an error to OpenSK now (it used to be a panic).
+/// A registration that is refused: `random` answers with an error (a CTAP error for the host).
 fn registration_panics(rng: &mut TestRng) -> bool {
     SeSecretKey::random(rng).is_err()
 }
@@ -581,7 +584,7 @@ fn keys_are_never_overwritten_when_all_slots_are_used() {
     let first = FIRST_CRED_SLOT;
     assert_eq!(slots, (first..first + SLOTS).collect::<Vec<_>>(), "free slots are taken in order 1..=9");
     assert_eq!(ecdsa::used_slots(), None, "no scan was run yet");
-    // The 10th registration is refused (an error to OpenSK) ...
+    // The 10th registration is refused (panic: the trait cannot return an error) ...
     assert!(registration_panics(&mut rng));
     assert!(registration_panics(&mut rng), "and again: still refused");
     // ... and nothing was regenerated: GenKey ran exactly once per slot, every old key still works.
@@ -794,13 +797,13 @@ impl HintRng {
         HintRng { inner: TestRng(ChaCha8Rng::seed_from_u64(seed)), hint: None }
     }
 }
-impl rc10::TryRng for HintRng {
+impl rand_core10::TryRng for HintRng {
     type Error = core::convert::Infallible;
-    fn try_next_u32(&mut self) -> Result<u32, Self::Error> { Ok(self.inner.0.next_u32()) }
-    fn try_next_u64(&mut self) -> Result<u64, Self::Error> { Ok(self.inner.0.next_u64()) }
-    fn try_fill_bytes(&mut self, d: &mut [u8]) -> Result<(), Self::Error> { self.inner.0.fill_bytes(d); Ok(()) }
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> { rand_core10::TryRng::try_next_u32(&mut self.inner) }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> { rand_core10::TryRng::try_next_u64(&mut self.inner) }
+    fn try_fill_bytes(&mut self, d: &mut [u8]) -> Result<(), Self::Error> { rand_core10::TryRng::try_fill_bytes(&mut self.inner, d) }
 }
-impl rc10::TryCryptoRng for HintRng {}
+impl rand_core10::TryCryptoRng for HintRng {}
 impl Rng for HintRng {
     fn set_rp_id_hash(&mut self, h: &[u8; 32]) {
         self.hint = Some(*h);
@@ -816,6 +819,7 @@ fn register(rng: &mut HintRng, rp: u8) -> SeSecretKey {
     SeSecretKey::random(rng).unwrap()
 }
 
+/// A registration that is refused: an error, no key handed out (the name is from when it panicked).
 fn register_panics(rng: &mut HintRng, rp: u8) -> bool {
     rng.set_rp_id_hash(&[rp; 32]);
     SeSecretKey::random(rng).is_err()
@@ -1359,12 +1363,12 @@ fn a_power_cut_while_the_directory_is_compacted_never_frees_a_used_key() {
 }
 
 #[test]
-fn a_chip_that_cannot_sign_is_a_hard_error_not_a_zero_signature() {
+fn a_chip_that_cannot_sign_is_an_error_not_a_zero_signature() {
     let (_g, m) = install(false, 0);
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(62));
     let k = SeSecretKey::random(&mut rng).unwrap();
     m.lock().unwrap().fail_next_wake = 1000;
-    assert!(k.sign(b"nobody gets a bogus signature").is_err());
+    assert!(k.sign(b"nobody gets a bogus signature").is_err(), "an error, not a dummy signature");
     m.lock().unwrap().fail_next_wake = 0;
     check_sig(&k, b"the chip is back");
 }
@@ -1792,22 +1796,299 @@ fn sealed_layouts_fit_the_plaintext_formats() {
 }
 
 
-/// src/env/rng.rs: HMAC_DRBG (SHA-256) seeded with bytes 0..32 gives this stream (host-test/seal_ref.py).
-#[test]
-fn drbg_matches_the_python_reference() {
-    use hmac::{Hmac, KeyInit, Mac};
-    fn h(k: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
-        let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(k).unwrap();
-        for p in parts { m.update(p); }
-        m.finalize().into_bytes().into()
+// ---------------------------------------------------------------- SRAM PUF arithmetic (puf_code.rs)
+
+mod puf_tests {
+    use super::puf_code::*;
+    use rand_chacha::ChaCha8Rng;
+    use rand_core::{RngCore, SeedableRng};
+
+    /// A region whose cells are ones with probability `p`.
+    fn region(rng: &mut ChaCha8Rng, p: f64) -> Vec<u32> {
+        (0..REGION_WORDS)
+            .map(|_| {
+                let mut w = 0u32;
+                for b in 0..32 {
+                    if (rng.next_u32() as f64 / 4294967296.0) < p {
+                        w |= 1 << b;
+                    }
+                }
+                w
+            })
+            .collect()
     }
-    // The same steps as env/rng.rs (that file needs defmt and the chip, so the logic is mirrored).
-    let seed: [u8; 32] = core::array::from_fn(|i| i as u8);
-    let (mut k, mut v) = ([0u8; 32], [1u8; 32]);
-    k = h(&k, &[&v, &[0x00], &seed]); v = h(&k, &[&v]);
-    k = h(&k, &[&v, &[0x01], &seed]); v = h(&k, &[&v]);
-    let mut out = Vec::new();
-    while out.len() < 40 { v = h(&k, &[&v]); out.extend_from_slice(&v); }
-    out.truncate(40);
-    assert_eq!(out, unhex("3226437dd9f98b17591aad731383303213439f64d029a5764e84e36256ddeb79e2d0f9bbbac0520e"));
+
+    fn stream(r: &[u32]) -> ([u32; CODE_WORDS], u32) {
+        let mut ones = 0;
+        let s = pair_stream(|i| r[i], &mut ones);
+        (s, ones)
+    }
+
+    fn secret(rng: &mut ChaCha8Rng) -> [u32; SEC_WORDS] {
+        let mut s = [0u32; SEC_WORDS];
+        for w in s.iter_mut() {
+            *w = rng.next_u32();
+        }
+        s
+    }
+
+    /// Flips every cell with probability `ber`.
+    fn noisy(rng: &mut ChaCha8Rng, r: &[u32], ber: f64) -> Vec<u32> {
+        r.iter()
+            .map(|&w| {
+                let mut w = w;
+                for b in 0..32 {
+                    if (rng.next_u32() as f64 / 4294967296.0) < ber {
+                        w ^= 1 << b;
+                    }
+                }
+                w
+            })
+            .collect()
+    }
+
+    /// The obvious bit-by-bit majority vote the bit-sliced one must equal.
+    fn naive_decode(x: &[u32; CODE_WORDS]) -> [u32; SEC_WORDS] {
+        let mut s = [0u32; SEC_WORDS];
+        for i in 0..SEC_BITS {
+            let ones = (0..REP).filter(|&k| (x[k * SEC_WORDS + i / 32] >> (i % 32)) & 1 == 1).count();
+            if ones > REP / 2 {
+                s[i / 32] |= 1 << (i % 32);
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn the_codeword_repeats_the_secret_and_decodes_without_noise() {
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let s = secret(&mut rng);
+        let c = encode(&s);
+        for k in 0..REP {
+            assert_eq!(&c[k * SEC_WORDS..(k + 1) * SEC_WORDS], &s[..]);
+        }
+        assert_eq!(decode(&c), s);
+        assert_eq!(bit_errors(&c, &s), 0);
+        assert_eq!(words_of(&bytes_of(&s)), s);
+    }
+
+    #[test]
+    fn the_bit_sliced_majority_equals_the_naive_one() {
+        let mut rng = ChaCha8Rng::seed_from_u64(2);
+        for t in 0..300 {
+            let mut x = [0u32; CODE_WORDS];
+            for w in x.iter_mut() {
+                // Mostly random, sometimes columns that are very close to the 31/32 border.
+                *w = rng.next_u32();
+            }
+            if t % 3 == 0 {
+                // Force exactly 31, 32 and 33 ones in some columns.
+                for col in 0..SEC_BITS {
+                    let ones = 30 + (col % 5);
+                    for k in 0..REP {
+                        let (wi, b) = (k * SEC_WORDS + col / 32, col % 32);
+                        if k < ones {
+                            x[wi] |= 1 << b;
+                        } else {
+                            x[wi] &= !(1 << b);
+                        }
+                    }
+                }
+            }
+            assert_eq!(decode(&x), naive_decode(&x), "trial {t}");
+        }
+    }
+
+    #[test]
+    fn helper_data_decodes_the_same_secret_from_a_noisy_sample() {
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        let r0 = region(&mut rng, 0.5);
+        let (r, _) = stream(&r0);
+        let s = secret(&mut rng);
+        let c = encode(&s);
+        let w: Vec<u32> = r.iter().zip(&c).map(|(a, b)| a ^ b).collect();
+        // 10 % of the raw cells flip at every boot: still decodes (failure ~1e-6 per boot).
+        for t in 0..400 {
+            let r1 = noisy(&mut rng, &r0, 0.10);
+            let (r1s, _) = stream(&r1);
+            let mut x = [0u32; CODE_WORDS];
+            for i in 0..CODE_WORDS {
+                x[i] = r1s[i] ^ w[i];
+            }
+            assert_eq!(decode(&x), s, "boot {t}");
+            let e = bit_errors(&x, &s);
+            assert!(e > CODE_BITS as u32 / 10 && e < CODE_BITS as u32 / 4, "about 18 % pair errors, got {e}");
+        }
+        // A completely different chip (an unrelated sample) does not decode to the secret.
+        let other = region(&mut rng, 0.5);
+        let (os, _) = stream(&other);
+        let mut x = [0u32; CODE_WORDS];
+        for i in 0..CODE_WORDS {
+            x[i] = os[i] ^ w[i];
+        }
+        assert_ne!(decode(&x), s);
+    }
+
+    #[test]
+    fn pair_xor_removes_most_of_the_bias_and_the_check_rejects_the_rest() {
+        let mut rng = ChaCha8Rng::seed_from_u64(4);
+        let frac = |r: &[u32]| {
+            let (s, raw) = stream(r);
+            let ones: u32 = s.iter().map(|w| w.count_ones()).sum();
+            (ones as f64 / CODE_BITS as f64, raw, s)
+        };
+        // A balanced chip passes.
+        let r = region(&mut rng, 0.5);
+        let (f, raw, s) = frac(&r);
+        assert!((f - 0.5).abs() < 0.02);
+        assert!(plausible(raw, &s));
+        // 60 % ones raw: the pair stream is 2*0.6*0.4 = 48 %, only 2 points off: accepted (the XOR
+        // did its job) ...
+        let r = region(&mut rng, 0.60);
+        let (f, raw, s) = frac(&r);
+        assert!((f - 0.5).abs() > 0.005 && (f - 0.5).abs() < 0.04, "pair stream bias {f}");
+        assert!(plausible(raw, &s));
+        // ... 70 % ones raw is 42 %: the helper data would leak too much, refused.
+        let r = region(&mut rng, 0.70);
+        let (f, raw, s) = frac(&r);
+        assert!((f - 0.5).abs() > 0.06, "pair stream bias {f}");
+        assert!(!plausible(raw, &s));
+        // Stuck / cleared RAM.
+        for fill in [0u32, !0u32] {
+            let r = vec![fill; REGION_WORDS];
+            let (_, raw, s) = frac(&r);
+            assert!(!plausible(raw, &s));
+        }
+        // A repeating pattern (every cell equal to its pair partner): the stream is all zero.
+        let mut r = region(&mut rng, 0.5);
+        for i in 0..CODE_WORDS {
+            r[i + PAIR_OFFSET] = r[i];
+        }
+        let (_, raw, s) = frac(&r);
+        assert!(!plausible(raw, &s));
+    }
+
+    #[test]
+    fn the_pairs_use_disjoint_cells_inside_the_region() {
+        assert!(CODE_WORDS + PAIR_OFFSET <= REGION_WORDS);
+        let seen: Vec<std::cell::Cell<u8>> = (0..REGION_WORDS).map(|_| std::cell::Cell::new(0)).collect();
+        let mut ones = 0;
+        let _ = pair_stream(|i| { seen[i].set(seen[i].get() + 1); 0 }, &mut ones);
+        assert!(seen.iter().all(|n| n.get() <= 1), "every cell is read at most once");
+        assert_eq!(seen.iter().map(|n| n.get() as usize).sum::<usize>(), 2 * CODE_WORDS);
+    }
+}
+
+
+// ---------------------------------------------------------------- values longer than one store entry (spill.rs)
+
+mod spill_tests {
+    use super::spill::*;
+    use std::collections::BTreeMap;
+
+    /// The store as `env/persist.rs` uses it: entries are (format, data), written by transactions.
+    #[derive(Default)]
+    struct Kv(BTreeMap<usize, (u8, Vec<u8>)>);
+    impl Kv {
+        fn insert(&mut self, key: usize, value: &[u8]) -> bool {
+            let present = key < SPILL && self.0.contains_key(&(key + SPILL));
+            let Some(ops) = plan(key, value, present) else { return false };
+            for op in ops {
+                match op {
+                    Op::Put { key, format, data } => {
+                        assert!(1 + data.len() + crate::seal::OVERHEAD <= STORE_MAX_VALUE, "an entry fits the store");
+                        assert!(key <= 4095, "the store's highest key");
+                        self.0.insert(key, (format, data.to_vec()));
+                    }
+                    Op::Remove { key } => {
+                        self.0.remove(&key);
+                    }
+                }
+            }
+            true
+        }
+        fn find(&self, key: usize) -> Option<Vec<u8>> {
+            let (format, head) = self.0.get(&key)?;
+            if *format == FORMAT_WHOLE {
+                return Some(head.clone());
+            }
+            let (f2, tail) = self.0.get(&(key + SPILL)).expect("a head always has its continuation");
+            assert_eq!(*f2, FORMAT_WHOLE);
+            Some(join(head, tail))
+        }
+        fn remove(&mut self, key: usize) {
+            self.0.remove(&key);
+            self.0.remove(&(key + SPILL));
+        }
+        fn keys(&self) -> Vec<usize> {
+            self.0.keys().copied().filter(|&k| k < SPILL).collect()
+        }
+    }
+
+    fn value(n: usize, seed: u8) -> Vec<u8> {
+        (0..n).map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed)).collect()
+    }
+
+    #[test]
+    fn the_sizes_fit_the_store() {
+        assert_eq!(CHUNK, 994);
+        assert_eq!(MAX_LEN, 1988);
+        assert!(1023 <= MAX_LEN, "an OpenSK large-blob shard (1023 bytes) fits");
+        assert!(plan(5, &value(MAX_LEN, 0), false).is_some());
+        assert!(plan(5, &value(MAX_LEN + 1, 0), false).is_none(), "too long");
+        assert!(plan(SPILL, &[1], false).is_none(), "keys from SPILL on are not OpenSK's");
+        // The highest OpenSK key (2047) and the large-blob shard keys (2000..2004) stay inside the store.
+        for k in [1usize, 2000, 2003, 2047] {
+            assert!(k + SPILL <= 4095);
+        }
+    }
+
+    #[test]
+    fn short_values_use_one_entry_and_long_ones_two() {
+        let (v1, v2, v3) = (value(CHUNK, 1), value(CHUNK + 1, 1), value(10, 2));
+        let one = plan(7, &v1, false).unwrap();
+        assert_eq!(one.len(), 1);
+        let two = plan(7, &v2, false).unwrap();
+        assert_eq!(two.len(), 2);
+        assert!(matches!(two[0], Op::Put { key: 7, format: FORMAT_HEAD, .. }));
+        assert!(matches!(two[1], Op::Put { key, format: FORMAT_WHOLE, .. } if key == 7 + SPILL));
+        // A short value over a long one removes the continuation in the same transaction.
+        let back = plan(7, &v3, true).unwrap();
+        assert_eq!(back.len(), 2);
+        assert!(matches!(back[1], Op::Remove { key } if key == 7 + SPILL));
+        assert_eq!(plan(7, &v3, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn every_length_round_trips_and_continuations_stay_hidden() {
+        let mut kv = Kv::default();
+        for n in [0usize, 1, 100, CHUNK - 1, CHUNK, CHUNK + 1, 1023, 1500, MAX_LEN] {
+            let v = value(n, n as u8);
+            assert!(kv.insert(2001, &v));
+            assert_eq!(kv.find(2001).unwrap(), v, "length {n}");
+            assert_eq!(kv.keys(), vec![2001], "the continuation is not an OpenSK key");
+        }
+        // Long -> short removes the continuation; short -> long adds it again; remove drops both.
+        assert!(kv.insert(2001, &value(1500, 3)));
+        assert!(kv.0.contains_key(&(2001 + SPILL)));
+        assert!(kv.insert(2001, &value(20, 4)));
+        assert!(!kv.0.contains_key(&(2001 + SPILL)), "no stale continuation");
+        assert_eq!(kv.find(2001).unwrap(), value(20, 4));
+        assert!(kv.insert(2001, &value(1023, 5)));
+        kv.remove(2001);
+        assert!(kv.0.is_empty());
+        assert!(!kv.insert(3, &value(MAX_LEN + 1, 0)));
+    }
+
+    #[test]
+    fn the_four_large_blob_shards_fit() {
+        let mut kv = Kv::default();
+        for (i, key) in (2000..2004).enumerate() {
+            assert!(kv.insert(key, &value(1023, i as u8)));
+        }
+        for (i, key) in (2000..2004).enumerate() {
+            assert_eq!(kv.find(key).unwrap(), value(1023, i as u8));
+        }
+        assert_eq!(kv.keys(), vec![2000, 2001, 2002, 2003]);
+    }
 }

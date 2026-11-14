@@ -12,17 +12,15 @@
 //! entry of about this size"), and when entries are written. The private keys of the credentials are
 //! not in the store at all (they are in the secure element); a credential ID only holds a slot handle.
 //!
-//! The store takes values of at most 1023 bytes. OpenSK's large-blob shards (`keys::LARGE_BLOB_SHARDS`)
-//! are exactly that long, so once sealed they no longer fit: a sealed shard is split over two
-//! entries, the second one under `key + OVERFLOW_OFFSET` (format byte 2), written in ONE store
-//! transaction so a power cut leaves the old or the new shard. `iter()` hides the second entries
-//! and `remove` deletes both. Any other value longer than `MAX_PLAIN` (994 bytes) is refused with
-//! `CTAP2_ERR_KEY_STORE_FULL` (OpenSK has none).
+//! The store takes at most 1023 bytes per entry, which leaves 994 bytes of plaintext once sealed.
+//! A longer value (OpenSK's large-blob shards are 1023 bytes) is split in two entries, the second
+//! at `key + 2048`, written in one store transaction (`spill.rs`); the continuation keys are hidden
+//! from `iter`. Values over 1988 bytes are refused with `CTAP2_ERR_KEY_STORE_FULL`.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use defmt::{error, warn};
-use opensk::api::persist::{keys, Persist, PersistIter};
+use opensk::api::persist::{Persist, PersistIter};
 use opensk::ctap::status_code::{Ctap2StatusCode, CtapResult};
 use wasefire_store::{Store, StoreError, StoreUpdate};
 
@@ -30,6 +28,7 @@ use super::flash_store::FlashStorage;
 use crate::keys::Fl;
 use crate::puf;
 use crate::seal::{Domain, OVERHEAD};
+use crate::spill::{self, Op, FORMAT_HEAD, FORMAT_WHOLE, SPILL};
 
 pub struct PicoPersist {
     store: Store<FlashStorage>,
@@ -91,80 +90,42 @@ fn convert(error: StoreError) -> Ctap2StatusCode {
     }
 }
 
-/// Format byte of a sealed value stored in one entry / in two entries (see the module documentation).
-const FORMAT_ONE: u8 = 1;
-const FORMAT_SPLIT: u8 = 2;
-/// The longest value the key-value store takes (OpenSK's own `VALUE_LENGTH`).
-const STORE_MAX_VALUE: usize = 1023;
-/// The longest plaintext that still fits one entry once sealed.
-const MAX_PLAIN: usize = STORE_MAX_VALUE - 1 - OVERHEAD;
-/// A large-blob shard may be one entry longer than it is in plain form: its second part is stored
-/// at `key + OVERFLOW_OFFSET`. OpenSK keeps 0 and 2048+ free ("reserved for migration"): 3000..3004
-/// are not used by it (api/persist/keys.rs).
-const OVERFLOW_OFFSET: usize = 1000;
-
-fn is_shard(key: usize) -> bool {
-    keys::LARGE_BLOB_SHARDS.contains(&key)
-}
-
-fn is_overflow(key: usize) -> bool {
-    key >= keys::LARGE_BLOB_SHARDS.start + OVERFLOW_OFFSET
-        && key < keys::LARGE_BLOB_SHARDS.end + OVERFLOW_OFFSET
-}
-
-/// Associated data of a value: which store key it belongs to.
-fn aad(key: usize) -> [u8; 17] {
-    let mut a = [0u8; 17];
-    a[..13].copy_from_slice(b"pfrs/store/v1");
-    a[13..].copy_from_slice(&(key as u32).to_le_bytes());
+/// Associated data of an entry: which store key and which format it belongs to.
+fn aad(key: usize, format: u8) -> [u8; 18] {
+    let mut a = [0u8; 18];
+    a[..13].copy_from_slice(b"pfrs/store/v2");
+    a[13..17].copy_from_slice(&(key as u32).to_le_bytes());
+    a[17] = format;
     a
 }
 
-/// The sealed form of a value: `[format][nonce][ciphertext][tag]`.
-fn seal_value(key: usize, value: &[u8]) -> CtapResult<Vec<u8>> {
-    let longest = if is_shard(key) {
-        2 * STORE_MAX_VALUE - 1 - OVERHEAD
-    } else {
-        MAX_PLAIN
-    };
-    if value.len() > longest {
-        warn!("flash: value of {} bytes is too long to be sealed", value.len());
-        return Err(Ctap2StatusCode::CTAP2_ERR_KEY_STORE_FULL);
-    }
+/// `[format][nonce][ciphertext][tag]` for one store entry.
+fn seal_entry(key: usize, format: u8, data: &[u8]) -> Vec<u8> {
     let sealer = puf::sealer(Domain::Store);
-    let mut out = Vec::with_capacity(1 + OVERHEAD + value.len());
-    out.push(if 1 + OVERHEAD + value.len() > STORE_MAX_VALUE {
-        FORMAT_SPLIT
-    } else {
-        FORMAT_ONE
-    });
-    out.extend_from_slice(&sealer.seal(&aad(key), value));
-    Ok(out)
+    let mut out = Vec::with_capacity(1 + OVERHEAD + data.len());
+    out.push(format);
+    out.extend_from_slice(&sealer.seal(&aad(key, format), data));
+    out
 }
 
-/// Opens a sealed value; `rest` is the second entry of a split one.
-fn open_value(key: usize, blob: &[u8], rest: Option<&[u8]>) -> CtapResult<Vec<u8>> {
-    let fail = |why: &str| {
-        error!("flash: store entry {} {}", key, why);
-        Ctap2StatusCode::CTAP2_ERR_VENDOR_HARDWARE_FAILURE
-    };
-    let joined: Vec<u8>;
-    let body: &[u8] = match (blob.first(), rest) {
-        (Some(&FORMAT_ONE), _) => &blob[1..],
-        (Some(&FORMAT_SPLIT), Some(r)) => {
-            let mut j = Vec::with_capacity(blob.len() - 1 + r.len());
-            j.extend_from_slice(&blob[1..]);
-            j.extend_from_slice(r);
-            joined = j;
-            &joined
+/// The format and plaintext of one store entry.
+fn open_entry(key: usize, blob: &[u8]) -> CtapResult<(u8, Vec<u8>)> {
+    let format = match blob.first() {
+        Some(&f) if f == FORMAT_WHOLE || f == FORMAT_HEAD => f,
+        _ => {
+            error!("flash: store entry {} is not a sealed value", key);
+            return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_HARDWARE_FAILURE);
         }
-        _ => return Err(fail("is not a sealed value")),
     };
     let sealer = puf::sealer(Domain::Store);
-    // Changed, moved or written under another key: nothing of it is used.
-    sealer
-        .open(&aad(key), body)
-        .ok_or_else(|| fail("failed authentication"))
+    match sealer.open(&aad(key, format), &blob[1..]) {
+        Some(v) => Ok((format, v)),
+        None => {
+            // Changed, moved or written under another key: nothing of it is used.
+            error!("flash: store entry {} failed authentication", key);
+            Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_HARDWARE_FAILURE)
+        }
+    }
 }
 
 impl PicoPersist {
@@ -184,64 +145,57 @@ impl PicoPersist {
 
 impl Persist for PicoPersist {
     fn find(&self, key: usize) -> CtapResult<Option<Vec<u8>>> {
+        if key >= SPILL {
+            return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR);
+        }
         let Some(blob) = self.store.find(key).map_err(convert)? else {
             return Ok(None);
         };
-        let rest = if blob.first() == Some(&FORMAT_SPLIT) {
-            self.store.find(key + OVERFLOW_OFFSET).map_err(convert)?
-        } else {
-            None
+        let (format, head) = open_entry(key, &blob)?;
+        if format == FORMAT_WHOLE {
+            return Ok(Some(head));
+        }
+        // The first part of a long value: the rest must be there and be a whole entry.
+        let tail = self.store.find(key + SPILL).map_err(convert)?;
+        let Some(tail) = tail else {
+            error!("flash: store entry {} lost its continuation", key);
+            return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_HARDWARE_FAILURE);
         };
-        Ok(Some(open_value(key, &blob, rest.as_deref())?))
+        match open_entry(key + SPILL, &tail)? {
+            (FORMAT_WHOLE, tail) => Ok(Some(spill::join(&head, &tail))),
+            _ => Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_HARDWARE_FAILURE),
+        }
     }
 
     fn insert(&mut self, key: usize, value: &[u8]) -> CtapResult<()> {
-        let blob = seal_value(key, value)?;
-        if blob[0] == FORMAT_SPLIT {
-            // First entry full, the rest in the second one: one transaction (all or nothing).
-            self.store
-                .transaction(&[
-                    StoreUpdate::Insert {
-                        key,
-                        value: &blob[..STORE_MAX_VALUE],
-                    },
-                    StoreUpdate::Insert {
-                        key: key + OVERFLOW_OFFSET,
-                        value: &blob[STORE_MAX_VALUE..],
-                    },
-                ])
-                .map_err(convert)
-        } else if is_shard(key) {
-            // A shard that fits one entry again: drop a second part left by an earlier, longer one.
-            self.store
-                .transaction(&[
-                    StoreUpdate::Insert { key, value: &blob[..] },
-                    StoreUpdate::Remove {
-                        key: key + OVERFLOW_OFFSET,
-                    },
-                ])
-                .map_err(convert)
-        } else {
-            self.store.insert(key, &blob).map_err(convert)
-        }
+        let spill_present = key < SPILL && self.store.find(key + SPILL).map_err(convert)?.is_some();
+        let Some(ops) = spill::plan(key, value, spill_present) else {
+            warn!("flash: value of {} bytes cannot be stored", value.len());
+            return Err(Ctap2StatusCode::CTAP2_ERR_KEY_STORE_FULL);
+        };
+        let updates: Vec<StoreUpdate<Vec<u8>>> = ops
+            .iter()
+            .map(|op| match op {
+                Op::Put { key, format, data } => StoreUpdate::Insert {
+                    key: *key,
+                    value: seal_entry(*key, *format, data),
+                },
+                Op::Remove { key } => StoreUpdate::Remove { key: *key },
+            })
+            .collect();
+        self.store.transaction(&updates).map_err(convert)
     }
 
     fn remove(&mut self, key: usize) -> CtapResult<()> {
-        if is_shard(key) {
-            self.store
-                .transaction(&[
-                    StoreUpdate::<&[u8]>::Remove { key },
-                    StoreUpdate::Remove {
-                        key: key + OVERFLOW_OFFSET,
-                    },
-                ])
-                .map_err(convert)
-        } else {
-            self.store.remove(key).map_err(convert)
+        let mut updates: Vec<StoreUpdate<Vec<u8>>> = alloc::vec![StoreUpdate::Remove { key }];
+        if key < SPILL && self.store.find(key + SPILL).map_err(convert)?.is_some() {
+            updates.push(StoreUpdate::Remove { key: key + SPILL });
         }
+        self.store.transaction(&updates).map_err(convert)
     }
 
     fn iter(&self) -> CtapResult<PersistIter<'_>> {
+        // The continuation entries (keys from SPILL on) are not OpenSK's keys.
         Ok(Box::new(
             self.store
                 .iter()
@@ -250,8 +204,7 @@ impl Persist for PicoPersist {
                     Ok(handle) => Ok(handle.get_key()),
                     Err(error) => Err(convert(error)),
                 })
-                // The second parts of split shards belong to their first entry.
-                .filter(|k| !matches!(k, Ok(k) if is_overflow(*k))),
+                .filter(|k| !matches!(k, Ok(k) if *k >= SPILL)),
         ))
     }
 }

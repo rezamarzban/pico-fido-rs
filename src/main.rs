@@ -28,9 +28,11 @@ mod layout;
 #[cfg(feature = "oled")]
 mod oled;
 mod puf;
+mod puf_code;
 mod se;
 mod seal;
 mod sealed_log;
+mod spill;
 mod status;
 mod usb;
 
@@ -135,15 +137,14 @@ fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) 
         }
         let secret = match se::ecdsa::chip_random() {
             Ok(r) => zeroize::Zeroizing::new(r),
-            Err(_) => defmt::panic!("puf: the secure element gave no random bytes for the enrolment"),
+            Err(_) => {
+                defmt::panic!("puf: the secure element gave no random bytes for the enrolment")
+            }
         };
         warn!("first start with flash encryption: erasing the store, directory and counter");
         let wiped = flash
             .borrow_mut()
-            .blocking_erase(
-                (layout::PUF_START + layout::PAGE) as u32,
-                FLASH_SIZE as u32,
-            )
+            .blocking_erase((layout::PUF_START + layout::PAGE) as u32, FLASH_SIZE as u32)
             .is_ok();
         if !wiped || !puf.enroll(flash, &secret) {
             error!("puf: enrolment failed");
@@ -184,9 +185,10 @@ fn main() -> ! {
     // ATECC608A: credential and attestation keys, signing and the RNG seed.
     se::i2c::init(p.I2C1, p.PIN_15, p.PIN_14);
     static FLASH: StaticCell<RefCell<keys::Fl>> = StaticCell::new();
-    let flash: &'static RefCell<keys::Fl> = &*FLASH.init(RefCell::new(
-        Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH),
-    ));
+    let flash: &'static RefCell<keys::Fl> =
+        &*FLASH.init(RefCell::new(
+            Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH),
+        ));
 
     let mut led = {
         #[cfg(feature = "rp2040_board")]
