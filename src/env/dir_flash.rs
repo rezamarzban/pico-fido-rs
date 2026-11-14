@@ -3,47 +3,73 @@
 //! several chips and always works with the directory of the chip that is connected.
 //!
 //! It used to live in data slot 13 of the chip; now NOTHING but keys is stored in the chip. The
-//! directory has its own two 4 KiB flash sectors (A directly below the OpenSK key-value store, B
-//! below the signature-counter page; build.rs keeps them out of the linker's FLASH region, like the
-//! store). They are separate from the store on purpose: OpenSK's own reset and the store's "format"
-//! never touch them. The format (an append-only record log, no erase to add a site, copy-on-write
-//! between the two sectors to compact it, so a power failure never loses the directory) is in
-//! `se/dirlog.rs`, which is host-tested. If the flash is erased from outside the directory is gone
-//! and `se::ecdsa` takes over slots that hold a key but belong to nobody (see SECURITY.md).
+//! directory has its own two 8 KiB flash sectors (A directly below the OpenSK key-value store, B
+//! below it; src/layout.rs, build.rs keeps them out of the linker's FLASH region, like the store).
+//! They are separate from the store on purpose: OpenSK's own reset and the store's "format" never
+//! touch them. The format (an append-only record log, no erase to add a site, copy-on-write between
+//! the two sectors to compact it, so a power failure never loses the directory) is in
+//! `se/dirlog.rs`, which is host-tested and works on a plaintext page image.
+//!
+//! **Every record is sealed with AES-256-GCM** under a key derived from the SRAM PUF (`seal.rs`,
+//! `sealed_log.rs`): a copy of the flash shows neither the chip serial numbers nor the site hashes.
+//! The 16-byte sector header (magic, generation) is not secret. `pages()` returns the decrypted page
+//! images; the planner's flash operations are translated to sealed ones one record at a time.
+//! If the flash is erased from outside the directory is gone and `se::ecdsa` takes over slots that
+//! hold a key but belong to nobody (see SECURITY.md).
 
+use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use super::flash_store::{PAGE_SIZE, STORE_START, XIP_BASE};
+use super::flash_io;
 use crate::keys::Fl;
+use crate::layout::{DIR_A_START, DIR_B_START, DIR_PHYS};
+use crate::puf;
 use crate::se::dirlog::{self, DirPlan, Step};
 use crate::se::ecdsa::{ChipSerial, DirStore, DIR_LEN};
+use crate::seal::Domain;
+use crate::sealed_log::{self, DIR};
 
-const _: () = assert!(PAGE_SIZE == dirlog::PAGE);
-
-/// Directory sector A: the 4 KiB right below the key-value store.
-pub const DIR_START: usize = STORE_START - PAGE_SIZE;
-/// Directory sector B: below the signature-counter page (which keeps the place it always had, right
-/// below sector A, so a build that already had the counter there keeps its count).
-pub const DIR_B_START: usize = DIR_START - 2 * PAGE_SIZE;
+const _: () = assert!(DIR.logical_len == dirlog::PAGE);
+const _: () = assert!(DIR.rec == dirlog::REC);
+const _: () = assert!(DIR.header_len == dirlog::HEADER_LEN);
+const _: () = assert!(DIR.max_recs == dirlog::MAX_RECS);
+const _: () = assert!(DIR.phys_len == DIR_PHYS);
 
 fn sector_start(sector: usize) -> usize {
     if sector == 0 {
-        DIR_START
+        DIR_A_START
     } else {
         DIR_B_START
     }
 }
 
-fn sector_slice(start: usize) -> &'static [u8] {
-    // SAFETY: `start..start+PAGE_SIZE` lies inside the memory-mapped flash, outside the firmware
-    // image (build.rs) and outside the store; it is only written by `FlashDir::save`, never while
-    // it is being read.
-    unsafe { core::slice::from_raw_parts((XIP_BASE + start) as *const u8, PAGE_SIZE) }
+/// The sealed bytes of one directory sector.
+fn phys(sector: usize) -> &'static [u8] {
+    flash_io::xip(sector_start(sector), DIR_PHYS)
 }
 
-/// Both directory sectors, read straight through the XIP window (also used by the status display).
-pub fn pages() -> [&'static [u8]; 2] {
-    [sector_slice(DIR_START), sector_slice(DIR_B_START)]
+fn blank_pages() -> [Vec<u8>; 2] {
+    [
+        alloc::vec![0xFFu8; dirlog::PAGE],
+        alloc::vec![0xFFu8; dirlog::PAGE],
+    ]
+}
+
+/// Both directory sectors decrypted into the page layout `se/dirlog.rs` reads (also used by the
+/// status display). Blank if the key cannot be rebuilt.
+pub fn pages() -> [Vec<u8>; 2] {
+    match puf::try_sealer(Domain::Dir) {
+        Some(s) => [
+            sealed_log::open_page(&DIR, &s, phys(0)),
+            sealed_log::open_page(&DIR, &s, phys(1)),
+        ],
+        None => blank_pages(),
+    }
+}
+
+/// The two pages as the slices `dirlog` works on.
+pub fn sectors(p: &[Vec<u8>; 2]) -> dirlog::Sectors<'_> {
+    [&p[0][..], &p[1][..]]
 }
 
 pub struct FlashDir {
@@ -71,14 +97,20 @@ impl DirStore for FlashDir {
 
     fn load(&mut self) -> [u8; DIR_LEN] {
         match &self.chip {
-            Some(chip) => dirlog::scan(pages(), chip).0,
+            Some(chip) => {
+                let p = pages();
+                dirlog::scan(sectors(&p), chip).0
+            }
             None => [0u8; DIR_LEN],
         }
     }
 
     fn save(&mut self, dir: &[u8; DIR_LEN]) -> Result<(), ()> {
         let chip = self.chip.ok_or(())?;
-        let plan = dirlog::plan(pages(), &chip, dir);
+        // No key, no directory: refuse (the registration then fails) instead of writing plaintext.
+        let sealer = puf::try_sealer(Domain::Dir).ok_or(())?;
+        let logical = pages();
+        let plan = dirlog::plan(sectors(&logical), &chip, dir);
         if plan == DirPlan::Full {
             return Err(());
         }
@@ -89,21 +121,19 @@ impl DirStore for FlashDir {
         for step in plan.steps() {
             match step {
                 Step::Erase { sector } => {
-                    let start = sector_start(sector);
-                    flash
-                        .blocking_erase(start as u32, (start + PAGE_SIZE) as u32)
-                        .map_err(|_| ())?;
+                    flash_io::erase(&mut flash, sector_start(sector), DIR_PHYS)?;
                 }
                 Step::Program {
                     sector,
                     offset,
                     data,
                 } => {
-                    flash
-                        .blocking_write((sector_start(sector) + offset) as u32, &data)
-                        .map_err(|_| ())?;
-                    if pages()[sector][offset..offset + data.len()] != data[..] {
-                        return Err(());
+                    let writes = sealed_log::seal_program(&DIR, &sealer, offset, &data).ok_or(())?;
+                    for w in writes {
+                        flash_io::program(&mut flash, sector_start(sector) + w.offset, &w.data)?;
+                        if phys(sector)[w.offset..w.offset + w.data.len()] != w.data[..] {
+                            return Err(());
+                        }
                     }
                 }
             }

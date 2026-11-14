@@ -1,8 +1,8 @@
 diff --git a/libraries/opensk/src/api/rng.rs b/libraries/opensk/src/api/rng.rs
-index 5ee4b7b..f8cf495 100644
+index e6c121f..87a6f20 100644
 --- a/libraries/opensk/src/api/rng.rs
 +++ b/libraries/opensk/src/api/rng.rs
-@@ -28,4 +28,15 @@ pub trait Rng: CryptoRng + RngCore {
+@@ -28,4 +28,15 @@ pub trait Rng: CryptoRng + CoreRng {
          self.fill_bytes(&mut bytes);
          bytes
      }
@@ -19,10 +19,10 @@ index 5ee4b7b..f8cf495 100644
 +    }
  }
 diff --git a/libraries/opensk/src/ctap/ctap1.rs b/libraries/opensk/src/ctap/ctap1.rs
-index 7cf4518..8d8eee4 100644
+index 8339a46..d02dae4 100644
 --- a/libraries/opensk/src/ctap/ctap1.rs
 +++ b/libraries/opensk/src/ctap/ctap1.rs
-@@ -19,6 +19,7 @@ use crate::api::crypto::ec_signing::{EcPublicKey, EcSecretKey, EcSignature};
+@@ -19,6 +19,7 @@ use crate::api::crypto::ec_signing::{self, EcPublicKey, EcSecretKey, EcSignature
  use crate::api::key_store::{CredentialSource, KeyStore};
  use crate::api::persist::{Attestation, AttestationId, Persist};
  use crate::api::private_key::PrivateKey;
@@ -30,23 +30,23 @@ index 7cf4518..8d8eee4 100644
  use crate::env::{EcdsaPk, EcdsaSk, Env};
  use alloc::vec::Vec;
  use arrayref::{array_ref, mut_array_refs};
-@@ -250,6 +251,7 @@ impl Ctap1Command {
+@@ -249,6 +250,7 @@ impl Ctap1Command {
          challenge: [u8; 32],
          application: [u8; 32],
      ) -> Result<Vec<u8>, Ctap1StatusCode> {
 +        env.rng().set_rp_id_hash(&application);
-         let sk = EcdsaSk::<E>::random(env.rng());
+         let sk = EcdsaSk::<E>::random(env.rng())?;
          let pk = sk.public_key();
          let private_key = PrivateKey::<E>::Ecdsa(sk);
 diff --git a/libraries/opensk/src/ctap/mod.rs b/libraries/opensk/src/ctap/mod.rs
-index 6eeb16d..f10dd11 100644
+index abbd9c3..dc5ee41 100644
 --- a/libraries/opensk/src/ctap/mod.rs
 +++ b/libraries/opensk/src/ctap/mod.rs
-@@ -948,6 +948,7 @@ impl<E: Env> CtapState<E> {
+@@ -967,6 +967,7 @@ impl<E: Env> CtapState<E> {
  
          // We decide on the algorithm early, but delay key creation since it takes time.
          // We rather do that later so all intermediate checks may return faster.
 +        env.rng().set_rp_id_hash(&rp_id_hash);
-         let private_key = PrivateKey::new(env, algorithm);
+         let private_key = PrivateKey::new(env, algorithm)?;
          let credential_id = if options.rk {
              let random_id = env.rng().gen_uniform_u8x32().to_vec();

@@ -5,7 +5,7 @@ on: [push, pull_request]
 env:
   CARGO_TERM_COLOR: always
   # The nightly OpenSK itself pins (edition 2024, let-chains). Keep in sync with rust-toolchain.toml.
-  NIGHTLY: nightly-2026-06-03
+  NIGHTLY: nightly-2026-10-02
 
 jobs:
   building:

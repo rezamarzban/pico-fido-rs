@@ -24,9 +24,13 @@ use {defmt_rtt as _, panic_probe as _};
 
 mod env;
 mod keys;
+mod layout;
 #[cfg(feature = "oled")]
 mod oled;
+mod puf;
 mod se;
+mod seal;
+mod sealed_log;
 mod status;
 mod usb;
 
@@ -52,10 +56,9 @@ pub const FLASH_SIZE: usize = FLASH_MB * 1024 * 1024;
 /// Pages of 4 KiB at the end of flash for OpenSK's key-value store (72 KiB). build.rs keeps the
 /// same area out of the linker's FLASH region: change them together.
 pub const STORE_PAGES: usize = 18;
-// One more 4 KiB page directly below the store is site directory sector A (src/env/dir_flash.rs);
-// the signature counter (src/env/tally_flash.rs) has the page below that and directory sector B the
-// one below the counter; build.rs leaves all three out of the linker's FLASH region too
-// (72 + 4 + 4 + 4 = 84 KiB).
+// Below the store: site directory sectors A and B (8 KiB each, src/env/dir_flash.rs), the signature
+// counter (12 KiB, src/env/tally_flash.rs) and the SRAM-PUF helper sector (4 KiB, src/puf.rs): 104 KiB
+// in all, see src/layout.rs. Everything but the helper sector is sealed with AES-256-GCM.
 
 // Heap for OpenSK (alloc): credentials, CBOR, the P-256 software crypto, message buffers.
 const HEAP_SIZE: usize = 128 * 1024;
@@ -99,6 +102,62 @@ async fn usb_executor_init(parts: AssertSend<UsbParts>) {
     spawner.spawn(blinker(led)).unwrap();
 }
 
+/// Blinks 3 short flashes and a pause forever: the flash key is not available (see SECURITY.md).
+/// USB is not running: nothing is served, nothing is read from or written to flash.
+fn halt_with_fault(led: &mut Output<'static>) -> ! {
+    loop {
+        for _ in 0..3 {
+            led.set_high();
+            embassy_time::block_for(Duration::from_millis(120));
+            led.set_low();
+            embassy_time::block_for(Duration::from_millis(180));
+        }
+        embassy_time::block_for(Duration::from_millis(1200));
+    }
+}
+
+/// Starts the SRAM PUF and installs it as the source of the flash encryption keys.
+///
+/// * helper sector valid and this boot's RAM sample decodes: go on.
+/// * helper sector erased (new device, or the first start of this firmware over an older one): wipe
+///   every area that is protected by the key (an older firmware left PLAINTEXT there), THEN write the
+///   helper sector. The helper sector is the commit: a power cut before it repeats the wipe, so the
+///   flash never holds plaintext secrets next to an enrolled key. Needs a power-on reset (unplug and
+///   replug after flashing the firmware).
+/// * anything else (damaged helper, sample does not decode, no power-on reset when one is needed):
+///   halt with the fault blink; nothing is read or written. A re-plug fixes a noisy sample.
+fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) {
+    let mut puf = puf::Puf::open(flash);
+    if puf.status() == puf::Status::Blank {
+        if !puf.can_enroll() {
+            error!("puf: cannot enrol now - unplug the key for 10 s and plug it in again");
+            halt_with_fault(led);
+        }
+        let secret = match se::ecdsa::chip_random() {
+            Ok(r) => zeroize::Zeroizing::new(r),
+            Err(_) => defmt::panic!("puf: the secure element gave no random bytes for the enrolment"),
+        };
+        warn!("first start with flash encryption: erasing the store, directory and counter");
+        let wiped = flash
+            .borrow_mut()
+            .blocking_erase(
+                (layout::PUF_START + layout::PAGE) as u32,
+                FLASH_SIZE as u32,
+            )
+            .is_ok();
+        if !wiped || !puf.enroll(flash, &secret) {
+            error!("puf: enrolment failed");
+            halt_with_fault(led);
+        }
+    }
+    if puf.status() != puf::Status::Ready {
+        error!("puf: no usable key (status {}) - halting", puf.status());
+        halt_with_fault(led);
+    }
+    static PUF: StaticCell<puf::Puf> = StaticCell::new();
+    puf::install(PUF.init(puf));
+}
+
 /// Publishes which chip slots hold a key and how many belong to a site (for the status display;
 /// reads the flash directory, no chip access).
 fn refresh_slot_status() {
@@ -124,18 +183,25 @@ fn main() -> ! {
     oled::init(p.I2C0, p.PIN_17, p.PIN_16);
     // ATECC608A: credential and attestation keys, signing and the RNG seed.
     se::i2c::init(p.I2C1, p.PIN_15, p.PIN_14);
-    let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
+    static FLASH: StaticCell<RefCell<keys::Fl>> = StaticCell::new();
+    let flash: &'static RefCell<keys::Fl> = &*FLASH.init(RefCell::new(
+        Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH),
+    ));
+
+    let mut led = {
+        #[cfg(feature = "rp2040_board")]
+        Output::new(p.PIN_25, Level::Low)
+    };
+
+    // Flash encryption key from the SRAM PUF. Must come before anything touches the store, the
+    // directory or the counter; halts with a blink pattern if the key is not available.
+    init_flash_key(flash, &mut led);
 
     // Persistent serial number (privacy trade-off): build without `usb_serial` to omit it.
     let serial = if cfg!(feature = "usb_serial") {
-        keys::serial(&mut flash)
+        keys::serial(&mut flash.borrow_mut())
     } else {
         None
-    };
-
-    let led = {
-        #[cfg(feature = "rp2040_board")]
-        Output::new(p.PIN_25, Level::Low)
     };
 
     // USB + LED on the high-priority executor.
@@ -152,8 +218,6 @@ fn main() -> ! {
         .unwrap();
 
     // OpenSK in thread mode. The flash moves into the key-value store, BOOTSEL into user presence.
-    static FLASH: StaticCell<RefCell<keys::Fl>> = StaticCell::new();
-    let flash: &'static RefCell<keys::Fl> = &*FLASH.init(RefCell::new(flash));
     // The site directory (which site owns which chip key slot) is in the Pico's flash, not in the chip.
     static DIR: StaticCell<FlashDir> = StaticCell::new();
     se::ecdsa::install_dir(DIR.init(FlashDir::new(flash)));

@@ -11,7 +11,7 @@
 //!      with GenKey.
 //!   Either way the RP is written to the directory before the key is handed out. A key that is
 //!   owned by an RP is never touched, regenerated or overwritten. When every slot belongs to
-//!   another RP `random()` panics, so the registration fails and the existing keys stay. The RP
+//!   another RP `random()` returns an error, so the registration fails and the existing keys stay. The RP
 //!   comes from OpenSK through `Rng::take_rp_id_hash` (third_party/opensk-rp-hint.patch); without
 //!   it (`None`), or without an installed directory, nothing is adopted or recorded and every call
 //!   takes a fresh (empty) slot.
@@ -33,7 +33,7 @@
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use critical_section::Mutex;
-use opensk::api::crypto::ec_signing::{EcPublicKey, EcSecretKey, EcSignature, Ecdsa};
+use opensk::api::crypto::ec_signing::{EcPublicKey, EcSecretKey, EcSignature, Ecdsa, Error as EcError};
 use opensk::api::crypto::EC_FIELD_SIZE;
 use opensk::api::rng::Rng;
 use sha2::{Digest, Sha256};
@@ -337,32 +337,97 @@ fn dir_owned(dir: &[u8; DIR_LEN], i: usize) -> bool {
 }
 
 /// The credential slot that already holds the key of this RP, with its public key. An entry whose
-/// slot holds no key (an interrupted registration) is ignored; a chip that does not answer is not
-/// (it must never look like "no key here").
-fn dir_find(dir: &[u8; DIR_LEN], rp: &[u8; 32]) -> Option<(u8, [u8; 64])> {
+/// slot holds no key (an interrupted registration) is ignored; a chip that does not answer is an
+/// error (it must never look like "no key here").
+fn dir_find(dir: &[u8; DIR_LEN], rp: &[u8; 32]) -> Result<Option<(u8, [u8; 64])>, ()> {
     let tag = dir_tag(rp);
     for i in 0..SLOTS as usize {
         if dir_entry(dir, i) == &tag[..] {
             let slot = FIRST_CRED_SLOT + i as u8;
             match cached_pubkey(slot) {
-                Ok(pk) => return Some((slot, pk)),
+                Ok(pk) => return Ok(Some((slot, pk))),
                 Err(Error::Status(STATUS_EMPTY_SLOT)) => {}
-                Err(_) => panic!("se: cannot read key slot"),
+                Err(_) => return Err(()),
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Records in the directory (in the Pico's flash) that `slot` belongs to `rp`. It is done BEFORE
-/// the key is handed out: if it cannot be stored, the registration fails (panic, like every
-/// other failure here) instead of a key being shared with the next site without a trace.
-fn dir_record(dir: &mut [u8; DIR_LEN], slot: u8, rp: &[u8; 32]) {
+/// the key is handed out: if it cannot be stored, the registration fails (an error to OpenSK, which
+/// answers the host with a CTAP error) instead of a key being shared with the next site without a trace.
+fn dir_record(dir: &mut [u8; DIR_LEN], slot: u8, rp: &[u8; 32]) -> Result<(), ()> {
     let off = (slot - FIRST_CRED_SLOT) as usize * DIR_ENTRY;
     dir[off..off + DIR_ENTRY].copy_from_slice(&dir_tag(rp));
-    if let Some(Err(())) = with_dir(|d| d.save(dir)) {
-        panic!("se: cannot record the site in the flash directory");
+    match with_dir(|d| d.save(dir)) {
+        Some(Err(())) => Err(()),
+        _ => Ok(()),
     }
+}
+
+/// The three steps of `SeSecretKey::random` (see the module documentation).
+fn create_key(rp: Option<[u8; 32]>) -> Result<SeSecretKey, ()> {
+    // Which chip is connected right now decides whose directory is used (a swapped chip is
+    // noticed here at the latest).
+    if rp.is_some() && chip_info().is_none() {
+        return Err(());
+    }
+    // The directory comes from the Pico's flash. Without a hint or without a store nothing can
+    // be recorded, so no key is shared or taken over then.
+    let mut dir = if rp.is_some() {
+        with_dir(|d| d.load())
+    } else {
+        None
+    };
+    // 1. This RP already has a key: use it again, no slot is consumed.
+    if let (Some(rp), Some(dir)) = (&rp, &dir) {
+        if let Some((slot, pubkey)) = dir_find(dir, rp)? {
+            return Ok(SeSecretKey { slot, pubkey });
+        }
+    }
+    // 2. A slot of nobody that already holds a private key: this RP takes it over as it is.
+    //    The slots without a key are collected for step 3 (also those with a stale entry).
+    let mut empty = [0u8; SLOTS as usize];
+    let mut n_empty = 0;
+    for i in 0..SLOTS as usize {
+        let slot = FIRST_CRED_SLOT + i as u8;
+        if !slot_has_key(slot).map_err(|_| ())? {
+            empty[n_empty] = slot;
+            n_empty += 1;
+            continue;
+        }
+        if let (Some(rp), Some(dir)) = (&rp, dir.as_mut()) {
+            if !dir_owned(dir, i) {
+                let pubkey = cached_pubkey(slot).map_err(|_| ())?;
+                dir_record(dir, slot, rp)?;
+                return Ok(SeSecretKey { slot, pubkey });
+            }
+        }
+    }
+    // 3. First empty slot, in order: GenKey. If the chip refuses GenKey in a slot (e.g. one that
+    //    cannot hold a P-256 private key) the next one is tried, so such a slot is never used.
+    for &slot in &empty[..n_empty] {
+        match with_chip(|c| c.gen_key(slot)) {
+            Ok(pubkey) => {
+                critical_section::with(|cs| {
+                    PUBKEYS.borrow(cs).borrow_mut()[slot as usize] = Some(pubkey);
+                    let u = USED.borrow(cs);
+                    u.set(u.get().map(|n| (n + 1).min(SLOTS)));
+                    let k = KEYS.borrow(cs);
+                    k.set(k.get().map(|m| m | (1 << slot)));
+                });
+                if let (Some(rp), Some(dir)) = (&rp, dir.as_mut()) {
+                    dir_record(dir, slot, rp)?;
+                }
+                return Ok(SeSecretKey { slot, pubkey });
+            }
+            Err(Error::Status(_)) => continue,
+            Err(_) => return Err(()),
+        }
+    }
+    // Every slot belongs to a site: refuse instead of overwriting an existing key.
+    Err(())
 }
 
 pub struct SeEcdsa;
@@ -392,74 +457,10 @@ impl EcSecretKey for SeSecretKey {
     type PublicKey = SePublicKey;
     type Signature = SeSignature;
 
-    fn random(rng: &mut impl Rng) -> Self {
-        let rp = rng.take_rp_id_hash();
-        // Which chip is connected right now decides whose directory is used (a swapped chip is
-        // noticed here at the latest).
-        if rp.is_some() && chip_info().is_none() {
-            panic!("se: cannot read the chip serial number");
-        }
-        // The directory comes from the Pico's flash. Without a hint or without a store nothing can
-        // be recorded, so no key is shared or taken over then.
-        let mut dir = if rp.is_some() {
-            with_dir(|d| d.load())
-        } else {
-            None
-        };
-        // 1. This RP already has a key: use it again, no slot is consumed.
-        if let (Some(rp), Some(dir)) = (&rp, &dir) {
-            if let Some((slot, pubkey)) = dir_find(dir, rp) {
-                return SeSecretKey { slot, pubkey };
-            }
-        }
-        // 2. A slot of nobody that already holds a private key: this RP takes it over as it is.
-        //    The slots without a key are collected for step 3 (also those with a stale entry).
-        let mut empty = [0u8; SLOTS as usize];
-        let mut n_empty = 0;
-        for i in 0..SLOTS as usize {
-            let slot = FIRST_CRED_SLOT + i as u8;
-            let has_key = match slot_has_key(slot) {
-                Ok(b) => b,
-                Err(_) => panic!("se: cannot read key slot"),
-            };
-            if !has_key {
-                empty[n_empty] = slot;
-                n_empty += 1;
-                continue;
-            }
-            if let (Some(rp), Some(dir)) = (&rp, dir.as_mut()) {
-                if !dir_owned(dir, i) {
-                    let pubkey = match cached_pubkey(slot) {
-                        Ok(pk) => pk,
-                        Err(_) => panic!("se: cannot read key slot"),
-                    };
-                    dir_record(dir, slot, rp);
-                    return SeSecretKey { slot, pubkey };
-                }
-            }
-        }
-        // 3. First empty slot, in order: GenKey. If the chip refuses GenKey in a slot (e.g. one that
-        //    cannot hold a P-256 private key) the next one is tried, so such a slot is never used.
-        for &slot in &empty[..n_empty] {
-            match with_chip(|c| c.gen_key(slot)) {
-                Ok(pubkey) => {
-                    critical_section::with(|cs| {
-                        PUBKEYS.borrow(cs).borrow_mut()[slot as usize] = Some(pubkey);
-                        let u = USED.borrow(cs);
-                        u.set(u.get().map(|n| (n + 1).min(SLOTS)));
-                        let k = KEYS.borrow(cs);
-                        k.set(k.get().map(|m| m | (1 << slot)));
-                    });
-                    if let (Some(rp), Some(dir)) = (&rp, dir.as_mut()) {
-                        dir_record(dir, slot, rp);
-                    }
-                    return SeSecretKey { slot, pubkey };
-                }
-                Err(Error::Status(_)) => continue,
-                Err(_) => panic!("se: GenKey failed"),
-            }
-        }
-        panic!("se: no free key slot for a new site, refusing to overwrite an existing key")
+    /// Every failure (chip does not answer, no free slot, directory cannot be saved) is an error:
+    /// OpenSK turns it into a CTAP error, nothing is overwritten and no key is handed out.
+    fn random(rng: &mut impl Rng) -> Result<Self, EcError> {
+        create_key(rng.take_rp_id_hash()).map_err(|_| EcError)
     }
 
     fn public_key(&self) -> SePublicKey {
@@ -470,7 +471,7 @@ impl EcSecretKey for SeSecretKey {
         SePublicKey { x, y }
     }
 
-    fn sign(&self, message: &[u8]) -> SeSignature {
+    fn sign(&self, message: &[u8]) -> Result<SeSignature, EcError> {
         let digest: [u8; 32] = Sha256::digest(message).into();
         match with_chip(|c| c.sign(self.slot, &digest)) {
             Ok(sig) => {
@@ -479,13 +480,11 @@ impl EcSecretKey for SeSecretKey {
                 let mut s = [0u8; 32];
                 r.copy_from_slice(&sig[..32]);
                 s.copy_from_slice(&sig[32..]);
-                SeSignature { r, s }
+                Ok(SeSignature { r, s })
             }
-            // The trait cannot report errors, and a bogus signature would look like a successful
-            // response that only fails later at the relying party. Like every other chip failure
-            // here this is a hard stop (the command layer already retried once from the wake-up):
-            // the host sees the device fail instead of a CTAP success.
-            Err(_) => panic!("se: the chip refused to sign"),
+            // OpenSK reports the error to the host (the command layer already retried once from
+            // the wake-up): the host sees a failed command, never a bogus signature.
+            Err(_) => Err(EcError),
         }
     }
 

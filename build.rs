@@ -1,8 +1,9 @@
 //! Generates the linker memory map (`memory.x`) from the selected `flash_*` Cargo feature and
-//! puts it where the linker finds it. The last 84 KiB of flash are left out of the FLASH region:
-//! 72 KiB hold the OpenSK key-value store (STORE_PAGES in src/main.rs), the 4 KiB page below it
-//! is site directory sector A (src/env/dir_flash.rs), the one below that the signature counter
-//! (src/env/tally_flash.rs) and the one below that site directory sector B. Because this is the single
+//! puts it where the linker finds it. The last 104 KiB of flash are left out of the FLASH region
+//! (src/layout.rs): 72 KiB OpenSK key-value store (STORE_PAGES in src/main.rs), 2 x 8 KiB site
+//! directory sectors, 12 KiB signature counter (all sealed with AES-256-GCM) and one 4 KiB sector of
+//! SRAM-PUF helper data. The first 1 KiB of RAM is also taken out of the linker's RAM: nothing may
+//! write it, src/puf.rs reads its power-up state as the root of the encryption keys. Because this is the single
 //! source of the flash size, the linker layout cannot disagree with `FLASH_SIZE` in main.rs.
 
 use std::env;
@@ -26,12 +27,14 @@ fn main() {
     }
     let flash_kib = sizes[0] * 1024;
 
+    // SRAM PUF: the first 1 KiB of RAM stays outside every linker section (src/puf.rs REGION_BYTES).
     let memory = format!(
         "MEMORY {{\n\
          \x20   BOOT2 : ORIGIN = 0x10000000, LENGTH = 0x100\n\
-         \x20   /* last 84K of the {flash_kib}K flash: site directory B (4K) + signature counter (4K) + site directory A (4K) + key-value store (72K) */\n\
-         \x20   FLASH : ORIGIN = 0x10000100, LENGTH = {flash_kib}K - 0x100 - 84K\n\
-         \x20   RAM   : ORIGIN = 0x20000000, LENGTH = 264K\n\
+         \x20   /* last 104K of the {flash_kib}K flash: PUF helper (4K) + counter (12K) + directory B (8K) + directory A (8K) + key-value store (72K) */\n\
+         \x20   FLASH : ORIGIN = 0x10000100, LENGTH = {flash_kib}K - 0x100 - 104K\n\
+         \x20   PUF   : ORIGIN = 0x20000000, LENGTH = 1K\n\
+         \x20   RAM   : ORIGIN = 0x20000400, LENGTH = 264K - 1K\n\
          }}\n"
     );
 

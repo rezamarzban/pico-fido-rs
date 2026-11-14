@@ -6,6 +6,7 @@
 
 mod clock;
 pub mod dir_flash;
+mod flash_io;
 mod flash_store;
 pub mod hid;
 mod persist;
