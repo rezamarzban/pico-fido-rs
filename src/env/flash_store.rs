@@ -12,14 +12,8 @@ use core::cell::RefCell;
 use wasefire_store::{Storage, StorageError, StorageIndex, StorageResult};
 
 use crate::keys::Fl;
-use crate::{FLASH_SIZE, STORE_PAGES};
-
-pub const PAGE_SIZE: usize = 4096;
-const STORE_BYTES: usize = STORE_PAGES * PAGE_SIZE;
-/// The store occupies the very end of flash.
-pub const STORE_START: usize = FLASH_SIZE - STORE_BYTES;
-/// Start of the memory-mapped flash (XIP window).
-pub const XIP_BASE: usize = 0x1000_0000;
+use crate::layout::{PAGE as PAGE_SIZE, STORE_BYTES, STORE_START, XIP_BASE};
+use crate::STORE_PAGES;
 
 pub struct FlashStorage {
     flash: &'static RefCell<Fl>,

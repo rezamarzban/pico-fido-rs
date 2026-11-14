@@ -7,23 +7,34 @@ Experimental firmware; read this before relying on it.
   A copy of the Pico's flash contains no private key, only credential handles (slot number +
   fingerprint) inside OpenSK's encrypted credential IDs.
 * **No signature limit**: signatures are not counted (the former Counter 0 budget was removed).
-  The chip signs as often as it is asked. If the chip refuses to sign, the firmware stops (panic) instead of
-  returning a dummy signature that would only fail later at the relying party. Consequence: anyone who can run code on the Pico or talk
+  The chip signs as often as it is asked. If the chip refuses to sign, OpenSK gets an error and the host a failed command (since OpenSK
+  #835 signing can fail) instead of a dummy signature that would only fail later at the relying party. Consequence: anyone who can run code on the Pico or talk
   to the chip's I2C bus (see below) is no longer stopped by a budget; user presence (BOOTSEL) is
   the only gate for normal use.
-* **Randomness** comes only from the chip's TRNG (a ChaCha20 DRBG seeded from it and re-seeded every
+* **Randomness** comes only from the chip's TRNG (an HMAC-DRBG seeded from it and re-seeded every
   1 KiB of output). If the chip stops answering the firmware halts; there is no weaker fallback.
 
 ## What is not protected
-* **Everything on the Pico is OpenSK's standard, unprotected storage**: the PIN hash, the master
-  keys that encrypt credential IDs, resident-credential data, counters. With physical access
-  (BOOTSEL / SWD) an attacker can read all of it. Short PINs can then be guessed offline.
-  The PIN is only an access check done by the Pico firmware.
+* **Flash is encrypted, RAM is not.** The PIN hash, the master keys that encrypt credential IDs, resident-credential
+  data, counters, the site directory and the signature counts are AES-256-GCM ciphertext in flash (README, "Flash layout
+  and encryption"); the key is rebuilt from the SRAM power-up pattern and never stored. A copy of the flash (dump,
+  backup, chip read in a programmer) therefore does not allow offline PIN guessing. Anyone who can **run code** on the
+  Pico (BOOTSEL / SWD) can read the same RAM and derive the key: this is protection against flash theft, not against
+  a device that is attacked live.
+* **PUF caveats.** 256 bits is an upper bound; the real strength is the min-entropy of this chip's SRAM pattern (the
+  public helper data leaks some of it). The error rate is logged at every boot; above ~10 % the key may fail to rebuild
+  (then the LED blinks 3x and the key stays locked until a re-plug). Temperature/voltage extremes and ageing change
+  the pattern. If the helper sector is lost or the SRAM of the chip changes for good, **all sealed data is
+  unrecoverable** (the chip's keys stay, credentials do not): there is no backup of the key by design.
+* **Not hidden:** store key ids, value lengths and write timing; there is **no rollback protection** (an old copy of the
+  flash can be restored with its old, valid ciphertext). Large-blob shards are split over two store entries (one transaction); other values over 994 bytes are refused.
+* A stack overflow of less than 1 KiB runs into the reserved PUF RAM (flip-link's guard is the end of RAM): the key can
+  then no longer be rebuilt and the firmware halts, by design.
 * **The chip does not authenticate the Pico.** Code running on the Pico, or a probe on the I2C
   bus, can make the chip sign (without limit). User presence is the BOOTSEL button,
   checked by the Pico.
 * **Only 9 sites.** A key that belongs to a site is never overwritten or regenerated; a registration at a
-  10th site is refused (firmware panic and restart). Accounts at a site that already has a key reuse it. The firmware
+  10th site is refused (OpenSK answers the host with a CTAP error). Accounts at a site that already has a key reuse it. The firmware
   tells a free slot from a used one by asking the chip for the public key (status 0x0F = no private key there); a bus
   error is never taken for "free". A slot that holds a key but belongs to no site is handed to the next new site as it
   is (no GenKey).

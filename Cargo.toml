@@ -55,9 +55,13 @@ futures = { version = "0.3.17", default-features = false, features = [
 embedded-storage = { version = "0.3" }
 static_cell = "2"
 critical-section = "1"
-rand_core = { version = "0.6", default-features = false }
-rand_chacha = { version = "0.3", default-features = false } # ChaCha20 DRBG seeded by the secure element (src/env/rng.rs)
-sha2 = { version = "0.10", default-features = false }        # digest + handle fingerprint (src/se/ecdsa.rs)
+sha2 = { version = "0.11", default-features = false }        # digest + handle fingerprint (src/se/ecdsa.rs), PUF check, HMAC-DRBG (same generation as OpenSK)
+hmac = { version = "0.13", default-features = false }         # key derivation / nonces / DRBG (src/seal.rs, src/puf.rs, src/env/rng.rs)
+subtle = { version = "2", default-features = false }          # constant-time PUF check
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# AES-256-GCM for every sensitive value in flash (src/seal.rs). No std, no RNG: nonces are derived.
+# 0.10 is the stable line; it brings its own `aes` 0.8 next to the `aes` 0.9 of OpenSK (a few KiB of flash).
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "zeroize"] }
 heapless = "0.8.0"
 portable-atomic = { version = "1.7.0", features = ["critical-section"] }
 embedded-alloc = "0.5.1"

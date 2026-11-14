@@ -158,8 +158,11 @@ struct FlashStats {
 }
 
 fn flash_stats() -> FlashStats {
-    let (mut all, dir_bytes) = dirlog::usage(dir_flash::pages());
-    let (sig, sig_bytes) = tallylog::usage(tally_flash::page());
+    // Both are stored sealed: `pages()` / `page()` decrypt them (blank until the PUF key is installed).
+    let dir_pages = dir_flash::pages();
+    let (mut all, dir_bytes) = dirlog::usage(dir_flash::sectors(&dir_pages));
+    let tally_page = tally_flash::page();
+    let (sig, sig_bytes) = tallylog::usage(&tally_page);
     let dir_chips = all.len();
     for s in &sig {
         if !all.contains(s) {

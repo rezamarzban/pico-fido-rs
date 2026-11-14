@@ -5,6 +5,11 @@
 
 extern crate alloc;
 
+#[path = "../../../src/seal.rs"]
+mod seal;
+#[path = "../../../src/sealed_log.rs"]
+mod sealed_log;
+
 mod se {
     #[path = "../../../../src/se/proto.rs"]
     pub mod proto;
@@ -22,12 +27,13 @@ mod se {
 
 use opensk::api::crypto::ec_signing::{EcPublicKey, EcSecretKey, EcSignature};
 use opensk::api::crypto::Crypto;
+use opensk::api::rng::rand_core as rc10; // rand_core 0.10, the one OpenSK uses
 use opensk::api::rng::Rng;
 use p256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use rand_chacha::ChaCha8Rng;
-use rand_core::{CryptoRng, RngCore, SeedableRng};
+use rand_core::{RngCore, SeedableRng};
 use se::chip::{Atecc, Bus, ChipOps};
 use se::ecdsa::{self, ChipSerial, DirStore, SeEcdsa, SigTally, SeSecretKey, ATTEST_SLOT, COUNTER_MAX, DIR_ENTRY, DIR_LEN, FIRST_CRED_SLOT, HANDLE_ATTEST, SLOTS};
 use se::dirlog::{self, DirPlan, Plan, Step};
@@ -494,13 +500,13 @@ fn wake_is_retried_then_fails() {
 static SERIAL: Mutex<()> = Mutex::new(());
 
 struct TestRng(ChaCha8Rng);
-impl RngCore for TestRng {
-    fn next_u32(&mut self) -> u32 { self.0.next_u32() }
-    fn next_u64(&mut self) -> u64 { self.0.next_u64() }
-    fn fill_bytes(&mut self, d: &mut [u8]) { self.0.fill_bytes(d) }
-    fn try_fill_bytes(&mut self, d: &mut [u8]) -> Result<(), rand_core::Error> { self.0.try_fill_bytes(d); Ok(()) }
+impl rc10::TryRng for TestRng {
+    type Error = core::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> { Ok(self.0.next_u32()) }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> { Ok(self.0.next_u64()) }
+    fn try_fill_bytes(&mut self, d: &mut [u8]) -> Result<(), Self::Error> { self.0.fill_bytes(d); Ok(()) }
 }
-impl CryptoRng for TestRng {}
+impl rc10::TryCryptoRng for TestRng {}
 impl Rng for TestRng {}
 
 fn install(limited: bool, c0: u32) -> (std::sync::MutexGuard<'static, ()>, Arc<Mutex<Model>>) {
@@ -514,7 +520,7 @@ fn install(limited: bool, c0: u32) -> (std::sync::MutexGuard<'static, ()>, Arc<M
 }
 
 fn check_sig(k: &SeSecretKey, msg: &[u8]) {
-    let der = k.sign(msg).to_der();
+    let der = k.sign(msg).unwrap().to_der();
     let (mut x, mut y) = ([0u8; 32], [0u8; 32]);
     k.public_key().to_coordinates(&mut x, &mut y);
     let mut sec1 = vec![4u8];
@@ -529,7 +535,7 @@ fn check_sig(k: &SeSecretKey, msg: &[u8]) {
 fn key_lifecycle_through_opensk_traits() {
     let (_g, _m) = install(false, 0);
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(1));
-    let k = SeSecretKey::random(&mut rng);
+    let k = SeSecretKey::random(&mut rng).unwrap();
     let handle = k.export();
     assert_eq!(handle.len(), 32);
     assert_eq!(handle, k.export(), "export is deterministic (OpenSK requirement)");
@@ -561,23 +567,21 @@ fn key_lifecycle_through_opensk_traits() {
     assert!(SeSecretKey::import(&bad).is_none());
 }
 
+/// A registration that cannot be served is an error to OpenSK now (it used to be a panic).
 fn registration_panics(rng: &mut TestRng) -> bool {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = SeSecretKey::random(rng);
-    }))
-    .is_err()
+    SeSecretKey::random(rng).is_err()
 }
 
 #[test]
 fn keys_are_never_overwritten_when_all_slots_are_used() {
     let (_g, m) = install(false, 0);
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(2));
-    let keys: Vec<_> = (0..SLOTS as usize).map(|_| SeSecretKey::random(&mut rng)).collect();
+    let keys: Vec<_> = (0..SLOTS as usize).map(|_| SeSecretKey::random(&mut rng).unwrap()).collect();
     let slots: Vec<u8> = keys.iter().map(|k| k.export()[1]).collect();
     let first = FIRST_CRED_SLOT;
     assert_eq!(slots, (first..first + SLOTS).collect::<Vec<_>>(), "free slots are taken in order 1..=9");
     assert_eq!(ecdsa::used_slots(), None, "no scan was run yet");
-    // The 10th registration is refused (panic: the trait cannot return an error) ...
+    // The 10th registration is refused (an error to OpenSK) ...
     assert!(registration_panics(&mut rng));
     assert!(registration_panics(&mut rng), "and again: still refused");
     // ... and nothing was regenerated: GenKey ran exactly once per slot, every old key still works.
@@ -599,13 +603,13 @@ fn used_slots_are_counted_from_the_chip_and_by_new_keys() {
     let (_g, _m) = install(false, 0);
     assert_eq!(ecdsa::scan_slots(), Some(0));
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(8));
-    let _a = SeSecretKey::random(&mut rng);
-    let _b = SeSecretKey::random(&mut rng);
+    let _a = SeSecretKey::random(&mut rng).unwrap();
+    let _b = SeSecretKey::random(&mut rng).unwrap();
     assert_eq!(ecdsa::used_slots(), Some(2));
     // A fresh scan (e.g. after a restart) finds the same keys in the chip.
     assert_eq!(ecdsa::scan_slots(), Some(2));
     // Existing keys are found even if the cache is gone: a new key goes to the next free slot.
-    let c = SeSecretKey::random(&mut rng);
+    let c = SeSecretKey::random(&mut rng).unwrap();
     assert_eq!(c.export()[1], FIRST_CRED_SLOT + 2);
     assert_eq!(ecdsa::used_slots(), Some(3));
 }
@@ -614,7 +618,7 @@ fn used_slots_are_counted_from_the_chip_and_by_new_keys() {
 fn a_bus_error_never_makes_a_used_slot_look_free() {
     let (_g, m) = install(false, 0);
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(10));
-    let k = SeSecretKey::random(&mut rng);
+    let k = SeSecretKey::random(&mut rng).unwrap();
     // The chip stops waking up: reading the slots fails, it must not be taken for "empty".
     m.lock().unwrap().fail_next_wake = 1000;
     assert!(registration_panics(&mut rng));
@@ -629,7 +633,7 @@ fn a_slot_that_refuses_genkey_is_skipped() {
     let (_g, m) = install(false, 0);
     m.lock().unwrap().no_genkey = vec![3, 9];
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(5));
-    let slots: Vec<u8> = (0..SLOTS as usize - 2).map(|_| SeSecretKey::random(&mut rng).export()[1]).collect();
+    let slots: Vec<u8> = (0..SLOTS as usize - 2).map(|_| SeSecretKey::random(&mut rng).unwrap().export()[1]).collect();
     assert_eq!(slots, vec![1, 2, 4, 5, 6, 7, 8], "slots 3 and 9 are never used");
     assert!(registration_panics(&mut rng), "no usable slot left: refused, nothing overwritten");
 }
@@ -640,7 +644,7 @@ fn signatures_are_unlimited_and_not_counted() {
     // to count, but nothing is counted any more, so every signature still verifies.
     let (_g, m) = install(true, COUNTER_MAX);
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(3));
-    let k = SeSecretKey::random(&mut rng);
+    let k = SeSecretKey::random(&mut rng).unwrap();
     for i in 0..50u8 {
         check_sig(&k, &[i; 8]);
     }
@@ -655,7 +659,7 @@ fn signatures_are_unlimited_and_not_counted() {
 fn signing_does_not_use_counter_commands() {
     let (_g, m) = install(false, 0);
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(4));
-    let k = SeSecretKey::random(&mut rng);
+    let k = SeSecretKey::random(&mut rng).unwrap();
     let before = m.lock().unwrap().commands.len();
     check_sig(&k, b"hello");
     let g = m.lock().unwrap();
@@ -771,7 +775,7 @@ fn credential_registration_never_touches_the_attestation_slot() {
     let handle = provision_attestation(&m);
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(9));
     for _ in 0..SLOTS as usize {
-        let k = SeSecretKey::random(&mut rng);
+        let k = SeSecretKey::random(&mut rng).unwrap();
         assert!((FIRST_CRED_SLOT..FIRST_CRED_SLOT + SLOTS).contains(&k.export()[1]));
     }
     assert!(registration_panics(&mut rng));
@@ -790,13 +794,13 @@ impl HintRng {
         HintRng { inner: TestRng(ChaCha8Rng::seed_from_u64(seed)), hint: None }
     }
 }
-impl RngCore for HintRng {
-    fn next_u32(&mut self) -> u32 { self.inner.next_u32() }
-    fn next_u64(&mut self) -> u64 { self.inner.next_u64() }
-    fn fill_bytes(&mut self, d: &mut [u8]) { self.inner.fill_bytes(d) }
-    fn try_fill_bytes(&mut self, d: &mut [u8]) -> Result<(), rand_core::Error> { self.inner.try_fill_bytes(d) }
+impl rc10::TryRng for HintRng {
+    type Error = core::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> { Ok(self.inner.0.next_u32()) }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> { Ok(self.inner.0.next_u64()) }
+    fn try_fill_bytes(&mut self, d: &mut [u8]) -> Result<(), Self::Error> { self.inner.0.fill_bytes(d); Ok(()) }
 }
-impl CryptoRng for HintRng {}
+impl rc10::TryCryptoRng for HintRng {}
 impl Rng for HintRng {
     fn set_rp_id_hash(&mut self, h: &[u8; 32]) {
         self.hint = Some(*h);
@@ -809,14 +813,12 @@ impl Rng for HintRng {
 /// What OpenSK does for a registration: announce the RP, then create the key.
 fn register(rng: &mut HintRng, rp: u8) -> SeSecretKey {
     rng.set_rp_id_hash(&[rp; 32]);
-    SeSecretKey::random(rng)
+    SeSecretKey::random(rng).unwrap()
 }
 
 fn register_panics(rng: &mut HintRng, rp: u8) -> bool {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = register(rng, rp);
-    }))
-    .is_err()
+    rng.set_rp_id_hash(&[rp; 32]);
+    SeSecretKey::random(rng).is_err()
 }
 
 #[test]
@@ -843,8 +845,8 @@ fn the_hint_is_used_once_and_without_it_every_key_is_new() {
     let mut rng = HintRng::new(21);
     let a = register(&mut rng, 1);
     // No announcement: not the previous site, a fresh slot (and nothing is recorded for it).
-    let c = SeSecretKey::random(&mut rng);
-    let d = SeSecretKey::random(&mut rng);
+    let c = SeSecretKey::random(&mut rng).unwrap();
+    let d = SeSecretKey::random(&mut rng).unwrap();
     assert_eq!(a.export()[1], FIRST_CRED_SLOT);
     assert_eq!(c.export()[1], FIRST_CRED_SLOT + 1);
     assert_eq!(d.export()[1], FIRST_CRED_SLOT + 2);
@@ -940,8 +942,8 @@ fn slots_that_already_hold_a_key_are_taken_over_one_per_site() {
     let (_g, m) = install(false, 0);
     // Slots 1 and 2 already hold keys, the flash directory is empty (e.g. a freshly erased Pico).
     let mut rng = HintRng::new(26);
-    let _ = SeSecretKey::random(&mut rng);
-    let _ = SeSecretKey::random(&mut rng);
+    let _ = SeSecretKey::random(&mut rng).unwrap();
+    let _ = SeSecretKey::random(&mut rng).unwrap();
     assert_eq!(m.lock().unwrap().created.len(), 2);
     let k1 = register(&mut rng, 1);
     let k2 = register(&mut rng, 2);
@@ -1297,12 +1299,12 @@ fn the_rp_tag_is_128_bits() {
     let mut h2 = h1;
     h2[12] ^= 0x01;
     rng.set_rp_id_hash(&h1);
-    let k1 = SeSecretKey::random(&mut rng);
+    let k1 = SeSecretKey::random(&mut rng).unwrap();
     rng.set_rp_id_hash(&h2);
-    let k2 = SeSecretKey::random(&mut rng);
+    let k2 = SeSecretKey::random(&mut rng).unwrap();
     assert_ne!(k1.export()[1], k2.export()[1], "different sites never share a key slot");
     rng.set_rp_id_hash(&h1);
-    assert_eq!(SeSecretKey::random(&mut rng).export(), k1.export(), "the same site still gets its own key back");
+    assert_eq!(SeSecretKey::random(&mut rng).unwrap().export(), k1.export(), "the same site still gets its own key back");
 }
 
 #[test]
@@ -1360,12 +1362,9 @@ fn a_power_cut_while_the_directory_is_compacted_never_frees_a_used_key() {
 fn a_chip_that_cannot_sign_is_a_hard_error_not_a_zero_signature() {
     let (_g, m) = install(false, 0);
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(62));
-    let k = SeSecretKey::random(&mut rng);
+    let k = SeSecretKey::random(&mut rng).unwrap();
     m.lock().unwrap().fail_next_wake = 1000;
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = k.sign(b"nobody gets a bogus signature");
-    }));
-    assert!(r.is_err());
+    assert!(k.sign(b"nobody gets a bogus signature").is_err());
     m.lock().unwrap().fail_next_wake = 0;
     check_sig(&k, b"the chip is back");
 }
@@ -1640,4 +1639,175 @@ fn two_chips_never_share_a_slot_owner_even_with_equal_slot_numbers() {
     }
     assert_eq!(register(&mut rng, 7).export()[1], 1);
     assert_eq!(register(&mut rng, 8).export()[1], 2);
+}
+
+
+// ---- AES-256-GCM sealing of the flash data (src/seal.rs, src/sealed_log.rs) ------------------------
+
+fn unhex(h: &str) -> Vec<u8> {
+    (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
+}
+
+fn root() -> [u8; 32] {
+    core::array::from_fn(|i| i as u8)
+}
+
+/// Vectors from host-test/seal_ref.py (an independent Python implementation of the same scheme).
+#[test]
+fn sealing_matches_the_python_reference() {
+    let s = seal::Sealer::new(&root(), seal::Domain::Store);
+    let mut aad = b"pfrs/store/v1".to_vec();
+    aad.extend_from_slice(&7u32.to_le_bytes());
+    let want = unhex("ff31ba0382f218bd70c6ac5d8027ab3e32b48afe3567f498156461b832fea6308216a1de14ae73");
+    assert_eq!(s.seal(&aad, b"hello flash"), want);
+    assert_eq!(s.open(&aad, &want).as_deref(), Some(&b"hello flash"[..]));
+
+    let d = seal::Sealer::new(&root(), seal::Domain::Dir);
+    let mut aad = b"pfrs/dir/v1/rec".to_vec();
+    aad.extend_from_slice(&3u16.to_le_bytes());
+    let rec: Vec<u8> = (0..32).collect();
+    let want = unhex("f276eaa431aacdef7f33fcb3fd5d963b10e28ee81b8516102e139536604a58250034566f4e81eb7c77ca4f20ee13b5df45783de55c6586d33a9fb5f7");
+    assert_eq!(d.seal(&aad, &rec), want);
+}
+
+#[test]
+fn sealed_data_is_rejected_when_changed_moved_or_under_another_key() {
+    let s = seal::Sealer::new(&root(), seal::Domain::Store);
+    let sealed = s.seal(b"aad", b"secret");
+    assert_eq!(sealed.len(), 6 + seal::OVERHEAD);
+    assert!(s.open(b"aad", &sealed).is_some());
+    assert!(s.open(b"other", &sealed).is_none(), "wrong associated data");
+    for i in 0..sealed.len() {
+        let mut bad = sealed.clone();
+        bad[i] ^= 1;
+        assert!(s.open(b"aad", &bad).is_none(), "byte {i} changed");
+    }
+    assert!(s.open(b"aad", &sealed[..seal::OVERHEAD - 1]).is_none(), "too short");
+    let other_domain = seal::Sealer::new(&root(), seal::Domain::Dir);
+    assert!(other_domain.open(b"aad", &sealed).is_none());
+    let mut r2 = root();
+    r2[0] ^= 1;
+    assert!(seal::Sealer::new(&r2, seal::Domain::Store).open(b"aad", &sealed).is_none());
+    // Empty values (OpenSK markers) work too, and the same input seals to the same bytes.
+    assert_eq!(s.open(b"a", &s.seal(b"a", b"")).as_deref(), Some(&b""[..]));
+    assert_eq!(s.seal(b"aad", b"secret"), sealed);
+    assert_ne!(s.seal(b"aad", b"secreT"), sealed);
+}
+
+/// The plaintext planners of dirlog / tallylog run unchanged on a sealed flash model: after every
+/// update the decrypted page equals the plaintext model, and no chip serial or site tag is visible
+/// in the physical bytes.
+#[test]
+fn directory_and_counter_work_on_sealed_sectors() {
+    let sd = seal::Sealer::new(&root(), seal::Domain::Dir);
+    let mut phys = [vec![0xFFu8; sealed_log::DIR.phys_len], vec![0xFFu8; sealed_log::DIR.phys_len]];
+    let mut plain = Page::blank();
+    let tag = |v: u8| dir_with(&[(0, v), (1, v.wrapping_add(1))]);
+    for v in 1..=140u8 {
+        let d = tag(v);
+        let logical = [sealed_log::open_page(&sealed_log::DIR, &sd, &phys[0]), sealed_log::open_page(&sealed_log::DIR, &sd, &phys[1])];
+        let plan = dirlog::plan([&logical[0][..], &logical[1][..]], &S1, &d);
+        for step in plan.steps() {
+            match step {
+                Step::Erase { sector } => phys[sector].fill(0xFF),
+                Step::Program { sector, offset, data } => {
+                    for w in sealed_log::seal_program(&sealed_log::DIR, &sd, offset, &data).expect("aligned") {
+                        for (i, b) in w.data.iter().enumerate() {
+                            phys[sector][w.offset + i] &= b; // flash can only clear bits
+                        }
+                    }
+                }
+            }
+        }
+        plain.apply(dirlog::plan(plain.s(), &S1, &d));
+        let logical = [sealed_log::open_page(&sealed_log::DIR, &sd, &phys[0]), sealed_log::open_page(&sealed_log::DIR, &sd, &phys[1])];
+        assert_eq!(dirlog::scan([&logical[0][..], &logical[1][..]], &S1).0, d, "update {v}");
+    }
+    for p in &phys {
+        assert!(!p.windows(9).any(|w| w == S1), "the chip serial is visible in flash");
+    }
+
+    // A torn record (half programmed) is a used but invalid position, never a wrong entry.
+    let mut torn = phys.clone();
+    let logical = [sealed_log::open_page(&sealed_log::DIR, &sd, &torn[0]), sealed_log::open_page(&sealed_log::DIR, &sd, &torn[1])];
+    let (a, _) = dirlog::active([&logical[0][..], &logical[1][..]]).unwrap();
+    let (_, used, _) = dirlog::scan([&logical[0][..], &logical[1][..]], &S1);
+    let sr = sealed_log::DIR.sealed_rec();
+    let at = sealed_log::DIR.header_len + used * sr;
+    if at + sr <= torn[a].len() {
+        torn[a][at..at + 20].fill(0x00);
+        let l2 = [sealed_log::open_page(&sealed_log::DIR, &sd, &torn[0]), sealed_log::open_page(&sealed_log::DIR, &sd, &torn[1])];
+        assert_eq!(dirlog::scan([&l2[0][..], &l2[1][..]], &S1).0, tag(140));
+        assert_eq!(dirlog::scan([&l2[0][..], &l2[1][..]], &S1).1, used + 1, "the torn record still takes a position");
+    }
+
+    // Under another key everything reads as an empty directory (records fail authentication).
+    let mut r2 = root();
+    r2[5] ^= 0xFF;
+    let other = seal::Sealer::new(&r2, seal::Domain::Dir);
+    let l3 = [sealed_log::open_page(&sealed_log::DIR, &other, &phys[0]), sealed_log::open_page(&sealed_log::DIR, &other, &phys[1])];
+    assert_eq!(dirlog::scan([&l3[0][..], &l3[1][..]], &S1).0, [0u8; DIR_LEN]);
+
+    // Signature counter.
+    let st = seal::Sealer::new(&root(), seal::Domain::Tally);
+    let mut tp = vec![0xFFu8; sealed_log::TALLY.phys_len];
+    let mut cache = vec![0xFFu8; sealed_log::TALLY.logical_len];
+    for n in 1..=600u32 {
+        let plan = tallylog::plan(&cache, &S1, n);
+        match &plan {
+            Plan::Nothing => {}
+            Plan::Append { offset, data } => {
+                for w in sealed_log::seal_program(&sealed_log::TALLY, &st, *offset, data).unwrap() {
+                    for (i, b) in w.data.iter().enumerate() {
+                        tp[w.offset + i] &= b;
+                    }
+                }
+                cache[*offset..*offset + data.len()].copy_from_slice(data);
+            }
+            Plan::Rewrite { data } => {
+                tp.fill(0xFF);
+                for w in sealed_log::seal_program(&sealed_log::TALLY, &st, 0, data).unwrap() {
+                    tp[w.offset..w.offset + w.data.len()].copy_from_slice(&w.data);
+                }
+                cache.fill(0xFF);
+                cache[..data.len()].copy_from_slice(data);
+            }
+        }
+        assert_eq!(sealed_log::open_page(&sealed_log::TALLY, &st, &tp), cache, "count {n}");
+        assert_eq!(tallylog::scan(&cache, &S1).0, n);
+    }
+    assert!(!tp.windows(9).any(|w| w == S1), "the chip serial is visible in flash");
+}
+
+#[test]
+fn sealed_layouts_fit_the_plaintext_formats() {
+    assert_eq!(sealed_log::DIR.max_recs, dirlog::MAX_RECS);
+    assert_eq!(sealed_log::DIR.rec, dirlog::REC);
+    assert_eq!(sealed_log::DIR.header_len, dirlog::HEADER_LEN);
+    assert_eq!(sealed_log::DIR.logical_len, dirlog::PAGE);
+    assert_eq!(sealed_log::TALLY.max_recs, tallylog::MAX_RECS);
+    assert_eq!(sealed_log::TALLY.rec, tallylog::REC);
+    assert_eq!(sealed_log::TALLY.header_len, tallylog::HEADER.len());
+    assert!(sealed_log::DIR.fits() && sealed_log::TALLY.fits());
+}
+
+
+/// src/env/rng.rs: HMAC_DRBG (SHA-256) seeded with bytes 0..32 gives this stream (host-test/seal_ref.py).
+#[test]
+fn drbg_matches_the_python_reference() {
+    use hmac::{Hmac, KeyInit, Mac};
+    fn h(k: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
+        let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(k).unwrap();
+        for p in parts { m.update(p); }
+        m.finalize().into_bytes().into()
+    }
+    // The same steps as env/rng.rs (that file needs defmt and the chip, so the logic is mirrored).
+    let seed: [u8; 32] = core::array::from_fn(|i| i as u8);
+    let (mut k, mut v) = ([0u8; 32], [1u8; 32]);
+    k = h(&k, &[&v, &[0x00], &seed]); v = h(&k, &[&v]);
+    k = h(&k, &[&v, &[0x01], &seed]); v = h(&k, &[&v]);
+    let mut out = Vec::new();
+    while out.len() < 40 { v = h(&k, &[&v]); out.extend_from_slice(&v); }
+    out.truncate(40);
+    assert_eq!(out, unhex("3226437dd9f98b17591aad731383303213439f64d029a5764e84e36256ddeb79e2d0f9bbbac0520e"));
 }

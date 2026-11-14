@@ -10,8 +10,14 @@ publish = false
 
 [dependencies]
 opensk = { path = "../../third_party/OpenSK/libraries/opensk", default-features = false, features = ["std"] }
-sha2 = "0.10"
+sha2 = "0.11"
 critical-section = { version = "1", features = ["std"] }
+# p256 0.13 / rand_chacha 0.3 / rand_core 0.6 only drive the software model of the chip (the test
+# crate's own copies, independent of the generation OpenSK uses: rand_core 0.10, p256 0.14).
 p256 = { version = "0.13", features = ["ecdsa"] }
 rand_chacha = "0.3"
 rand_core = "0.6"
+# src/seal.rs / src/sealed_log.rs (AES-256-GCM sealing of the flash data)
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+hmac = "0.13"
+zeroize = "1"
