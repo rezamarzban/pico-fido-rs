@@ -117,7 +117,7 @@ pub fn plan(page: &[u8], serial: &ChipSerial, total: u32) -> Plan {
     }
     let mut others: Vec<(ChipSerial, u32)> = if valid { totals(page) } else { Vec::new() };
     others.retain(|e| &e.0 != serial);
-    others.sort_by(|a, b| b.1.cmp(&a.1)); // highest totals first (stable: ties keep log order)
+    others.sort_by_key(|e| core::cmp::Reverse(e.1)); // highest totals first (stable: ties keep log order)
     others.truncate(MAX_CHIPS - 1);
     let mut data = Vec::with_capacity(HEADER.len() + (others.len() + 1) * REC);
     data.extend_from_slice(&HEADER);

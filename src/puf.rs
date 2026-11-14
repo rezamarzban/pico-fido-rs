@@ -1,17 +1,19 @@
-//! SRAM PUF: the root of the flash encryption keys, from the power-up state of 1 KiB of RAM that
-//! nothing writes. Adapted from the `openSK-based-se5` branch (same fuzzy extractor), with a
-//! 256-bit secret and a single helper sector.
+//! SRAM PUF: the root of the flash encryption keys, from the power-up state of 4 KiB of RAM that
+//! nothing writes. The arithmetic (pair-XOR debiasing, repetition code, bit-sliced majority vote) is in
+//! `puf_code.rs`, which is host-tested; this module reads the RAM and the helper sector.
 //!
-//! * `build.rs` carves `REGION_BYTES` at 0x2000_0000 out of the linker's RAM, so no startup code,
-//!   `.bss`, `.data`, heap or stack ever touches it; this module only READS it. (It is therefore
-//!   still intact after a warm reset.)
-//! * Fuzzy extractor (code offset, repetition code, interleaved): the 256-bit secret `s` is repeated
-//!   `REP` = 31 times (secret bit `i` -> codeword bit `k*256 + i`). Enrolment stores the public
-//!   helper `W = R xor C(s)` and an 8-byte check in one flash sector. Later `R'` is decoded by
-//!   majority vote of `R' xor W`; the check tells a good decode from a bad one. Up to 15 of 31
-//!   votes per bit may be wrong: a raw bit-error rate up to ~10 % decodes with a failure
-//!   probability below 2e-6 per boot (host simulation, see `host-test/puf_sim.py`). The measured
-//!   error count is logged on every boot (`puf: ... bit errors`).
+//! * `build.rs` keeps `REGION_BYTES` at `REGION_ADDR` (the top of the striped SRAM, 0x2003_F000) out
+//!   of the linker's RAM, so no startup code, `.bss`, `.data`, heap or stack ever touches it; this module
+//!   only READS it. (It is therefore still intact after a warm reset.) It is at the TOP so that the
+//!   stack, which flip-link places at the BOTTOM of RAM, still runs into unmapped memory (a fault) on
+//!   overflow instead of silently into the PUF.
+//! * Fuzzy extractor: see `puf_code.rs`. Enrolment stores the public helper `W = R xor C(s)` and an
+//!   8-byte check in one flash sector. Later the sample is decoded by majority vote of `R' xor W`; the
+//!   check tells a good decode from a bad one. A raw bit-error rate of 10 % decodes with a failure
+//!   probability of about 1e-6 per boot (`host-test/puf_sim.py`). The measured error count and the
+//!   bias of the sample are logged on every boot (`puf: ...`).
+//! * Enrolment is refused when the pair stream is not balanced (46..54 % ones): on a heavily biased
+//!   chip the helper data would give a secret that is much weaker than 256 bits (`puf_code.rs`).
 //! * Root key = HMAC-SHA-256(s, "sram-puf-key-v1"). It is derived on demand and never kept in RAM
 //!   (`key()` returns a `Zeroizing` value); `seal::Sealer` derives the AES-256-GCM keys from it.
 //! * Enrolment only happens on a power-on reset (`CHIP_RESET.HAD_POR`): after a warm reset the RAM
@@ -19,34 +21,38 @@
 //!   bind the key to a pattern that is not the chip's own.
 //!
 //! What it buys, honestly: a copy of the FLASH alone (dump, backup, desoldered chip read in a
-//! programmer) contains only ciphertext. It does NOT stop anyone who can run code on the device
-//! (BOOTSEL / SWD): they can read the same RAM at power-up. The 256 bits are an upper bound: the
-//! real strength is limited by the min-entropy of this chip's SRAM pattern.
+//! programmer) contains only ciphertext. It does NOT stop anyone who has the device: BOOTSEL and
+//! picotool (or SWD) can very likely read the same RAM at power-up, with no code of their own. The 256
+//! bits are an upper bound: the real strength is limited by the min-entropy of this chip's SRAM.
 
 use core::cell::{Cell, RefCell};
 use critical_section::Mutex;
 use defmt::{info, warn};
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
+
+use crate::puf_code::{self as code, CODE_BITS, CODE_WORDS, SEC_WORDS};
 
 use crate::keys::Fl;
 use crate::layout::PUF_START;
 use crate::seal::{Domain, Sealer};
 
-/// RAM bytes reserved at the start of SRAM (must match build.rs).
-pub const REGION_BYTES: usize = 1024;
-const REGION_ADDR: usize = 0x2000_0000;
+/// RAM bytes reserved for the PUF (must match build.rs).
+pub const REGION_BYTES: usize = code::REGION_WORDS * 4;
+/// Top of the striped SRAM (SRAM0-3, 0x2000_0000..0x2004_0000), 4 KiB below it.
+pub const REGION_ADDR: usize = 0x2003_F000;
 
-const SEC_BITS: usize = 256;
-const SEC_BYTES: usize = SEC_BITS / 8;
-const REP: usize = 31;
-const CODE_BITS: usize = SEC_BITS * REP; // 7936
-const CODE_BYTES: usize = CODE_BITS / 8; // 992
-const _: () = core::assert!(CODE_BITS % 8 == 0 && CODE_BYTES <= REGION_BYTES && CODE_BYTES % 4 == 0);
+const _: () = core::assert!(
+    REGION_ADDR + REGION_BYTES == 0x2004_0000,
+    "the PUF region ends at the top of SRAM0-3"
+);
 
-const MAGIC: [u8; 4] = *b"PUF2";
+const SEC_BYTES: usize = SEC_WORDS * 4;
+const CODE_BYTES: usize = CODE_WORDS * 4; // 2016
+
+const MAGIC: [u8; 4] = *b"PUF3";
 const CHECK_LEN: usize = 8;
 const HASH_LEN: usize = 16;
 const IMG_LEN: usize = 4 + CHECK_LEN + CODE_BYTES + HASH_LEN;
@@ -70,7 +76,7 @@ pub enum Status {
 /// Public helper data of the enrolment.
 struct Slot {
     check: [u8; CHECK_LEN],
-    helper: [u8; CODE_BYTES],
+    helper: [u32; CODE_WORDS],
 }
 
 pub struct Puf {
@@ -79,63 +85,25 @@ pub struct Puf {
     slot: Option<Slot>,
 }
 
-fn bit(buf: &[u8], i: usize) -> u8 {
-    (buf[i >> 3] >> (i & 7)) & 1
-}
-
 fn mac(s: &[u8; SEC_BYTES], label: &[u8]) -> [u8; 32] {
-    let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(s).expect("HMAC takes any key length");
+    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(s).expect("HMAC takes any key length");
     m.update(label);
     m.finalize().into_bytes().into()
 }
 
-fn read_sample(out: &mut [u8; CODE_BYTES]) {
-    for i in (0..CODE_BYTES).step_by(4) {
+/// The pair stream of this boot's RAM sample, and how many raw cells were ones.
+fn read_sample() -> (Zeroizing<[u32; CODE_WORDS]>, u32) {
+    let mut raw_ones = 0;
+    let r = code::pair_stream(
         // SAFETY: the region is reserved in memory.x (build.rs), mapped SRAM, 4-byte aligned and
         // only read here.
-        let w = unsafe { ((REGION_ADDR + i) as *const u32).read_volatile() };
-        out[i..i + 4].copy_from_slice(&w.to_le_bytes());
-    }
+        |i| unsafe { ((REGION_ADDR + 4 * i) as *const u32).read_volatile() },
+        &mut raw_ones,
+    );
+    (Zeroizing::new(r), raw_ones)
 }
 
-fn encode(s: &[u8; SEC_BYTES]) -> [u8; CODE_BYTES] {
-    let mut c = [0u8; CODE_BYTES];
-    for k in 0..REP {
-        for i in 0..SEC_BITS {
-            if bit(s, i) == 1 {
-                let b = k * SEC_BITS + i;
-                c[b >> 3] |= 1 << (b & 7);
-            }
-        }
-    }
-    c
-}
-
-/// Majority decode of `x`; also returns how many bits disagreed with the decoded word.
-fn decode(x: &[u8; CODE_BYTES]) -> ([u8; SEC_BYTES], u32) {
-    let mut s = [0u8; SEC_BYTES];
-    let mut errors = 0u32;
-    for i in 0..SEC_BITS {
-        let mut ones = 0usize;
-        for k in 0..REP {
-            ones += bit(x, k * SEC_BITS + i) as usize;
-        }
-        if ones > REP / 2 {
-            s[i >> 3] |= 1 << (i & 7);
-            errors += (REP - ones) as u32;
-        } else {
-            errors += ones as u32;
-        }
-    }
-    (s, errors)
-}
-
-/// Does the RAM sample look like a real power-up pattern (roughly balanced, not stuck / cleared)?
-fn sample_plausible(r: &[u8; CODE_BYTES]) -> bool {
-    let ones: u32 = r.iter().map(|b| b.count_ones()).sum();
-    (CODE_BITS as u32 * 25 / 100..=CODE_BITS as u32 * 75 / 100).contains(&ones)
-}
-
+#[allow(clippy::large_enum_variant)] // short-lived, on the stack of `open`
 enum Parsed {
     Blank,
     Valid(Slot),
@@ -151,11 +119,13 @@ fn parse(img: &[u8; IMG_LEN]) -> Parsed {
     {
         let mut s = Slot {
             check: [0; CHECK_LEN],
-            helper: [0; CODE_BYTES],
+            helper: [0; CODE_WORDS],
         };
         s.check.copy_from_slice(&img[4..4 + CHECK_LEN]);
-        s.helper
-            .copy_from_slice(&img[4 + CHECK_LEN..4 + CHECK_LEN + CODE_BYTES]);
+        for (i, h) in s.helper.iter_mut().enumerate() {
+            let o = 4 + CHECK_LEN + 4 * i;
+            *h = u32::from_le_bytes([img[o], img[o + 1], img[o + 2], img[o + 3]]);
+        }
         return Parsed::Valid(s);
     }
     Parsed::Damaged
@@ -201,7 +171,7 @@ impl Puf {
     }
 
     /// Can a first enrolment happen now? Needs an erased helper sector, a power-on reset and a RAM
-    /// sample that looks like a real power-up pattern.
+    /// sample that looks like a real, balanced power-up pattern.
     pub fn can_enroll(&self) -> bool {
         if self.status != Status::Blank {
             return false;
@@ -210,11 +180,13 @@ impl Puf {
             warn!("puf: not a power-on reset, cannot enrol; unplug for 10 s and retry");
             return false;
         }
-        let mut r = Zeroizing::new([0u8; CODE_BYTES]);
-        read_sample(&mut r);
-        let ok = sample_plausible(&r);
+        let (r, raw_ones) = read_sample();
+        let ok = code::plausible(raw_ones, &r);
         if !ok {
-            warn!("puf: the RAM sample is not usable (stuck or cleared RAM)");
+            warn!(
+                "puf: the RAM sample is not usable (stuck, cleared or too biased): raw {} per mille ones",
+                raw_ones as usize * 1000 / (2 * CODE_BITS)
+            );
         }
         ok
     }
@@ -226,18 +198,15 @@ impl Puf {
         if !self.can_enroll() {
             return false;
         }
-        let mut r = Zeroizing::new([0u8; CODE_BYTES]);
-        read_sample(&mut r);
-        let c = Zeroizing::new(encode(secret));
+        let (r, _) = read_sample();
+        let c = Zeroizing::new(code::encode(&code::words_of(secret)));
         let mut img = [0u8; IMG_LEN];
         img[..4].copy_from_slice(&MAGIC);
         let chk = Zeroizing::new(mac(secret, b"sram-puf-check-v1"));
         img[4..4 + CHECK_LEN].copy_from_slice(&chk[..CHECK_LEN]);
-        for (i, o) in img[4 + CHECK_LEN..4 + CHECK_LEN + CODE_BYTES]
-            .iter_mut()
-            .enumerate()
-        {
-            *o = r[i] ^ c[i];
+        for i in 0..CODE_WORDS {
+            let o = 4 + CHECK_LEN + 4 * i;
+            img[o..o + 4].copy_from_slice(&(r[i] ^ c[i]).to_le_bytes());
         }
         let h = Sha256::digest(&img[..IMG_LEN - HASH_LEN]);
         img[IMG_LEN - HASH_LEN..].copy_from_slice(&h[..HASH_LEN]);
@@ -276,22 +245,25 @@ impl Puf {
     /// The secret, if this boot's sample decodes with the helper data.
     fn try_decode(&self, log: bool) -> Option<Zeroizing<[u8; SEC_BYTES]>> {
         let slot = self.slot.as_ref()?;
-        let mut r = Zeroizing::new([0u8; CODE_BYTES]);
-        read_sample(&mut r);
-        for (x, w) in r.iter_mut().zip(&slot.helper) {
-            *x ^= w;
+        let (mut x, raw_ones) = read_sample();
+        let ones: u32 = x.iter().map(|w| w.count_ones()).sum();
+        for (v, w) in x.iter_mut().zip(&slot.helper) {
+            *v ^= w;
         }
-        let (s, errors) = decode(&r);
-        let s = Zeroizing::new(s);
+        let sw = Zeroizing::new(code::decode(&x));
+        let s = Zeroizing::new(code::bytes_of(&sw));
         let chk = Zeroizing::new(mac(&s, b"sram-puf-check-v1"));
         let ok = bool::from(chk[..CHECK_LEN].ct_eq(&slot.check));
         if log {
+            let errors = code::bit_errors(&x, &sw);
             info!(
-                "puf: {} bit errors of {} ({} per mille), check {}",
+                "puf: {} bit errors of {} ({} per mille), check {}; ones: raw {} per mille, pairs {} per mille",
                 errors,
                 CODE_BITS,
-                errors * 1000 / CODE_BITS as u32,
-                ok
+                errors as usize * 1000 / CODE_BITS,
+                ok,
+                raw_ones as usize * 1000 / (2 * CODE_BITS),
+                ones as usize * 1000 / CODE_BITS
             );
         }
         if ok {

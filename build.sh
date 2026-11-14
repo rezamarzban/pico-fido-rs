@@ -5,7 +5,7 @@
 #   -s  flash size of your board in MiB (default 2; a standard Raspberry Pi Pico has 2)
 #   -u  build WITH a USB serial number (off by default for privacy; adds the `usb_serial` feature)
 #   -O  build WITHOUT the SSD1306 status display (default: with; the `oled` feature, GP16/GP17)
-#   -t  Rust nightly to use (default: nightly-2026-10-02, the one OpenSK pins, then `nightly`)
+#   -t  Rust nightly to use (default: nightly-2026-06-03, the one OpenSK pins, then `nightly`)
 #   -r  repository URL   (default https://github.com/rezamarzban/pico-fido-rs)
 #   -b  branch           (default openSK-based-se4)
 #   -o  output directory (default ./out)
@@ -101,7 +101,7 @@ echo "Cargo features: $FEATURES"
 
 # OpenSK uses edition 2024 and let-chains, so the old 2025 nightlies cannot compile it.
 # NOTE: embassy-executor 0.6 / embassy-rp 0.2 may not build on a nightly this new (see README).
-if [ -n "$TOOLCHAIN" ]; then CANDIDATES=("$TOOLCHAIN"); else CANDIDATES=(nightly-2026-10-02 nightly); fi
+if [ -n "$TOOLCHAIN" ]; then CANDIDATES=("$TOOLCHAIN"); else CANDIDATES=(nightly-2026-06-03 nightly); fi
 
 BUILT=""
 for t in "${CANDIDATES[@]}"; do

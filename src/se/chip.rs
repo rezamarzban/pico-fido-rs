@@ -26,7 +26,9 @@ pub trait ChipOps {
     fn public_key(&mut self, slot: u8) -> Result<[u8; 64], Error>;
     /// ECDSA P-256 signature r||s over the 32-byte digest, made inside the chip.
     fn sign(&mut self, slot: u8, digest: &[u8; 32]) -> Result<[u8; 64], Error>;
+    #[allow(dead_code)] // the firmware does not count in the chip
     fn counter(&mut self, id: u8) -> Result<u32, Error>;
+    #[allow(dead_code)]
     fn counter_inc(&mut self, id: u8) -> Result<u32, Error>;
     /// Serial number, revision, I2C address and lock state (Info + two config-zone reads).
     fn info(&mut self) -> Result<proto::ChipInfo, Error>;
@@ -43,6 +45,7 @@ impl<B: Bus> Atecc<B> {
         Self { bus }
     }
 
+    #[allow(dead_code)] // host tests
     pub fn into_bus(self) -> B {
         self.bus
     }

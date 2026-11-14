@@ -131,7 +131,7 @@ pub fn seal_program(l: &Layout, s: &Sealer, offset: usize, data: &[u8]) -> Optio
         return Some(out);
     }
     let rel = off - l.header_len;
-    if rel % l.rec != 0 || rest.len() % l.rec != 0 {
+    if !rel.is_multiple_of(l.rec) || !rest.len().is_multiple_of(l.rec) {
         return None;
     }
     let first = rel / l.rec;

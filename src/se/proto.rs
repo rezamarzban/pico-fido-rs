@@ -7,7 +7,9 @@
 //! CRC covers `count .. last data byte`, polynomial 0x8005, bits processed LSB first, sent LSB first.
 
 pub const ADDR_7BIT: u8 = 0x60; // default 8-bit address 0xC0
+#[allow(dead_code)] // used by the host tests and the provisioning tools, not by the firmware
 pub const WORD_RESET: u8 = 0x00;
+#[allow(dead_code)] // used by the host tests and the provisioning tools, not by the firmware
 pub const WORD_SLEEP: u8 = 0x01;
 pub const WORD_IDLE: u8 = 0x02;
 pub const WORD_COMMAND: u8 = 0x03;
@@ -104,7 +106,9 @@ pub const GENKEY_CREATE: u8 = 0x04; // create a new random private key in the sl
 pub const GENKEY_PUBLIC: u8 = 0x00; // compute the public key of the slot's private key
 pub const NONCE_PASSTHROUGH: u8 = 0x03; // load 32 bytes into TempKey unchanged
 pub const SIGN_EXTERNAL: u8 = 0x80; // sign the message digest held in TempKey
+#[allow(dead_code)] // used by the host tests and the provisioning tools, not by the firmware
 pub const COUNTER_READ: u8 = 0x00;
+#[allow(dead_code)] // used by the host tests and the provisioning tools, not by the firmware
 pub const COUNTER_INC: u8 = 0x01;
 pub const RANDOM_MODE: u8 = 0x00; // update the EEPROM seed (normal use)
 pub const INFO_REVISION: u8 = 0x00; // 4 bytes: device revision (00 00 60 xx for the ATECC608)
@@ -150,6 +154,7 @@ pub fn parse_info(revision: &[u8], block0: &[u8], block2: &[u8]) -> Result<ChipI
 }
 
 /// Counter response: 4 bytes little-endian.
+#[allow(dead_code)] // used by the host tests and the provisioning tools, not by the firmware
 pub fn counter_value(payload: &[u8]) -> Result<u32, Error> {
     if payload.len() != 4 {
         return Err(Error::Param);
