@@ -60,8 +60,9 @@ pub const FLASH_SIZE: usize = FLASH_MB * 1024 * 1024;
 /// same area out of the linker's FLASH region: change them together.
 pub const STORE_PAGES: usize = 18;
 // Below the store: site directory sectors A and B (8 KiB each, src/env/dir_flash.rs), the signature
-// counter (12 KiB, src/env/tally_flash.rs), the SRAM-PUF helper sector (4 KiB, src/puf.rs) and the
-// backup of the PUF secret (4 KiB, src/puf_backup.rs): 108 KiB in all, see src/layout.rs. Everything
+// counter (two regions of 12 KiB, src/env/tally_flash.rs), the SRAM-PUF helper sector (4 KiB,
+// src/puf.rs) and the backup of the PUF secret (4 KiB, src/puf_backup.rs): 120 KiB in all, see
+// src/layout.rs. Everything
 // but the helper sector is sealed with AES-256-GCM.
 
 // Heap for OpenSK (alloc): credentials, CBOR, the P-256 software crypto, message buffers.
@@ -217,10 +218,17 @@ fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) 
                 }
             };
             warn!("first start with flash encryption: erasing the store, directory and counter");
-            let wiped = flash
-                .borrow_mut()
-                .blocking_erase((layout::PUF_START + layout::PAGE) as u32, FLASH_SIZE as u32)
-                .is_ok();
+            let wiped = {
+                let mut f = flash.borrow_mut();
+                // Counter region B lies below the backup sector, outside the range above the helper.
+                f.blocking_erase((layout::PUF_START + layout::PAGE) as u32, FLASH_SIZE as u32)
+                    .is_ok()
+                    && f.blocking_erase(
+                        layout::TALLY_B_START as u32,
+                        (layout::TALLY_B_START + layout::TALLY_PHYS) as u32,
+                    )
+                    .is_ok()
+            };
             if !wiped || !puf.enroll(flash, &secret) {
                 error!("puf: enrolment failed");
                 fail(led, status::PUF_FAIL_ENROL);

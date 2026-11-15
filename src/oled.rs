@@ -174,8 +174,8 @@ fn flash_stats() -> FlashStats {
     // Both are stored sealed: `pages()` / `page()` decrypt them (blank until the PUF key is installed).
     let dir_pages = dir_flash::pages();
     let (mut all, dir_bytes) = dirlog::usage(dir_flash::sectors(&dir_pages));
-    let tally_page = tally_flash::page();
-    let (sig, sig_bytes) = tallylog::usage(&tally_page);
+    let tally_pages = tally_flash::pages();
+    let (sig, sig_bytes) = tallylog::usage(tally_flash::sectors(&tally_pages));
     let dir_chips = all.len();
     for s in &sig {
         if !all.contains(s) {

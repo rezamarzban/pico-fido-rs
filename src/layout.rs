@@ -6,12 +6,17 @@
 //!   72 KiB   OpenSK key-value store                      (every value sealed, env/persist.rs)
 //!    8 KiB   site directory sector A                     (every record sealed, env/dir_flash.rs)
 //!    8 KiB   site directory sector B                     (every record sealed, env/dir_flash.rs)
-//!   12 KiB   signature counter                           (every record sealed, env/tally_flash.rs)
+//!   12 KiB   signature counter region A                 (every record sealed, env/tally_flash.rs)
 //!    4 KiB   SRAM-PUF helper data                        (public by design, puf.rs)
 //!    4 KiB   backup of the PUF secret, one record per chip (sealed with the chip's slot-0 public key, puf_backup.rs)
-//!   ---- 108 KiB in total ----
+//!   12 KiB   signature counter region B                 (every record sealed, env/tally_flash.rs)
+//!   ---- 120 KiB in total ----
 //!   firmware image
 //! ```
+//!
+//! Counter region B lies BELOW the backup, not next to region A, so that the helper sector and the backup
+//! stay where they have always been (moving them would make an enrolled device look new). The first-start
+//! wipe therefore erases it explicitly (main.rs).
 //!
 //! The directory sectors and the counter are larger than before (they were 4 KiB each) because every
 //! record carries a 12-byte nonce and a 16-byte GCM tag (`seal::OVERHEAD`): the plaintext log formats
@@ -31,17 +36,22 @@ pub const DIR_PHYS: usize = 2 * PAGE;
 pub const DIR_A_START: usize = STORE_START - DIR_PHYS;
 pub const DIR_B_START: usize = DIR_A_START - DIR_PHYS;
 
-/// The sealed signature counter (a logical 4 KiB `tallylog` page of 255 records of 16 bytes).
+/// One sealed signature-counter region (a logical 4 KiB `tallylog` page of 255 records of 16 bytes).
+/// Like the directory, the counter is copy-on-write between two regions (A, B).
 pub const TALLY_PHYS: usize = 3 * PAGE;
-pub const TALLY_START: usize = DIR_B_START - TALLY_PHYS;
+pub const TALLY_A_START: usize = DIR_B_START - TALLY_PHYS;
 
 /// SRAM-PUF helper sector.
-pub const PUF_START: usize = TALLY_START - PAGE;
+pub const PUF_START: usize = TALLY_A_START - PAGE;
 
 /// Backup of the PUF secret. It lies BELOW the helper sector, outside the area that the first start
 /// wipes (`PUF_START + PAGE ..`), so a lost helper sector does not take the backup with it.
 pub const BACKUP_START: usize = PUF_START - PAGE;
 
-/// Everything from `BACKUP_START` to the end of flash is outside the firmware image.
-pub const RESERVED: usize = FLASH_SIZE - BACKUP_START;
-const _: () = core::assert!(RESERVED == 108 * 1024, "build.rs reserves 108 KiB");
+/// Signature-counter region B. Below the backup, so the first-start wipe (`PUF_START + PAGE ..`) does
+/// not reach it: main.rs erases it separately.
+pub const TALLY_B_START: usize = BACKUP_START - TALLY_PHYS;
+
+/// Everything from `TALLY_B_START` to the end of flash is outside the firmware image.
+pub const RESERVED: usize = FLASH_SIZE - TALLY_B_START;
+const _: () = core::assert!(RESERVED == 120 * 1024, "build.rs reserves 120 KiB");

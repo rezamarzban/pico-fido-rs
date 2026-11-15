@@ -84,8 +84,12 @@ Experimental firmware; read this before relying on it.
   credential ID names the slot), but a new registration may be given a key that an earlier site already uses: those
   two sites could then recognise the same public key. After erasing the flash, register at sites that matter in the
   same order as before, or treat the old credentials as shared.
-* **The signature count is not power-fail safe** (its single page is erased and rewritten when its log is full); it
-  is only shown on the display and nothing depends on it.
+* **The signature count can lag by the signatures in flight.** It is copy-on-write between two flash regions like the
+  site directory, so a power cut during a compaction leaves the old or the new counts, never blank or older ones; the
+  signature that was being counted at that moment may be missing. If a flash write fails the display shows the last
+  value that flash is known to hold and the next successful write catches up. It is only shown on the display and
+  nothing depends on it. After updating from a firmware with the single-page counter the counts start from 0 once
+  (the old page is in another format and is ignored).
 * **Chips used with the previous firmware** kept their site list in data slot 13 (the firmware no longer reads or
   writes it). It is not migrated: the first sites registered afterwards are matched to the existing keys in slot order,
   not to the sites that used them before. The old list stays in the chip until you overwrite that slot yourself.

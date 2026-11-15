@@ -42,17 +42,6 @@ const CHECK_LEN: usize = 6;
 const _: () = assert!(9 + 1 + DIR_ENTRY + CHECK_LEN == REC);
 pub const MAX_RECS: usize = (PAGE - HEADER_LEN) / REC;
 
-/// What to do with a (non-directory) page to store a new value; also used by `tallylog`.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Plan {
-    /// The page already holds exactly this.
-    Nothing,
-    /// Program `data` at byte `offset` of the page (no erase).
-    Append { offset: usize, data: Vec<u8> },
-    /// Erase the page, then program `data` at its start.
-    Rewrite { data: Vec<u8> },
-}
-
 /// One flash operation of a directory update. Execute them strictly in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {

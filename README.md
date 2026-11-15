@@ -40,16 +40,17 @@ answer a refused registration or signature with a CTAP error instead of stopping
 
 ## Flash layout and encryption
 Everything sensitive in the Pico's flash is encrypted with **AES-256-GCM**; the key comes from the **SRAM PUF**
-(`src/puf.rs`, `src/seal.rs`, `src/sealed_log.rs`, `src/layout.rs`). The last **108 KiB** of flash are kept out of the
+(`src/puf.rs`, `src/seal.rs`, `src/sealed_log.rs`, `src/layout.rs`). The last **120 KiB** of flash are kept out of the
 linker's FLASH region by `build.rs`. From the end of flash downwards:
 
 | Area | Size | Content |
 |---|---|---|
 | OpenSK key-value store | 72 KiB | **every value sealed** (PIN hash, master keys, resident credentials, attestation certificate, counters), `src/env/persist.rs` |
 | Site directory sectors A, B | 2 x 8 KiB | **every record sealed** (chip serials, site hashes), `src/env/dir_flash.rs` |
-| Signature counter | 12 KiB | **every record sealed**, `src/env/tally_flash.rs` |
+| Signature counter, region A | 12 KiB | **every record sealed**, `src/env/tally_flash.rs` (copy-on-write between regions A and B, like the directory: a power cut never loses the counts) |
 | SRAM-PUF helper data | 4 KiB | public by design (useless without this chip's SRAM pattern) |
 | Backup of the PUF secret | 4 KiB | one sealed record per chip, `src/puf_backup.rs` (see below); below the helper sector, so the first-start wipe never touches it |
+| Signature counter, region B | 12 KiB | as region A; lies below the backup so that the helper and the backup keep their place; the first-start wipe erases it explicitly |
 
 * **Key.** 4 KiB at the TOP of the striped SRAM (0x2003F000..0x20040000) are carved out of the linker's RAM
   (`build.rs`) and never written (at the top so that flip-link's stack, at the bottom of RAM, still faults on overflow).

@@ -63,7 +63,8 @@ pub const DIR: Layout = Layout {
     phys_len: 8192,
 };
 
-/// Signature counter: 16-byte header, 255 records of 16 bytes (`se/tallylog.rs`), three 4 KiB sectors.
+/// Signature counter: 16-byte header, 255 records of 16 bytes (`se/tallylog.rs`), three 4 KiB sectors
+/// per region, two regions (A, B).
 pub const TALLY: Layout = Layout {
     label: b"pfrs/tally/v1/rec",
     header_len: 16,

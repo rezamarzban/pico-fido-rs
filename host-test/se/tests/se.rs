@@ -41,8 +41,8 @@ use rand_chacha::ChaCha8Rng;
 use rand_core::{CryptoRng, RngCore, SeedableRng};
 use se::chip::{Atecc, Bus, ChipOps};
 use se::ecdsa::{self, ChipSerial, DirStore, SeEcdsa, SigTally, SeSecretKey, ATTEST_SLOT, COUNTER_MAX, DIR_ENTRY, DIR_LEN, FIRST_CRED_SLOT, HANDLE_ATTEST, SLOTS};
-use se::dirlog::{self, DirPlan, Plan, Step};
-use se::tallylog;
+use se::dirlog::{self, DirPlan, Step};
+use se::tallylog::{self, TallyPlan};
 use se::proto::{self, Error};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
@@ -67,29 +67,11 @@ struct Model {
     created: Vec<usize>,   // slots where GenKey(create) ran, in order
     config: Vec<u8>,       // 128-byte config zone (serial number, I2C address, lock bytes)
     pages: [Vec<u8>; 2],   // the two directory sectors of the Pico's flash (all chips), NOT in the chip
-    tpage: Vec<u8>,        // the signature-count page of the Pico's flash (all chips)
+    tpage: [Vec<u8>; 2],   // the two signature-count regions of the Pico's flash (all chips)
     stash: Vec<(ChipSerial, Vec<Option<SigningKey>>)>, // chips that are currently "unplugged": their keys
     dir_fails: bool,       // the flash directory cannot be saved
     dir_cut: Option<(usize, usize)>, // power fails during the next directory save: (whole steps done, bytes of the next step written)
     dir_writes: u32,       // saves of the directory seen
-}
-
-/// Programs / erases a flash page like `env/dir_flash.rs` does (erased = 0xFF, programming ANDs).
-fn apply(page: &mut Vec<u8>, p: Plan) -> bool {
-    let program = |page: &mut Vec<u8>, offset: usize, data: &[u8]| {
-        for (i, b) in data.iter().enumerate() {
-            page[offset + i] &= b;
-        }
-    };
-    match p {
-        Plan::Nothing => {}
-        Plan::Append { offset, data } => program(page, offset, &data),
-        Plan::Rewrite { data } => {
-            *page = vec![0xFF; dirlog::PAGE];
-            program(page, 0, &data);
-        }
-    }
-    true
 }
 
 /// The two directory sectors as the slices `dirlog` works on.
@@ -106,6 +88,13 @@ fn apply_step(pages: &mut [Vec<u8>; 2], step: &Step) {
                 pages[*sector][offset + i] &= b;
             }
         }
+    }
+}
+
+/// Runs a whole signature-counter update on the model.
+fn apply_tally(pages: &mut [Vec<u8>; 2], p: TallyPlan) {
+    for st in p.steps() {
+        apply_step(pages, &st);
     }
 }
 
@@ -156,7 +145,7 @@ impl Model {
 
     /// Signatures counted for chip `serial`.
     fn sigs(&self, serial: &ChipSerial) -> u32 {
-        tallylog::scan(&self.tpage, serial).0
+        tallylog::scan(sec(&self.tpage), serial).0
     }
 }
 
@@ -194,7 +183,7 @@ impl Model {
             rng: Some(ChaCha8Rng::seed_from_u64(7)),
             config: config_zone(),
             pages: [vec![0xFF; dirlog::PAGE], vec![0xFF; dirlog::PAGE]],
-            tpage: vec![0xFF; dirlog::PAGE],
+            tpage: [vec![0xFF; dirlog::PAGE], vec![0xFF; dirlog::PAGE]],
             ..Default::default()
         }
     }
@@ -413,15 +402,15 @@ struct MemTally {
 impl SigTally for MemTally {
     fn select(&mut self, chip: &ChipSerial) {
         self.chip = Some(*chip);
-        self.total = tallylog::scan(&self.m.lock().unwrap().tpage, chip).0;
+        self.total = tallylog::scan(sec(&self.m.lock().unwrap().tpage), chip).0;
     }
 
     fn bump(&mut self) {
         let Some(chip) = self.chip else { return };
         self.total += 1;
         let mut m = self.m.lock().unwrap();
-        let p = tallylog::plan(&m.tpage, &chip, self.total);
-        apply(&mut m.tpage, p);
+        let p = tallylog::plan(sec(&m.tpage), &chip, self.total);
+        apply_tally(&mut m.tpage, p);
     }
 }
 
@@ -1397,7 +1386,7 @@ fn usage_counts_chips_and_bytes_for_the_display() {
     // Blank / foreign page: nothing stored.
     let blank = vec![0xFFu8; dirlog::PAGE];
     assert_eq!(dirlog::usage([&blank, &blank]), (vec![], 0));
-    assert_eq!(tallylog::usage(&blank), (vec![], 0));
+    assert_eq!(tallylog::usage([&blank, &blank]), (vec![], 0));
 
     let mut p = Page::blank();
     p.apply(dirlog::plan(p.s(), &S1, &dir_with(&[(0, 5), (1, 6)])));
@@ -1406,20 +1395,13 @@ fn usage_counts_chips_and_bytes_for_the_display() {
     assert_eq!(chips, vec![S1, S2]);
     assert_eq!(bytes, dirlog::HEADER_LEN + 3 * dirlog::REC);
 
-    let mut t = vec![0xFFu8; dirlog::PAGE];
+    let mut t = TPage::blank();
     for (n, s) in [(1u32, S1), (2, S1), (1, S2)] {
-        match tallylog::plan(&t, &s, n) {
-            Plan::Rewrite { data } => {
-                t.fill(0xFF);
-                t[..data.len()].copy_from_slice(&data);
-            }
-            Plan::Append { offset, data } => t[offset..offset + data.len()].copy_from_slice(&data),
-            _ => {}
-        }
+        t.count(&s, n);
     }
-    let (chips, bytes) = tallylog::usage(&t);
+    let (chips, bytes) = tallylog::usage(t.s());
     assert_eq!(chips, vec![S1, S2]);
-    assert_eq!(bytes, tallylog::HEADER.len() + 3 * tallylog::REC);
+    assert_eq!(bytes, tallylog::HEADER_LEN + 3 * tallylog::REC);
 }
 
 #[test]
@@ -1481,50 +1463,76 @@ fn a_sector_of_an_older_format_is_not_read_as_a_directory() {
     assert_eq!(p.load(), d);
 }
 
+/// The two signature-counter regions of the Pico's flash.
+#[derive(Clone)]
+struct TPage([Vec<u8>; 2]);
+impl TPage {
+    fn blank() -> Self {
+        TPage([vec![0xFF; dirlog::PAGE], vec![0xFF; dirlog::PAGE]])
+    }
+    fn s(&self) -> [&[u8]; 2] {
+        sec(&self.0)
+    }
+    fn apply(&mut self, p: TallyPlan) {
+        apply_tally(&mut self.0, p);
+    }
+    fn program(&mut self, sector: usize, offset: usize, data: &[u8]) {
+        apply_step(&mut self.0, &Step::Program { sector, offset, data: data.to_vec() });
+    }
+    /// Sets the total of `serial` to `n`; returns the plan that was run.
+    fn count(&mut self, serial: &ChipSerial, n: u32) -> TallyPlan {
+        let plan = tallylog::plan(self.s(), serial, n);
+        let steps = plan.steps();
+        for st in &steps {
+            apply_step(&mut self.0, st);
+        }
+        plan
+    }
+    fn sigs(&self, serial: &ChipSerial) -> u32 {
+        tallylog::scan(self.s(), serial).0
+    }
+}
+
 #[test]
 fn signature_counts_are_kept_per_chip() {
-    let mut p = vec![0xFFu8; dirlog::PAGE];
+    let mut p = TPage::blank();
     for (serial, n) in [(S1, 3u32), (S2, 2), (S1, 4)] {
-        let plan = tallylog::plan(&p, &serial, n);
-        assert!(apply(&mut p, plan));
+        p.count(&serial, n);
     }
-    assert_eq!(tallylog::scan(&p, &S1).0, 4);
-    assert_eq!(tallylog::scan(&p, &S2).0, 2);
-    assert_eq!(tallylog::scan(&p, &[9u8; 9]).0, 0);
-    assert_eq!(tallylog::totals(&p), vec![(S1, 4), (S2, 2)]);
-    assert_eq!(tallylog::plan(&p, &S2, 2), Plan::Nothing);
+    assert_eq!(p.sigs(&S1), 4);
+    assert_eq!(p.sigs(&S2), 2);
+    assert_eq!(p.sigs(&[9u8; 9]), 0);
+    assert_eq!(tallylog::totals(p.s()), vec![(S1, 4), (S2, 2)]);
+    assert_eq!(tallylog::plan(p.s(), &S2, 2), TallyPlan::Nothing);
 }
 
 #[test]
 fn a_full_signature_log_is_compacted_and_keeps_every_chip() {
-    let mut p = vec![0xFFu8; dirlog::PAGE];
+    let mut p = TPage::blank();
     let (mut a, mut erased) = (0u32, 0);
-    let plan = tallylog::plan(&p, &S2, 41);
-    assert!(apply(&mut p, plan));
+    p.count(&S2, 41);
     for _ in 0..600 {
         a += 1;
-        let plan = tallylog::plan(&p, &S1, a);
-        erased += matches!(plan, Plan::Rewrite { .. }) as u32;
-        assert!(apply(&mut p, plan));
-        assert_eq!(tallylog::scan(&p, &S1).0, a);
-        assert_eq!(tallylog::scan(&p, &S2).0, 41, "the other chip's count survives the compaction");
+        let plan = p.count(&S1, a);
+        erased += matches!(plan, TallyPlan::Rewrite { .. }) as u32;
+        assert_eq!(p.sigs(&S1), a);
+        assert_eq!(p.sigs(&S2), 41, "the other chip's count survives the compaction");
     }
     assert!(erased >= 2 && erased <= 4, "an erase only every ~250 signatures, got {erased}");
 }
 
 #[test]
 fn a_torn_signature_record_is_ignored() {
-    let mut p = vec![0xFFu8; dirlog::PAGE];
-    let plan = tallylog::plan(&p, &S1, 10);
-    assert!(apply(&mut p, plan));
-    if let Plan::Append { offset, data } = tallylog::plan(&p, &S1, 11) {
+    let mut p = TPage::blank();
+    p.count(&S1, 10);
+    if let TallyPlan::Append { offset, data, .. } = tallylog::plan(p.s(), &S1, 11) {
         for (i, b) in data[..10].iter().enumerate() {
-            p[offset + i] &= b;
+            p.0[0][offset + i] &= b;
         }
     } else {
         panic!("expected an append");
     }
-    assert_eq!(tallylog::scan(&p, &S1).0, 10);
+    assert_eq!(p.sigs(&S1), 10);
 }
 
 #[test]
@@ -1534,31 +1542,167 @@ fn many_chips_in_the_signature_log_are_limited_to_the_highest_totals() {
         s[8] = c;
         s
     };
-    let mut p = vec![0xFFu8; dirlog::PAGE];
+    let mut p = TPage::blank();
     for c in 0..40u8 {
-        let plan = tallylog::plan(&p, &serial(c), 1000 + c as u32);
-        assert!(apply(&mut p, plan));
+        p.count(&serial(c), 1000 + c as u32);
     }
     // One more chip counts until the log is full and gets compacted.
     let x = serial(200);
     let mut n = 0;
     loop {
         n += 1;
-        let plan = tallylog::plan(&p, &x, n);
-        let compacted = matches!(plan, Plan::Rewrite { .. });
-        assert!(apply(&mut p, plan));
+        let compacted = matches!(p.count(&x, n), TallyPlan::Rewrite { .. });
         if compacted {
             break;
         }
     }
-    assert_eq!(tallylog::totals(&p).len(), tallylog::MAX_CHIPS);
-    assert_eq!(tallylog::scan(&p, &x).0, n, "the chip that is counting keeps its total");
+    assert_eq!(tallylog::totals(p.s()).len(), tallylog::MAX_CHIPS);
+    assert_eq!(p.sigs(&x), n, "the chip that is counting keeps its total");
     for c in 0..9u8 {
-        assert_eq!(tallylog::scan(&p, &serial(c)).0, 0, "the lowest totals are dropped");
+        assert_eq!(p.sigs(&serial(c)), 0, "the lowest totals are dropped");
     }
     for c in 9..40u8 {
-        assert_eq!(tallylog::scan(&p, &serial(c)).0, 1000 + c as u32);
+        assert_eq!(p.sigs(&serial(c)), 1000 + c as u32);
     }
+}
+
+// ---------------------------------------------------------------- power failure during a counter update
+
+/// Counts S1 up until the active log has no free record position left (the next count compacts).
+/// Returns S1's total.
+fn fill_tally(p: &mut TPage, mut n: u32) -> u32 {
+    loop {
+        let (_, used, _) = tallylog::scan(p.s(), &S1);
+        if used >= tallylog::MAX_RECS {
+            return n;
+        }
+        n += 1;
+        p.count(&S1, n);
+    }
+}
+
+/// Every state the flash can be in if the power fails during `plan`: after 0..n whole steps, and in
+/// the middle of the step after them (a few torn lengths of a program, a part of an erase, garbage).
+fn tally_cut_states(base: &TPage, plan: &TallyPlan) -> Vec<TPage> {
+    let steps = plan.steps();
+    let mut out = Vec::new();
+    for k in 0..steps.len() {
+        let mut whole = base.clone();
+        for st in &steps[..k] {
+            apply_step(&mut whole.0, st);
+        }
+        out.push(whole.clone());
+        match &steps[k] {
+            Step::Program { sector, offset, data } => {
+                for n in [1, 5, 11, 13, 15, 16, 17, data.len() / 2, data.len().saturating_sub(1)] {
+                    if n > 0 && n < data.len() {
+                        let mut t = whole.clone();
+                        t.program(*sector, *offset, &data[..n]);
+                        out.push(t);
+                    }
+                }
+            }
+            Step::Erase { sector } => {
+                for n in [16, dirlog::PAGE / 2, dirlog::PAGE - 1] {
+                    let mut t = whole.clone();
+                    t.0[*sector][..n].fill(0xFF);
+                    out.push(t);
+                }
+                let mut t = whole.clone();
+                for (i, b) in t.0[*sector].iter_mut().enumerate() {
+                    *b = (i as u8).wrapping_mul(37);
+                }
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// The invariant: after a power failure at ANY point of an update of S1's total from `old` to `new`
+/// the total of S1 reads as `old` or `new` (never lower than `old`: not blank, not an older value),
+/// S2's total is untouched, and the next count still works.
+fn assert_tally_power_safe(base: &TPage, new: u32, s2: u32) {
+    let old = base.sigs(&S1);
+    let plan = tallylog::plan(base.s(), &S1, new);
+    let states = tally_cut_states(base, &plan);
+    assert!(!states.is_empty());
+    for (n, st) in states.iter().enumerate() {
+        let got = st.sigs(&S1);
+        assert!(got == old || got == new, "state {n}: {got} is neither the old total {old} nor the new {new}");
+        assert_eq!(st.sigs(&S2), s2, "state {n}: the other chip's count changed");
+        if tallylog::active(base.s()).is_some() {
+            assert!(tallylog::active(st.s()).is_some(), "state {n}: the counters were lost");
+        }
+        let mut again = st.clone();
+        again.count(&S1, new);
+        assert_eq!(again.sigs(&S1), new, "state {n}: the next count does not work");
+        assert_eq!(again.sigs(&S2), s2);
+    }
+}
+
+#[test]
+fn a_power_cut_during_an_append_never_lowers_the_signature_count() {
+    let mut p = TPage::blank();
+    p.count(&S1, 7);
+    p.count(&S2, 41);
+    assert_tally_power_safe(&p, 8, 41);
+}
+
+#[test]
+fn a_power_cut_during_the_first_format_leaves_nothing_wrong() {
+    assert_tally_power_safe(&TPage::blank(), 1, 0);
+}
+
+#[test]
+fn a_power_cut_during_a_compaction_never_loses_the_signature_count() {
+    let mut p = TPage::blank();
+    p.count(&S2, 41);
+    let n = fill_tally(&mut p, 0);
+    assert_eq!(tallylog::active(p.s()), Some((0, 1)));
+    assert!(matches!(tallylog::plan(p.s(), &S1, n + 1), TallyPlan::Rewrite { sector: 1, .. }));
+    assert_tally_power_safe(&p, n + 1, 41);
+    p.count(&S1, n + 1);
+    assert_eq!(tallylog::active(p.s()), Some((1, 2)), "the compaction went to region B and committed");
+    // ... and the next one goes back to region A.
+    let m = fill_tally(&mut p, n + 1);
+    assert!(matches!(tallylog::plan(p.s(), &S1, m + 1), TallyPlan::Rewrite { sector: 0, .. }));
+    assert_tally_power_safe(&p, m + 1, 41);
+    p.count(&S1, m + 1);
+    assert_eq!(tallylog::active(p.s()), Some((0, 3)));
+    assert_eq!(p.sigs(&S1), m + 1);
+    assert_eq!(p.sigs(&S2), 41);
+}
+
+#[test]
+fn a_tally_rewrite_never_touches_the_active_region_and_commits_with_the_header_last() {
+    let mut p = TPage::blank();
+    p.count(&S1, 1);
+    let n = fill_tally(&mut p, 1);
+    let before = p.0[0].clone();
+    let plan = tallylog::plan(p.s(), &S1, n + 1);
+    let steps = plan.steps();
+    assert_eq!(steps.len(), 3);
+    assert!(steps.iter().all(|st| match st {
+        Step::Erase { sector } | Step::Program { sector, .. } => *sector == 1,
+    }));
+    assert!(matches!(steps[0], Step::Erase { .. }));
+    assert!(matches!(steps[1], Step::Program { offset, .. } if offset == tallylog::HEADER_LEN));
+    assert!(matches!(steps[2], Step::Program { offset: 0, .. }), "the header is written last");
+    p.apply(plan);
+    assert_eq!(p.0[0], before, "the old region is left as it was");
+}
+
+#[test]
+fn a_tally_region_of_an_older_format_is_not_read_as_counters() {
+    let mut p = TPage::blank();
+    // The single-page format: header "PFRS-SIGTALLY\x02\0\0" followed by records.
+    p.0[0][..16].copy_from_slice(b"PFRS-SIGTALLY\x02\0\0");
+    p.0[0][16..32].copy_from_slice(&[7u8; 16]);
+    assert_eq!(tallylog::scan(p.s(), &S1), (0, 0, false));
+    p.count(&S1, 1); // formats region A (the first generation)
+    assert_eq!(p.sigs(&S1), 1);
+    assert_eq!(tallylog::active(p.s()), Some((0, 1)));
 }
 
 fn plug(m: &Arc<Mutex<Model>>, tag: u8) {
@@ -1754,35 +1898,36 @@ fn directory_and_counter_work_on_sealed_sectors() {
     let l3 = [sealed_log::open_page(&sealed_log::DIR, &other, &phys[0]), sealed_log::open_page(&sealed_log::DIR, &other, &phys[1])];
     assert_eq!(dirlog::scan([&l3[0][..], &l3[1][..]], &S1).0, [0u8; DIR_LEN]);
 
-    // Signature counter.
+    // Signature counter: both regions, copy-on-write.
     let st = seal::Sealer::new(&root(), seal::Domain::Tally);
-    let mut tp = vec![0xFFu8; sealed_log::TALLY.phys_len];
-    let mut cache = vec![0xFFu8; sealed_log::TALLY.logical_len];
+    let mut tp = [vec![0xFFu8; sealed_log::TALLY.phys_len], vec![0xFFu8; sealed_log::TALLY.phys_len]];
+    let open = |tp: &[Vec<u8>; 2]| {
+        [sealed_log::open_page(&sealed_log::TALLY, &st, &tp[0]), sealed_log::open_page(&sealed_log::TALLY, &st, &tp[1])]
+    };
+    let mut plain = TPage::blank();
     for n in 1..=600u32 {
-        let plan = tallylog::plan(&cache, &S1, n);
-        match &plan {
-            Plan::Nothing => {}
-            Plan::Append { offset, data } => {
-                for w in sealed_log::seal_program(&sealed_log::TALLY, &st, *offset, data).unwrap() {
-                    for (i, b) in w.data.iter().enumerate() {
-                        tp[w.offset + i] &= b;
+        let logical = open(&tp);
+        let plan = tallylog::plan([&logical[0][..], &logical[1][..]], &S1, n);
+        for step in plan.steps() {
+            match step {
+                Step::Erase { sector } => tp[sector].fill(0xFF),
+                Step::Program { sector, offset, data } => {
+                    for w in sealed_log::seal_program(&sealed_log::TALLY, &st, offset, &data).unwrap() {
+                        for (i, b) in w.data.iter().enumerate() {
+                            tp[sector][w.offset + i] &= b; // flash can only clear bits
+                        }
                     }
                 }
-                cache[*offset..*offset + data.len()].copy_from_slice(data);
-            }
-            Plan::Rewrite { data } => {
-                tp.fill(0xFF);
-                for w in sealed_log::seal_program(&sealed_log::TALLY, &st, 0, data).unwrap() {
-                    tp[w.offset..w.offset + w.data.len()].copy_from_slice(&w.data);
-                }
-                cache.fill(0xFF);
-                cache[..data.len()].copy_from_slice(data);
             }
         }
-        assert_eq!(sealed_log::open_page(&sealed_log::TALLY, &st, &tp), cache, "count {n}");
-        assert_eq!(tallylog::scan(&cache, &S1).0, n);
+        plain.count(&S1, n);
+        let logical = open(&tp);
+        assert_eq!(logical, plain.0, "count {n}");
+        assert_eq!(tallylog::scan([&logical[0][..], &logical[1][..]], &S1).0, n);
     }
-    assert!(!tp.windows(9).any(|w| w == S1), "the chip serial is visible in flash");
+    for p in &tp {
+        assert!(!p.windows(9).any(|w| w == S1), "the chip serial is visible in flash");
+    }
 }
 
 #[test]
@@ -1793,7 +1938,7 @@ fn sealed_layouts_fit_the_plaintext_formats() {
     assert_eq!(sealed_log::DIR.logical_len, dirlog::PAGE);
     assert_eq!(sealed_log::TALLY.max_recs, tallylog::MAX_RECS);
     assert_eq!(sealed_log::TALLY.rec, tallylog::REC);
-    assert_eq!(sealed_log::TALLY.header_len, tallylog::HEADER.len());
+    assert_eq!(sealed_log::TALLY.header_len, tallylog::HEADER_LEN);
     assert!(sealed_log::DIR.fits() && sealed_log::TALLY.fits());
 }
 
