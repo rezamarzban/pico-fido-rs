@@ -213,44 +213,4 @@ pub fn usage(sectors: Sectors) -> (Vec<ChipSerial>, usize) {
         })
         .count();
     (
-        totals(sectors).into_iter().map(|e| e.0).collect(),
-        HEADER_LEN + n * REC,
-    )
-}
-
-/// How to bring the counters to the new `total` of chip `serial` (the other chips keep theirs).
-pub fn plan(sectors: Sectors, serial: &ChipSerial, total: u32) -> TallyPlan {
-    let (cur, used, valid) = scan(sectors, serial);
-    if valid && cur == total {
-        return TallyPlan::Nothing;
-    }
-    if valid && used < MAX_RECS {
-        let (sector, _) = active(sectors).expect("valid counters have an active region");
-        return TallyPlan::Append {
-            sector,
-            offset: HEADER_LEN + used * REC,
-            data: record(serial, total).to_vec(),
-        };
-    }
-    // First use / foreign data / older format, or the log is full: copy-on-write into the inactive
-    // region, one record per chip, the other chips first. The active region is not touched, so no
-    // power failure can lose the counters.
-    let (sector, generation) = match active(sectors) {
-        Some((a, g)) => (1 - a, g.wrapping_add(1)),
-        None => (0, 1),
-    };
-    let mut others: Vec<(ChipSerial, u32)> = if valid { totals(sectors) } else { Vec::new() };
-    others.retain(|e| &e.0 != serial);
-    others.sort_by_key(|e| core::cmp::Reverse(e.1)); // highest totals first (stable: ties keep log order)
-    others.truncate(MAX_CHIPS - 1);
-    let mut records = Vec::with_capacity((others.len() + 1) * REC);
-    for (s, c) in &others {
-        records.extend_from_slice(&record(s, *c));
-    }
-    records.extend_from_slice(&record(serial, total));
-    TallyPlan::Rewrite {
-        sector,
-        records,
-        header: header(generation),
-    }
-}
+        totals(sectors).into_iter().map(|e| 

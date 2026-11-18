@@ -54,7 +54,7 @@ chip the firmware halts at start-up (the credential keys and the RNG seed come f
   writes it (the directory is in the Pico's flash: 4 KiB page below the OpenSK store, format in `src/se/dirlog.rs`).
   The slot keeps its general-config values and nothing needs to change in the chip's configuration. Old content
   stays until you overwrite it yourself.
-* Slots 10-12, 14, 15: not used by this firmware; they keep the general config's values (SlotConfig `8F8F 8F8F 0000 0000 0000 8F8F`, KeyConfig `1800 1C00 3000 3C00 3C00 1C00`).
+* Slot 11 holds the HMAC key of the PUF-secret backup (random, from the chip's RNG; written by the firmware on first use while the data zone is unlocked, or with `hmac-write-key 11 0 key_file` of atecc-util-py). Slots 10, 12, 14, 15: not used by this firmware; they keep the general config's values (SlotConfig `8F8F 8F8F 0000 0000 0000 8F8F`, KeyConfig `1800 1C00 3000 3C00 3C00 1C00`).
 * Counters: not used by the firmware. Counter 0 / 1 fields are the factory value 0 (`FFFFFFFF 00000000`, ignored), LastKeyUse is `00` and ChipMode `00`, all as on a factory-default chip. Byte 14 (I2C_Enable, `01` in the image) and the serial are read-only on the chip.
 
 A credential ID holds a 32-byte *handle* `[01][slot][6-byte public-key fingerprint][zeros]` inside

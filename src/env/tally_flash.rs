@@ -128,7 +128,8 @@ impl FlashTally {
                     offset,
                     data,
                 } => {
-                    let writes = sealed_log::seal_program(&TALLY, sealer, offset, &data).ok_or(())?;
+                    let writes =
+                        sealed_log::seal_program(&TALLY, sealer, offset, &data).ok_or(())?;
                     for w in writes {
                         flash_io::program(&mut flash, sector_start(sector) + w.offset, &w.data)?;
                         if phys(sector)[w.offset..w.offset + w.data.len()] != w.data[..] {

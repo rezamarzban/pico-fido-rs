@@ -1,25 +1,28 @@
 //! Backup of the SRAM-PUF secret in the Pico's flash, one record per chip (pure logic, host-tested;
 //! the flash access is in `env/backup_flash.rs`, the policy in `main.rs`).
 //!
-//! When the PUF gives its secret at start-up and a chip with a key in slot 0 is connected, the
+//! When the PUF gives its secret at start-up and the connected chip can give its backup key, the
 //! secret is written to the backup sector sealed (AES-256-GCM, `seal.rs`) with a key derived from
-//! that chip's slot-0 PUBLIC key. If the PUF later cannot be read (noisy sample, damaged or lost
-//! helper sector), connecting any chip that has a record brings the secret back, and every key
-//! derived from it with it.
+//! that chip's **HMAC digest**: HMAC-SHA-256, computed INSIDE the chip, of a fixed challenge with a
+//! random 32-byte key that lives in one of the chip's secret data slots (`se::ecdsa::backup_key`,
+//! slot 11). That key was made by the chip's own RNG, is written once and never leaves the chip. If
+//! the PUF later cannot be read (noisy sample, damaged or lost helper sector), connecting any chip
+//! that has a record brings the secret back, and every key derived from it with it.
 //!
-//! **This is a deliberate trade: availability for confidentiality.** A public key is not secret
-//! (it is in the attestation certificate every relying party gets), and the secret is the same for
-//! every chip, so anyone with a copy of the flash and the slot-0 public key of any ONE chip with a
-//! record can open the backup and then everything the PUF protects. It is only as strong as "the
-//! attacker does not know a slot-0 public key". See SECURITY.md.
+//! **What this protects against:** a copy of the Pico's flash alone (the backup is useless without
+//! the chip: the digest can only be had from the chip) and anyone who only knows public data such as
+//! the attestation certificate. **What it does not:** anyone who holds the chip (the board) can ask it for
+//! the digest. The secret is the same for every chip, so any ONE chip with a record opens the backup.
 //!
-//! Sector: a 16-byte header `[magic "PFRSPBK\x01" (8)][8-byte check]` followed by an append-only
+//! Sector: a 16-byte header `[magic "PFRSPBK\x02" (8)][8-byte check]` followed by an append-only
 //! log of records `[chip id (8)][sealed secret (60)][6-byte check]`. The chip id is a hash of the
-//! public key (it names the record, it does not reveal the key). The newest record of a chip that
+//! digest (it names the record, it does not reveal the digest). The newest record of a chip that
 //! really opens with that chip's key is its secret; a half-written record fails its check and is
 //! skipped. Records are never removed: a chip is written once (again only if the secret changed,
 //! after a re-enrolment), up to `MAX_RECS` records; a full sector refuses new chips (`Plan::Full`)
-//! and keeps what it has. A sector without a valid header holds no backup and may be formatted.
+//! and keeps what it has. A sector without a valid header holds no backup and may be formatted
+//! (this also drops records of the older, slot-0-public-key format, which cannot be opened any more;
+//! they are written again from the live PUF secret).
 
 use alloc::vec::Vec;
 use sha2::{Digest, Sha256};
@@ -29,7 +32,7 @@ use crate::seal::{Domain, Sealer, OVERHEAD};
 
 pub const PAGE: usize = 4096;
 pub const SECRET_LEN: usize = 32;
-pub const MAGIC: [u8; 8] = *b"PFRSPBK\x01";
+pub const MAGIC: [u8; 8] = *b"PFRSPBK\x02";
 pub const HEADER_LEN: usize = 16;
 pub const ID_LEN: usize = 8;
 const CHECK_LEN: usize = 6;
@@ -40,28 +43,31 @@ pub const MAX_RECS: usize = (PAGE - HEADER_LEN) / REC;
 
 pub type ChipId = [u8; ID_LEN];
 
-fn hash(label: &[u8], pubkey: &[u8; 64]) -> [u8; 32] {
+/// The chip's backup digest (see the module documentation).
+pub type Digest32 = [u8; 32];
+
+fn hash(label: &[u8], digest: &Digest32) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(label);
-    h.update(pubkey);
+    h.update(digest);
     h.finalize().into()
 }
 
-/// The sealing key of a chip's record: SHA-256 of its slot-0 public key (X || Y).
-fn backup_key(pubkey: &[u8; 64]) -> Zeroizing<[u8; 32]> {
-    Zeroizing::new(hash(b"pfrs-puf-backup-v1/key", pubkey))
+/// The sealing key of a chip's record.
+fn backup_key(digest: &Digest32) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(hash(b"pfrs-puf-backup-v2/key", digest))
 }
 
-/// Names a chip's records without revealing its public key.
-pub fn chip_id(pubkey: &[u8; 64]) -> ChipId {
-    let d = hash(b"pfrs-puf-backup-v1/id", pubkey);
+/// Names a chip's records without revealing its digest.
+pub fn chip_id(digest: &Digest32) -> ChipId {
+    let d = hash(b"pfrs-puf-backup-v2/id", digest);
     let mut id = [0u8; ID_LEN];
     id.copy_from_slice(&d[..ID_LEN]);
     id
 }
 
-fn sealer(pubkey: &[u8; 64]) -> Sealer {
-    Sealer::new(&backup_key(pubkey), Domain::Backup)
+fn sealer(digest: &Digest32) -> Sealer {
+    Sealer::new(&backup_key(digest), Domain::Backup)
 }
 
 fn aad(id: &ChipId) -> [u8; 8 + ID_LEN] {
@@ -93,12 +99,12 @@ fn rec_check(body: &[u8]) -> [u8; CHECK_LEN] {
     c
 }
 
-/// The record that backs up `secret` for the chip with slot-0 public key `pubkey`.
-pub fn record(pubkey: &[u8; 64], secret: &[u8; SECRET_LEN]) -> [u8; REC] {
-    let id = chip_id(pubkey);
+/// The record that backs up `secret` for the chip whose backup digest is `digest`.
+pub fn record(digest: &Digest32, secret: &[u8; SECRET_LEN]) -> [u8; REC] {
+    let id = chip_id(digest);
     let mut r = [0u8; REC];
     r[..ID_LEN].copy_from_slice(&id);
-    r[ID_LEN..ID_LEN + SEALED_LEN].copy_from_slice(&sealer(pubkey).seal(&aad(&id), secret));
+    r[ID_LEN..ID_LEN + SEALED_LEN].copy_from_slice(&sealer(digest).seal(&aad(&id), secret));
     let c = rec_check(&r[..REC - CHECK_LEN]);
     r[REC - CHECK_LEN..].copy_from_slice(&c);
     r
@@ -124,17 +130,17 @@ fn walk<'a>(sector: &'a [u8], mut f: impl FnMut(&'a [u8])) -> Option<usize> {
     Some(used)
 }
 
-/// The PUF secret backed up for the chip with slot-0 public key `pubkey` (the newest record that
+/// The PUF secret backed up for the chip whose backup digest is `digest` (the newest record that
 /// opens with that chip's key), or `None`.
-pub fn find(sector: &[u8], pubkey: &[u8; 64]) -> Option<Zeroizing<[u8; SECRET_LEN]>> {
-    let id = chip_id(pubkey);
+pub fn find(sector: &[u8], digest: &Digest32) -> Option<Zeroizing<[u8; SECRET_LEN]>> {
+    let id = chip_id(digest);
     let mut mine: Vec<&[u8]> = Vec::new();
     let _ = walk(sector, |r| {
         if r[..ID_LEN] == id {
             mine.push(&r[ID_LEN..ID_LEN + SEALED_LEN]);
         }
     });
-    let s = sealer(pubkey);
+    let s = sealer(digest);
     for sealed in mine.into_iter().rev() {
         if let Some(p) = s.open(&aad(&id), sealed) {
             if p.len() == SECRET_LEN {
@@ -160,7 +166,7 @@ pub fn usage(sector: &[u8]) -> (usize, usize) {
     (ids.len(), used.unwrap_or(0))
 }
 
-/// What to do to the sector so that the chip with `pubkey` has `secret` backed up.
+/// What to do to the sector so that the chip with backup digest `digest` has `secret` backed up.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Plan {
     /// The chip already has exactly this backed up.
@@ -173,15 +179,15 @@ pub enum Plan {
     Full,
 }
 
-pub fn plan(sector: &[u8], pubkey: &[u8; 64], secret: &[u8; SECRET_LEN]) -> Plan {
-    let rec = record(pubkey, secret);
+pub fn plan(sector: &[u8], digest: &Digest32, secret: &[u8; SECRET_LEN]) -> Plan {
+    let rec = record(digest, secret);
     if !header_ok(sector) {
         let mut data = Vec::with_capacity(HEADER_LEN + REC);
         data.extend_from_slice(&header());
         data.extend_from_slice(&rec);
         return Plan::Format { data };
     }
-    if find(sector, pubkey).is_some_and(|s| *s == *secret) {
+    if find(sector, digest).is_some_and(|s| *s == *secret) {
         return Plan::Nothing;
     }
     let (_, used) = usage(sector);

@@ -60,16 +60,23 @@ linker's FLASH region by `build.rs`. From the end of flash downwards:
   ones is refused at enrolment (a biased chip would give a weaker secret, see SECURITY.md). Root key =
   HMAC-SHA-256(secret, label); per area two keys are derived from it (AES-256 key and a nonce key). The root key is never
   stored: it is rebuilt from the RAM for every flash operation and wiped.
-* **Backup of the PUF secret.** Whenever the PUF works and a chip with a key in slot 0 is connected, the PUF secret is
-  also written once to the backup sector: AES-256-GCM sealed with a key derived (SHA-256) from that chip's **slot-0 public
-  key**, one record per chip (55 fit). If a later start cannot read the PUF (the sample does not decode, the helper sector
-  is damaged or erased), connecting any chip that has a record brings the secret back and with it every key; if the
-  sample allows it (power-on reset, balanced pattern) a new helper sector is written from the current power-up pattern, so
-  the next starts use the PUF again, otherwise the secret stays in RAM for that power cycle. Nothing is wiped on this
-  path. A blank helper sector with records of *other* chips only (or an unreadable backup) halts instead of wiping.
-  **Trade-off:** a public key is not secret (it is in the attestation certificate), and the secret is the same for every chip,
-  so a copy of the flash plus the slot-0 public key of any one chip with a record opens the backup and then everything
-  (`SECURITY.md`). The backup buys availability, not confidentiality.
+* **Backup of the PUF secret.** Whenever the PUF works and the connected chip can give its **backup key**, the PUF secret
+  is also written once to the backup sector: AES-256-GCM sealed with a key derived (SHA-256) from an **HMAC digest computed
+  inside the chip**: HMAC-SHA-256 of a fixed challenge with a random 32-byte key kept in the chip's data slot 11 (the SHA
+  command in HMAC mode, the same as `hmac-dgst` of atecc-util-py; the key never leaves the chip). That key comes from the
+  chip's own RNG and is written once: by the firmware itself the first time it finds slot 11 blank (all zeros or all
+  ones; possible only while the chip lets a clear write through, i.e. before the data zone is locked, and checked by
+  comparing the chip's HMAC with the software HMAC of the key), or beforehand with `hmac-write-key 11 0 key_file` of atecc-util-py.
+  A slot that already holds a key is never written; a blank slot that cannot be written means no backup (the OLED says
+  NO HMAC KEY), because a blank slot would give a known constant. One record per chip (55 fit). If a later start cannot
+  read the PUF (the sample does not decode, the helper sector is damaged or erased), connecting any chip that has a record
+  brings the secret back and with it every key; if the sample allows it (power-on reset, balanced pattern) a new helper
+  sector is written from the current power-up pattern, so the next starts use the PUF again, otherwise the secret stays in
+  RAM for that power cycle. Nothing is wiped on this path. A blank helper sector with records of *other* chips only (or
+  an unreadable backup) halts instead of wiping. **Trade-off:** the secret is the same for every chip, so anyone who
+  holds the Pico's flash AND any ONE chip with a record (the board is enough: it answers HMAC to anyone who asks) opens
+  the backup and then everything (`SECURITY.md`); a copy of the flash alone, or public data such as the attestation
+  certificate, does not.
 * **Format.** `nonce(12) || ciphertext || tag(16)`; associated data = store key id / record position. Nonces are
   derived (HMAC of the data), so no counter or RNG is needed and a nonce is never used for two different messages.
 * **First start.** With an erased helper sector the firmware wipes store, directory and counter (an older firmware left
@@ -138,7 +145,7 @@ encryption, was checked like this (stable Rust 1.99 with `RUSTC_BOOTSTRAP=1`, `-
 * `cargo check`, `cargo clippy -- --deny=warnings` and `cargo build --release` for `thumbv6m-none-eabi` pass (linked with
   `rust-lld`; flip-link is not installed in that setup); the image is about 230 KB, `.data`+`.bss` end well below the
   PUF region, and `rustfmt --check` is clean.
-* `host-test/se` (76 tests): the chip model and the OpenSK adapter, the two-sector directory with the power cut after
+* `host-test/se` (87 tests): the chip model and the OpenSK adapter, the two-sector directory with the power cut after
   every step and in the middle of every program/erase step, the sealed log layouts with known-answer vectors from
   `host-test/seal_ref.py`, the PUF arithmetic (bit-sliced majority against a naive one, noise at 10 %, bias
   refusal), the long-value splitting and the PUF-secret backup (record format, torn writes, forgery, capacity, and the

@@ -51,8 +51,8 @@
 //! ERR 312/16128 1.9%          bit errors of this boot's sample (about 10% is the limit)
 //! RAW 49.8 PAIR 50.2%         share of ones in the raw cells and in the XOR-ed pairs
 //! POR YES RAM@2003F000        power-on reset this boot (a helper sector can only be written then)
-//! CHIP BACKUP: OK             OK (has a record) / NEW (written now) / NONE (no key in slot 0)
-//!                             / FULL / ERROR
+//! CHIP BACKUP: OK             OK (has a record) / NEW (written now) / NONE (no chip)
+//!                             / NO HMAC KEY (slot 11 blank, none could be written) / FULL / ERROR
 //! BACKUPS 2/55 CHIPS          chips with a record in the backup sector, and its capacity
 //! KEY FROM PUF                PUF / BACKUP (RAM) / BACKUP+HELPER (helper sector rewritten)
 //! ```
@@ -302,6 +302,7 @@ impl Oled {
             st::BK_NEW => "NEW",
             st::BK_FULL => "FULL",
             st::BK_ERR => "ERROR",
+            st::BK_NOKEY => "NO HMAC KEY",
             _ => "NONE",
         };
         let b = &mut self.buf;

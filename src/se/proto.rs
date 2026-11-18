@@ -22,6 +22,7 @@ pub const OP_GENKEY: u8 = 0x40;
 pub const OP_NONCE: u8 = 0x16;
 pub const OP_RANDOM: u8 = 0x1B;
 pub const OP_SIGN: u8 = 0x41;
+pub const OP_SHA: u8 = 0x47;
 
 /// Largest command frame we build: Nonce pass-through (32 bytes data) = 1+1+1+1+2+32+2 = 40.
 pub const MAX_CMD: usize = 48;
@@ -110,6 +111,18 @@ pub const SIGN_EXTERNAL: u8 = 0x80; // sign the message digest held in TempKey
 pub const COUNTER_READ: u8 = 0x00;
 #[allow(dead_code)] // used by the host tests and the provisioning tools, not by the firmware
 pub const COUNTER_INC: u8 = 0x01;
+/// SHA command in HMAC mode (ATECC608 only): start with the key in data slot `param2`, then end with the
+/// message in `data` (param2 = its length, at most 63 bytes). The response is the 32-byte HMAC-SHA-256;
+/// the key never leaves the chip. The same two commands as `hmac-dgst` of atecc-util-py.
+pub const SHA_HMAC_START: u8 = 0x04;
+pub const SHA_HMAC_END: u8 = 0x02;
+/// Write command, data zone, one 32-byte block in the clear (zone 2 | bit 7). Address = slot << 3 for
+/// block 0 (`(block << 8) | (slot << 3) | word`). The chip only accepts a clear write while the data
+/// zone is unlocked or the slot's configuration allows it (status 0x0F otherwise).
+pub const WRITE_DATA_32: u8 = 0x82;
+pub const fn data_slot_addr(slot: u8) -> u16 {
+    (slot as u16) << 3
+}
 pub const RANDOM_MODE: u8 = 0x00; // update the EEPROM seed (normal use)
 pub const INFO_REVISION: u8 = 0x00; // 4 bytes: device revision (00 00 60 xx for the ATECC608)
 pub const READ_CONFIG_32: u8 = 0x80; // config zone, 32-byte block (bit 7 = 32 bytes, zone bits = 0)
@@ -176,6 +189,7 @@ pub fn max_exec_ms(opcode: u8) -> u32 {
         OP_NONCE => 29,
         OP_RANDOM => 23,
         OP_SIGN => 70,
+        OP_SHA => 50,
         _ => 200,
     }
 }
@@ -191,6 +205,7 @@ pub fn typ_exec_ms(opcode: u8) -> u32 {
         OP_NONCE => 7,
         OP_RANDOM => 15,
         OP_SIGN => 50,
+        OP_SHA => 9,
         _ => 2,
     }
 }

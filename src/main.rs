@@ -150,23 +150,28 @@ fn fail(led: &mut Output<'static>, reason: u8) -> ! {
 ///   that has a record, or erase the whole flash.
 /// * anything else: halt with the fault blink; nothing is read or written.
 ///
-/// Whenever the key is available and a chip with a key in slot 0 is connected, its record of the
-/// secret is written once.
+/// Whenever the key is available and a chip that can give its backup key (an HMAC key in slot 11) is
+/// connected, its record of the secret is written once.
 fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) {
     use portable_atomic::Ordering::Relaxed;
     use puf_backup::Plan;
 
     let mut puf = puf::Puf::open(flash);
-    // The password of the backup is the public key of slot 0 of the connected chip.
-    let pubkey = se::ecdsa::attestation_pubkey();
+    // The password of the backup is the HMAC digest of the secret key in slot 11 of the connected chip
+    // (a random key from the chip's own RNG, written there on first use if the slot is still blank).
+    let (digest, no_key) = match se::ecdsa::backup_key() {
+        se::ecdsa::BackupKey::Key(d) => (Some(d), false),
+        se::ecdsa::BackupKey::NoKey => (None, true),
+        se::ecdsa::BackupKey::NoChip => (None, false),
+    };
     let sector = env::backup_flash::read(flash);
     let stats = puf.stats();
     status::PUF_POR.store(puf.por(), Relaxed);
     status::PUF_ERRORS.store(stats.errors, Relaxed);
     status::PUF_RAW_PM.store(stats.raw_pm, Relaxed);
     status::PUF_PAIR_PM.store(stats.pair_pm, Relaxed);
-    let backed_up = match (&pubkey, &sector) {
-        (Some(pk), Some(s)) => puf_backup::find(s, pk),
+    let backed_up = match (&digest, &sector) {
+        (Some(d), Some(s)) => puf_backup::find(s, d),
         _ => None,
     };
     let chips_backed_up = sector.as_deref().map_or(0, |s| puf_backup::usage(s).0);
@@ -242,8 +247,8 @@ fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) 
 
     // Back up the secret for the connected chip (once; again only if the secret changed).
     let mut chips = chips_backed_up;
-    let backup_state = match (&pubkey, puf.secret(), &sector) {
-        (Some(pk), Some(secret), Some(s)) => match puf_backup::plan(s, pk, &secret) {
+    let backup_state = match (&digest, puf.secret(), &sector) {
+        (Some(d), Some(secret), Some(s)) => match puf_backup::plan(s, d, &secret) {
             Plan::Nothing => status::BK_HAVE,
             Plan::Full => {
                 warn!("puf: the backup sector is full, this chip gets no backup");
@@ -262,8 +267,12 @@ fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) 
             }
         },
         (_, _, None) => status::BK_ERR,
+        _ if no_key => {
+            warn!("puf: the HMAC slot of the chip is blank and no key could be written: no backup possible");
+            status::BK_NOKEY
+        }
         _ => {
-            info!("puf: no key in slot 0 of a connected chip: no backup possible");
+            info!("puf: no chip that can give a backup key: no backup possible");
             status::BK_UNKNOWN
         }
     };

@@ -196,14 +196,69 @@ pub fn chip_info() -> Option<ChipInfo> {
     Some(info)
 }
 
-/// Serial number of the connected chip, as of the last `chip_info()`.
-/// The public key (X || Y) of the key in slot 0, the attestation key, read from the chip (never
-/// from the cache: slot 0 may be provisioned after the firmware looked at it). `None`: no chip, or
-/// slot 0 holds no key. It is the "password" of the PUF-secret backup (`puf_backup.rs`).
-pub fn attestation_pubkey() -> Option<[u8; 64]> {
-    with_chip(|c| c.public_key(ATTEST_SLOT)).ok()
+/// Data slot that holds the HMAC key of the PUF-secret backup (`puf_backup.rs`): a random 32-byte key
+/// from the chip's own RNG, written once, never read back (the slot is secret: only HMAC can use it).
+/// Slots 10-15 all answer to HMAC; 11 keeps slot 15 free as the write key named in its configuration.
+pub const BACKUP_SLOT: u8 = 11;
+/// What the chip HMACs to give the backup key.
+const BACKUP_CHALLENGE: &[u8] = b"pfrs-puf-backup-key-v1";
+
+/// The backup key of the connected chip, as far as it could be had.
+pub enum BackupKey {
+    /// No chip answered (or it has no HMAC): there is no backup to make or to read.
+    NoChip,
+    /// The slot holds no key (still blank) and one could not be written (data zone locked, slot
+    /// configuration, chip error): a blank slot would be a known constant, so nothing is derived.
+    NoKey,
+    /// HMAC-SHA-256 of the challenge with the slot's key: a secret only this chip's slot gives.
+    Key(zeroize::Zeroizing<[u8; 32]>),
 }
 
+fn software_hmac(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC takes any key length");
+    m.update(msg);
+    m.finalize().into_bytes().into()
+}
+
+/// Is `d` what the chip gives for a slot that was never written? A blank data slot reads as all
+/// zeros or all ones (depending on the state of the chip), and HMAC is the standard one, so both
+/// answers can be computed here.
+fn is_blank_answer(d: &[u8; 32]) -> bool {
+    *d == software_hmac(&[0x00; 32], BACKUP_CHALLENGE)
+        || *d == software_hmac(&[0xFF; 32], BACKUP_CHALLENGE)
+}
+
+/// The secret that seals the PUF-secret backup (`puf_backup.rs`), from the HMAC key in `BACKUP_SLOT`
+/// of the connected chip. If the slot is still blank, a random key from the chip's RNG is written into
+/// it first (only possible while the chip lets a clear write through, i.e. before its data zone is
+/// locked; otherwise write the key beforehand with `atecc hmac-write-key 11 0 key_file`) and checked
+/// by comparing the chip's HMAC with the software HMAC of that key. A slot that already holds a key
+/// is never written. Not cached: it is asked for once at start-up.
+pub fn backup_key() -> BackupKey {
+    let Ok(d) = with_chip(|c| c.hmac(BACKUP_SLOT, BACKUP_CHALLENGE)) else {
+        return BackupKey::NoChip;
+    };
+    if !is_blank_answer(&d) {
+        return BackupKey::Key(zeroize::Zeroizing::new(d));
+    }
+    // Blank: provision it, then prove with the chip's own HMAC that the key is in and works.
+    let Ok(r) = with_chip(|c| c.random()) else {
+        return BackupKey::NoKey;
+    };
+    let r = zeroize::Zeroizing::new(r);
+    if with_chip(|c| c.write_slot(BACKUP_SLOT, &r)).is_err() {
+        return BackupKey::NoKey;
+    }
+    match with_chip(|c| c.hmac(BACKUP_SLOT, BACKUP_CHALLENGE)) {
+        Ok(d) if d == software_hmac(&r, BACKUP_CHALLENGE) => {
+            BackupKey::Key(zeroize::Zeroizing::new(d))
+        }
+        _ => BackupKey::NoKey,
+    }
+}
+
+/// Serial number of the connected chip, as of the last `chip_info()`.
 pub fn chip_serial() -> Option<ChipSerial> {
     critical_section::with(|cs| SERIAL.borrow(cs).get())
 }

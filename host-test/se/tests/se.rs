@@ -72,6 +72,11 @@ struct Model {
     dir_fails: bool,       // the flash directory cannot be saved
     dir_cut: Option<(usize, usize)>, // power fails during the next directory save: (whole steps done, bytes of the next step written)
     dir_writes: u32,       // saves of the directory seen
+    slot_data: [[u8; 32]; 16], // data slots of the chip (HMAC keys); blank = all zeros
+    data_locked: bool,     // the data zone is locked: clear writes are refused
+    drop_writes: bool,     // a clear write answers OK but does not store (a failing EEPROM)
+    slot_writes: u32,      // clear writes into data slots that were accepted
+    hmac_slot: Option<usize>, // key slot of the HMAC that was started and not ended yet
 }
 
 /// The two directory sectors as the slices `dirlog` works on.
@@ -266,6 +271,42 @@ impl Model {
                     return status(0x03);
                 }
                 frame(&self.config[block * 32..block * 32 + 32])
+            }
+            // SHA in HMAC mode, as atecc-util-py's `hmac-dgst` and the firmware use it.
+            proto::OP_SHA => match p1 {
+                proto::SHA_HMAC_START => {
+                    let slot = p2 as usize;
+                    if slot >= 16 || !data.is_empty() {
+                        return status(0x03);
+                    }
+                    self.hmac_slot = Some(slot);
+                    status(0x00)
+                }
+                proto::SHA_HMAC_END => {
+                    let Some(slot) = self.hmac_slot.take() else { return status(0x0F) };
+                    if p2 as usize != data.len() {
+                        return status(0x03);
+                    }
+                    let mut mac = <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(&self.slot_data[slot]).unwrap();
+                    hmac::Mac::update(&mut mac, data);
+                    frame(&hmac::Mac::finalize(mac).into_bytes())
+                }
+                _ => status(0x03),
+            },
+            // Clear write of one 32-byte block into a data slot.
+            proto::OP_WRITE => {
+                let slot = ((p2 >> 3) & 0xF) as usize;
+                if p1 != proto::WRITE_DATA_32 || data.len() != 32 || p2 & 7 != 0 || (p2 >> 8) != 0 {
+                    return status(0x03);
+                }
+                if self.data_locked {
+                    return status(0x0F);
+                }
+                if !self.drop_writes {
+                    self.slot_data[slot].copy_from_slice(data);
+                }
+                self.slot_writes += 1;
+                status(0x00)
             }
             _ => status(0x03),
         }
@@ -1650,7 +1691,7 @@ fn a_power_cut_during_an_append_never_lowers_the_signature_count() {
 }
 
 #[test]
-fn a_power_cut_during_the_first_format_leaves_nothing_wrong() {
+fn a_power_cut_during_the_first_counter_format_leaves_nothing_wrong() {
     assert_tally_power_safe(&TPage::blank(), 1, 0);
 }
 
@@ -2246,8 +2287,8 @@ mod spill_tests {
 mod backup_tests {
     use super::puf_backup::*;
 
-    fn pk(n: u8) -> [u8; 64] {
-        let mut k = [0u8; 64];
+    fn pk(n: u8) -> [u8; 32] {
+        let mut k = [0u8; 32];
         for (i, b) in k.iter_mut().enumerate() {
             *b = n.wrapping_mul(31).wrapping_add(i as u8);
         }
@@ -2285,19 +2326,19 @@ mod backup_tests {
     }
 
     #[test]
-    fn a_chip_gets_its_secret_back_with_its_own_public_key_only() {
+    fn a_chip_gets_its_secret_back_with_its_own_digest_only() {
         let mut sec = blank();
         assert!(find(&sec, &pk(1)).is_none(), "a blank sector has no backup");
         let p = plan(&sec, &pk(1), &secret(7));
         assert!(matches!(p, Plan::Format { .. }), "no valid header: format");
         assert!(apply(&mut sec, &p));
         assert_eq!(&*find(&sec, &pk(1)).unwrap(), &secret(7));
-        assert!(find(&sec, &pk(2)).is_none(), "another chip's public key opens nothing");
+        assert!(find(&sec, &pk(2)).is_none(), "another chip's digest opens nothing");
         let mut wrong = pk(1);
-        wrong[63] ^= 1;
+        wrong[31] ^= 1;
         assert!(find(&sec, &wrong).is_none());
         assert_eq!(usage(&sec), (1, 1));
-        // The sector holds neither the secret, nor the public key, in the clear.
+        // The sector holds neither the secret, nor the digest, in the clear.
         assert!(!sec.windows(8).any(|w| w == &secret(7)[..8]));
         assert!(!sec.windows(8).any(|w| w == &pk(1)[..8]));
     }
@@ -2449,5 +2490,127 @@ mod backup_tests {
         assert_eq!(boot_decision(Blank, false, 0, true), Boot::FirstStart);
         assert_eq!(boot_decision(Blank, false, 2, true), Boot::Halt(Halt::Lost), "other chips' records: do not wipe");
         assert_eq!(boot_decision(Blank, false, 0, false), Boot::Halt(Halt::Lost), "unreadable backup: do not wipe");
+    }
+}
+
+// ---------------------------------------------------------------- backup key from the chip's HMAC slot (ecdsa::backup_key)
+
+mod backup_key_tests {
+    use super::*;
+    use ecdsa::BackupKey;
+
+    const CHALLENGE: &[u8] = b"pfrs-puf-backup-key-v1";
+
+    fn sw_hmac(key: &[u8; 32]) -> [u8; 32] {
+        let mut m = <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(key).unwrap();
+        hmac::Mac::update(&mut m, CHALLENGE);
+        hmac::Mac::finalize(m).into_bytes().into()
+    }
+
+    fn key_of(r: BackupKey) -> Option<[u8; 32]> {
+        match r {
+            BackupKey::Key(d) => Some(*d),
+            _ => None,
+        }
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn the_chip_hmac_is_the_standard_one_and_an_existing_key_is_never_written() {
+        let (_g, m) = install(false, 0);
+        let key: [u8; 32] = core::array::from_fn(|i| i as u8);
+        m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize] = key;
+        let d = key_of(ecdsa::backup_key()).expect("a key");
+        // Independent known answer (Python hmac, HMAC-SHA-256 of the challenge with this key).
+        assert_eq!(hex(&d), "9f39b84482592724542eb0aebf310f03960621084aaa6f0807e0daf64bfe48fb");
+        assert_eq!(d, sw_hmac(&key));
+        let g = m.lock().unwrap();
+        assert_eq!(g.slot_writes, 0, "nothing was written");
+        assert!(!g.commands.contains(&proto::OP_WRITE) && !g.commands.contains(&proto::OP_RANDOM));
+        assert_eq!(g.slot_data[ecdsa::BACKUP_SLOT as usize], key);
+    }
+
+    #[test]
+    fn a_blank_slot_gets_a_random_key_from_the_chip_once() {
+        for blank in [0x00u8, 0xFF] {
+            let (_g, m) = install(false, 0);
+            m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize] = [blank; 32];
+            let d = key_of(ecdsa::backup_key()).expect("provisioned");
+            let (written, writes) = {
+                let g = m.lock().unwrap();
+                (g.slot_data[ecdsa::BACKUP_SLOT as usize], g.slot_writes)
+            };
+            assert_eq!(writes, 1);
+            assert_ne!(written, [blank; 32], "a random key replaced the blank one (blank {blank:#x})");
+            assert_eq!(d, sw_hmac(&written), "the digest is the chip's HMAC with the new key");
+            // The next start uses the same key and writes nothing.
+            let d2 = key_of(ecdsa::backup_key()).unwrap();
+            assert_eq!(d2, d);
+            assert_eq!(m.lock().unwrap().slot_writes, 1);
+        }
+    }
+
+    #[test]
+    fn two_chips_get_different_keys() {
+        let mut ds = Vec::new();
+        for seed in [7u64, 8] {
+            let (_g, m) = install(false, 0);
+            m.lock().unwrap().rng = Some(ChaCha8Rng::seed_from_u64(seed));
+            ds.push(key_of(ecdsa::backup_key()).unwrap());
+        }
+        assert_ne!(ds[0], ds[1]);
+    }
+
+    #[test]
+    fn a_blank_slot_that_cannot_be_written_gives_no_key_and_is_left_alone() {
+        // Locked data zone: the chip refuses the clear write.
+        {
+            let (_g, m) = install(false, 0);
+            m.lock().unwrap().data_locked = true;
+            assert!(matches!(ecdsa::backup_key(), BackupKey::NoKey));
+            assert_eq!(m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize], [0u8; 32]);
+        }
+        // A write that is accepted but does not stick is caught by the check.
+        let (_g, m) = install(false, 0);
+        m.lock().unwrap().drop_writes = true;
+        assert!(matches!(ecdsa::backup_key(), BackupKey::NoKey));
+        assert_eq!(m.lock().unwrap().slot_writes, 1, "the write was tried");
+    }
+
+    #[test]
+    fn no_chip_means_no_backup_key() {
+        let (_g, m) = install(false, 0);
+        m.lock().unwrap().fail_next_wake = 1000;
+        assert!(matches!(ecdsa::backup_key(), BackupKey::NoChip));
+        assert_eq!(m.lock().unwrap().slot_writes, 0);
+    }
+
+    #[test]
+    fn the_whole_chain_from_the_chip_digest_to_the_sealed_backup() {
+        let (g, m) = install(false, 0);
+        let d = key_of(ecdsa::backup_key()).unwrap();
+        let secret = [0x5Au8; puf_backup::SECRET_LEN];
+        let mut sector = vec![0xFFu8; puf_backup::PAGE];
+        let plan = puf_backup::plan(&sector, &d, &secret);
+        if let puf_backup::Plan::Format { data } = &plan {
+            sector.fill(0xFF);
+            sector[..data.len()].copy_from_slice(data);
+        } else {
+            panic!("expected a format");
+        }
+        // The key slot of this chip opens it; another chip's slot does not.
+        assert_eq!(&*puf_backup::find(&sector, &d).unwrap(), &secret);
+        // Nothing of the chip key or the digest is in the sector.
+        let slot_key = m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize];
+        assert!(!sector.windows(8).any(|w| w == &slot_key[..8] || w == &d[..8]));
+        // Another chip (its own random key in the same slot) does not open it.
+        drop(g);
+        let (_g2, m2) = install(false, 0);
+        m2.lock().unwrap().rng = Some(ChaCha8Rng::seed_from_u64(99));
+        let other = key_of(ecdsa::backup_key()).unwrap();
+        assert!(puf_backup::find(&sector, &other).is_none());
     }
 }

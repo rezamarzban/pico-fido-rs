@@ -30,6 +30,12 @@ pub trait ChipOps {
     fn counter(&mut self, id: u8) -> Result<u32, Error>;
     #[allow(dead_code)]
     fn counter_inc(&mut self, id: u8) -> Result<u32, Error>;
+    /// HMAC-SHA-256 of `data` (at most 40 bytes) with the key stored in data slot `slot`, computed
+    /// inside the chip (SHA command, HMAC mode): the key never leaves it.
+    fn hmac(&mut self, slot: u8, data: &[u8]) -> Result<[u8; 32], Error>;
+    /// Writes 32 bytes in the clear into data slot `slot` (block 0). The chip refuses (status 0x0F)
+    /// unless the data zone is unlocked or the slot's configuration allows clear writes.
+    fn write_slot(&mut self, slot: u8, data: &[u8; 32]) -> Result<(), Error>;
     /// Serial number, revision, I2C address and lock state (Info + two config-zone reads).
     fn info(&mut self) -> Result<proto::ChipInfo, Error>;
 }
@@ -187,6 +193,52 @@ impl<B: Bus> ChipOps for Atecc<B> {
                 &mut r,
             )?;
             fixed::<64>(&r[..n])
+        })
+    }
+
+    fn hmac(&mut self, slot: u8, data: &[u8]) -> Result<[u8; 32], Error> {
+        Self::check_slot(slot)?;
+        if data.len() > 40 {
+            return Err(Error::Param);
+        }
+        self.session(|c| {
+            let mut r = [0u8; proto::MAX_RESP];
+            let n = c.command(
+                proto::OP_SHA,
+                proto::SHA_HMAC_START,
+                slot as u16,
+                &[],
+                &mut r,
+            )?;
+            if n != 0 {
+                return Err(Error::Param);
+            }
+            let n = c.command(
+                proto::OP_SHA,
+                proto::SHA_HMAC_END,
+                data.len() as u16,
+                data,
+                &mut r,
+            )?;
+            fixed::<32>(&r[..n])
+        })
+    }
+
+    fn write_slot(&mut self, slot: u8, data: &[u8; 32]) -> Result<(), Error> {
+        Self::check_slot(slot)?;
+        self.session(|c| {
+            let mut r = [0u8; proto::MAX_RESP];
+            let n = c.command(
+                proto::OP_WRITE,
+                proto::WRITE_DATA_32,
+                proto::data_slot_addr(slot),
+                data,
+                &mut r,
+            )?;
+            if n != 0 {
+                return Err(Error::Param);
+            }
+            Ok(())
         })
     }
 

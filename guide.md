@@ -62,10 +62,11 @@ almost solid = waiting for your button press.
   SRAM PUF (state, bit errors of this boot's sample, share of ones, whether this boot was a power-on reset, whether this
   chip has a backup of the PUF secret and how many chips do, and whether the key came from the PUF or from the backup).
   If the flash key is not available the key halts (LED blinks 3x) and the display stays on that page and says why.
-- **Backup of the PUF secret.** The first time the PUF works with a chip connected, that chip gets a record of the PUF
-  secret in the Pico's flash (sealed with the chip's slot-0 public key). If the PUF later fails, connect a chip that has
-  a record and the key restores itself; unplug and replug once to let it write a new helper sector. (Known weakness:
-  anyone with a copy of the flash and a public key of one of your chips can open that backup; `SECURITY.md`.)
+- **Backup of the PUF secret.** The first time the PUF works with a chip connected (that has, or can be given, an HMAC key in slot 11), that chip gets a record of the PUF
+  secret in the Pico's flash, sealed with a key derived from an HMAC that only that chip can compute (a random key in its
+  data slot 11, written the first time if the slot is blank). If the PUF later fails, connect a chip that has a record
+  and the key restores itself; unplug and replug once to let it write a new helper sector. (Whoever holds one of your
+  chips and the flash can open that backup; `SECURITY.md`.)
 - **Wrong PINs:** the usual CTAP rules apply: after 3 wrong PINs in a row, unplug and replug; after 8 wrong PINs
   without a correct one in between, the PIN is blocked. A correct PIN resets the counts.
 - **Forgotten or blocked PIN:** the only way out is a reset, which **deletes all credentials** from the key store (the

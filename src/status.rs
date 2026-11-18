@@ -99,11 +99,12 @@ pub static PUF_PAIR_PM: AtomicU32 = AtomicU32::new(0);
 pub static PUF_POR: AtomicBool = AtomicBool::new(false);
 
 /// `BACKUP_STATE`: the backup of the connected chip.
-pub const BK_UNKNOWN: u8 = 0; // not checked, or no chip / no key in slot 0 to seal it with
+pub const BK_UNKNOWN: u8 = 0; // not checked, or no chip that can give a backup key
 pub const BK_HAVE: u8 = 1; // this chip already had a record
 pub const BK_NEW: u8 = 2; // written at this start
 pub const BK_FULL: u8 = 3; // the backup sector has no room for this chip
 pub const BK_ERR: u8 = 4; // the backup sector could not be read or written
+pub const BK_NOKEY: u8 = 5; // the chip's HMAC slot is blank and no key could be written into it
 pub static BACKUP_STATE: AtomicU8 = AtomicU8::new(BK_UNKNOWN);
 /// Different chips that have a record in the backup sector.
 pub static BACKUP_CHIPS: AtomicU32 = AtomicU32::new(0);
