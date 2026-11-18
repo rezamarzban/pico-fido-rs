@@ -85,11 +85,10 @@ Experimental firmware; read this before relying on it.
   the whole new list into the other sector and commits it with a generation-numbered header written last, so a power
   failure leaves the complete old or the complete new list, never an empty or truncated one (checked on a host
   model with the power cut after every step and in the middle of every program and erase; not on hardware).
-* **If the site list is lost** (the whole flash is erased from outside, or both sectors are destroyed), the keys are
-  still in the chip and are taken over again by new sites in slot order. Old credentials keep working (their
-  credential ID names the slot), but a new registration may be given a key that an earlier site already uses: those
-  two sites could then recognise the same public key. After erasing the flash, register at sites that matter in the
-  same order as before, or treat the old credentials as shared.
+* **If the site list is lost** (the whole flash is erased from outside, or both sectors are destroyed), the slots still hold
+  keys but belong to nobody: new sites get those slots in slot order and GenKey replaces the old key each time, so
+  no two sites ever share a public key by this route. The price: credentials that were registered in such a slot
+  stop working (their key is gone for good). Treat a lost site list as the loss of those credentials.
 * **The signature count can lag by the signatures in flight.** It is copy-on-write between two flash regions like the
   site directory, so a power cut during a compaction leaves the old or the new counts, never blank or older ones; the
   signature that was being counted at that moment may be missing. If a flash write fails the display shows the last

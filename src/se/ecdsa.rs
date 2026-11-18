@@ -6,12 +6,12 @@
 //!   1. the RP already has a slot in the directory and that slot holds a key: use it again (no
 //!      slot is consumed, accounts at the same site then share one public key);
 //!   2. otherwise the first credential slot that is NOT owned by another RP and already HOLDS a
-//!      private key is taken over for this RP (its key is used as it is, no GenKey);
+//!      private key gets a NEW key with GenKey (the old key is discarded, it is never used);
 //!   3. otherwise the first slot that holds no key (its public key cannot be read) gets a new key
 //!      with GenKey.
 //!
 //!   Either way the RP is written to the directory before the key is handed out. A key that is
-//!   owned by an RP is never touched, regenerated or overwritten. When every slot belongs to
+//!   owned by an RP is never touched, regenerated or overwritten (only slots of nobody are). When every slot belongs to
 //!   another RP, or the chip or the directory cannot be used, `random()` returns an error, so the
 //!   registration fails (OpenSK answers with a CTAP error) and the existing keys stay. The RP
 //!   comes from OpenSK through `Rng::take_rp_id_hash` (third_party/opensk-rp-hint.patch); without
@@ -258,6 +258,43 @@ pub fn backup_key() -> BackupKey {
     }
 }
 
+/// Result of `rotate_backup_key`.
+pub enum Rotation {
+    /// A new random key is in `BACKUP_SLOT` (checked with the chip's HMAC); this is its digest.
+    /// The old key is gone, records sealed with its digest can no longer be opened.
+    Rotated(zeroize::Zeroizing<[u8; 32]>),
+    /// The slot could not be rewritten (e.g. the data zone is locked and clear writes are refused,
+    /// or the chip failed); the key that is in it now gives this digest.
+    Kept(zeroize::Zeroizing<[u8; 32]>),
+    /// Not even the digest of the current key could be had.
+    Failed,
+}
+
+/// Replaces the key in `BACKUP_SLOT` with a new random one from the chip's RNG. Called by the
+/// firmware every time a NEW backup record is about to be written, so that every backup is sealed
+/// under a key that has never been used before. The new key is proven with the chip's own HMAC
+/// (compared with the software HMAC of the key that was written). If the slot cannot be rewritten
+/// the current digest is returned as `Kept` so that the caller can still make its backup.
+pub fn rotate_backup_key() -> Rotation {
+    let kept = || match with_chip(|c| c.hmac(BACKUP_SLOT, BACKUP_CHALLENGE)) {
+        Ok(d) if !is_blank_answer(&d) => Rotation::Kept(zeroize::Zeroizing::new(d)),
+        _ => Rotation::Failed,
+    };
+    let Ok(r) = with_chip(|c| c.random()) else {
+        return kept();
+    };
+    let r = zeroize::Zeroizing::new(r);
+    if with_chip(|c| c.write_slot(BACKUP_SLOT, &r)).is_err() {
+        return kept();
+    }
+    match with_chip(|c| c.hmac(BACKUP_SLOT, BACKUP_CHALLENGE)) {
+        Ok(d) if d == software_hmac(&r, BACKUP_CHALLENGE) => {
+            Rotation::Rotated(zeroize::Zeroizing::new(d))
+        }
+        _ => kept(),
+    }
+}
+
 /// Serial number of the connected chip, as of the last `chip_info()`.
 pub fn chip_serial() -> Option<ChipSerial> {
     critical_section::with(|cs| SERIAL.borrow(cs).get())
@@ -485,35 +522,40 @@ impl EcSecretKey for SeSecretKey {
                 return Ok(SeSecretKey { slot, pubkey });
             }
         }
-        // 2. A slot of nobody that already holds a private key: this RP takes it over as it is.
-        //    The slots without a key are collected for step 3 (also those with a stale entry).
+        // Classify the credential slots. `keyed_free`: slots of nobody that already hold a private
+        // key (only known when there is a directory: without it ownership is unknown, so such a
+        // slot is never touched). `empty`: slots without a key (also those with a stale entry).
+        let mut keyed_free = [0u8; SLOTS as usize];
+        let mut n_keyed = 0;
         let mut empty = [0u8; SLOTS as usize];
         let mut n_empty = 0;
         for i in 0..SLOTS as usize {
             let slot = FIRST_CRED_SLOT + i as u8;
-            let has_key = slot_has_key(slot).map_err(|_| SignError)?;
-            if !has_key {
+            if !slot_has_key(slot).map_err(|_| SignError)? {
                 empty[n_empty] = slot;
                 n_empty += 1;
-                continue;
-            }
-            if let (Some(rp), Some(dir)) = (&rp, dir.as_mut()) {
-                if !dir_owned(dir, i) {
-                    let pubkey = cached_pubkey(slot).map_err(|_| SignError)?;
-                    dir_record(dir, slot, rp)?;
-                    return Ok(SeSecretKey { slot, pubkey });
-                }
+            } else if dir.as_ref().is_some_and(|d| !dir_owned(d, i)) {
+                keyed_free[n_keyed] = slot;
+                n_keyed += 1;
             }
         }
-        // 3. First empty slot, in order: GenKey. If the chip refuses GenKey in a slot (e.g. one that
-        //    cannot hold a P-256 private key) the next one is tried, so such a slot is never used.
-        for &slot in &empty[..n_empty] {
+        // 2. then 3.: GenKey in the first slot of nobody that holds a key (the old key is thrown
+        //    away), then in the first empty slot, in order. If the chip refuses GenKey in a slot
+        //    (e.g. one that cannot hold a P-256 private key) the next one is tried, so such a slot
+        //    is never used; a refused slot keeps whatever it held.
+        let candidates = keyed_free[..n_keyed]
+            .iter()
+            .map(|&s| (s, true))
+            .chain(empty[..n_empty].iter().map(|&s| (s, false)));
+        for (slot, was_keyed) in candidates {
             match with_chip(|c| c.gen_key(slot)) {
                 Ok(pubkey) => {
                     critical_section::with(|cs| {
                         PUBKEYS.borrow(cs).borrow_mut()[slot as usize] = Some(pubkey);
-                        let u = USED.borrow(cs);
-                        u.set(u.get().map(|n| (n + 1).min(SLOTS)));
+                        if !was_keyed {
+                            let u = USED.borrow(cs);
+                            u.set(u.get().map(|n| (n + 1).min(SLOTS)));
+                        }
                         let k = KEYS.borrow(cs);
                         k.set(k.get().map(|m| m | (1 << slot)));
                     });
@@ -526,7 +568,7 @@ impl EcSecretKey for SeSecretKey {
                 Err(_) => return Err(SignError),
             }
         }
-        // No free slot: an existing key is never overwritten.
+        // No slot of nobody left: a key that belongs to a site is never overwritten.
         Err(SignError)
     }
 

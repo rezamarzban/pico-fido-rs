@@ -6,7 +6,7 @@
 //! * Nothing else is stored in the chip: the site directory (which site owns which key slot) lives in the
 //!   Pico's flash (`env/dir_flash.rs`, reached through `ecdsa::DirStore`)
 //! * No counters at all: signatures are not counted; a slot that is owned by a site is never overwritten.
-//!   Slots that already hold a key are taken over, empty slots get a key with GenKey
+//!   Slots of nobody that hold a key and empty slots both get a new key with GenKey
 //! * Info + config-zone reads (serial number, revision, lock state: shown on the OLED)
 //!
 //! Modules:

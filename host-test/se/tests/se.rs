@@ -116,6 +116,11 @@ fn apply_dir(pages: &mut [Vec<u8>; 2], p: DirPlan) -> bool {
 
 impl Model {
     /// Serial number of the chip that is "plugged in" (SN0-3 and SN4-8 of the config zone).
+    /// Public key X||Y of the private key in `slot` (the slot must hold one).
+    fn pubkey(&self, slot: usize) -> [u8; 64] {
+        let k = self.keys[slot].as_ref().expect("the slot holds a key");
+        VerifyingKey::from(k).to_encoded_point(false).as_bytes()[1..].try_into().unwrap()
+    }
     fn serial(&self) -> ChipSerial {
         let mut s = [0u8; 9];
         s[..4].copy_from_slice(&self.config[..4]);
@@ -936,11 +941,12 @@ fn a_directory_that_cannot_be_saved_fails_the_registration_and_loses_no_slot() {
     assert!(register_panics(&mut rng, 1));
     assert_eq!(m.lock().unwrap().dir_writes, 0);
     assert_eq!(m.lock().unwrap().created, vec![FIRST_CRED_SLOT as usize]);
-    // Flash works again: the key that was made but never handed out is taken over, no new GenKey.
+    // Flash works again: the slot holds a key that nobody owns (it was never handed out), so it gets
+    // a NEW key with GenKey (the unowned key is never used as it is).
     m.lock().unwrap().dir_fails = false;
     let a = register(&mut rng, 1);
     assert_eq!(a.export()[1], FIRST_CRED_SLOT);
-    assert_eq!(m.lock().unwrap().created.len(), 1, "the slot was reused, not regenerated");
+    assert_eq!(m.lock().unwrap().created, vec![FIRST_CRED_SLOT as usize; 2], "slot 1 was regenerated, not reused");
     check_sig(&a, b"works");
 }
 
@@ -974,31 +980,39 @@ fn an_entry_without_a_key_behind_it_is_ignored() {
 }
 
 #[test]
-fn slots_that_already_hold_a_key_are_taken_over_one_per_site() {
+fn slots_that_hold_a_key_of_nobody_are_regenerated_one_per_site() {
     let (_g, m) = install(false, 0);
     // Slots 1 and 2 already hold keys, the flash directory is empty (e.g. a freshly erased Pico).
     let mut rng = HintRng::new(26);
     let _ = SeSecretKey::random(&mut rng).unwrap();
     let _ = SeSecretKey::random(&mut rng).unwrap();
-    assert_eq!(m.lock().unwrap().created.len(), 2);
+    let old = {
+        let g = m.lock().unwrap();
+        [ecdsa::handle(1, 1, &g.pubkey(1)), ecdsa::handle(1, 2, &g.pubkey(2))]
+    };
+    assert_eq!(m.lock().unwrap().created, vec![1, 2]);
     let k1 = register(&mut rng, 1);
     let k2 = register(&mut rng, 2);
-    assert_eq!(k1.export()[1], FIRST_CRED_SLOT, "site 1 takes the key in slot 1");
-    assert_eq!(k2.export()[1], FIRST_CRED_SLOT + 1, "site 2 takes the key in slot 2");
-    assert_eq!(m.lock().unwrap().created.len(), 2, "no GenKey: the existing keys were used as they are");
-    check_sig(&k1, b"existing key signs");
-    check_sig(&k2, b"existing key signs");
-    // Both are recorded: the same sites find the same slots again.
+    assert_eq!(k1.export()[1], FIRST_CRED_SLOT, "site 1 gets slot 1");
+    assert_eq!(k2.export()[1], FIRST_CRED_SLOT + 1, "site 2 gets slot 2");
+    assert_eq!(m.lock().unwrap().created, vec![1, 2, 1, 2], "GenKey ran again in both keyed slots");
+    assert_ne!(k1.export(), old[0], "the old key of slot 1 is gone");
+    assert_ne!(k2.export(), old[1], "the old key of slot 2 is gone");
+    assert!(SeSecretKey::import(&old[0]).is_none(), "a handle of the discarded key no longer imports");
+    check_sig(&k1, b"new key signs");
+    check_sig(&k2, b"new key signs");
+    // Both are recorded: the same sites find the same slots again, without another GenKey.
     assert_eq!(register(&mut rng, 1).export(), k1.export());
     assert_eq!(register(&mut rng, 2).export(), k2.export());
-    // Site 3: no key left to take over, so the first EMPTY slot gets a new key.
+    assert_eq!(m.lock().unwrap().created.len(), 4);
+    // Site 3: no keyed slot of nobody left, so the first EMPTY slot gets a new key.
     let k3 = register(&mut rng, 3);
     assert_eq!(k3.export()[1], FIRST_CRED_SLOT + 2);
-    assert_eq!(m.lock().unwrap().created.len(), 3);
+    assert_eq!(m.lock().unwrap().created, vec![1, 2, 1, 2, 3]);
 }
 
 #[test]
-fn a_mix_of_keyed_and_empty_slots_uses_the_keyed_ones_first() {
+fn a_mix_of_keyed_and_empty_slots_regenerates_the_keyed_ones_first() {
     let (_g, m) = install(false, 0);
     // Keys in slots 3 and 5 only (made directly in the chip), everything else empty.
     {
@@ -1010,13 +1024,14 @@ fn a_mix_of_keyed_and_empty_slots_uses_the_keyed_ones_first() {
     }
     let mut rng = HintRng::new(28);
     let slots: Vec<u8> = (1..=4u8).map(|rp| register(&mut rng, rp).export()[1]).collect();
-    // Sites 1 and 2 take the existing keys (slots 3, 5); sites 3 and 4 get GenKey in slots 1, 2.
+    // Sites 1 and 2 get GenKey in the keyed slots 3, 5 (the old keys are discarded); sites 3 and 4
+    // get GenKey in the empty slots 1, 2. GenKey ran in every case.
     assert_eq!(slots, vec![3, 5, 1, 2]);
-    assert_eq!(m.lock().unwrap().created, vec![1, 2]);
+    assert_eq!(m.lock().unwrap().created, vec![3, 5, 1, 2]);
 }
 
 #[test]
-fn a_slot_owned_by_another_site_is_never_taken_over() {
+fn a_slot_owned_by_another_site_is_never_regenerated() {
     let (_g, m) = install(false, 0);
     let mut rng = HintRng::new(29);
     let slots: Vec<u8> = (1..=SLOTS).map(|rp| register(&mut rng, rp).export()[1]).collect();
@@ -1024,11 +1039,12 @@ fn a_slot_owned_by_another_site_is_never_taken_over() {
     // All nine slots hold keys and belong to sites 1..=9: a tenth site gets nothing.
     assert!(register_panics(&mut rng, 50));
     assert_eq!(m.lock().unwrap().created.len(), SLOTS as usize);
-    // After the Pico's flash was erased (directory gone) the same keys are handed out again, one per site.
+    // After the Pico's flash was erased (directory gone) every slot holds a key of nobody: each new
+    // site gets one of them, but with a NEW key (GenKey), never the old one.
     m.lock().unwrap().pages = [vec![0xFF; dirlog::PAGE], vec![0xFF; dirlog::PAGE]]; // the Pico's flash was erased
     let again: Vec<u8> = (101..101 + SLOTS).map(|rp| register(&mut rng, rp).export()[1]).collect();
-    assert_eq!(again, slots, "every site gets one of the existing keys, no GenKey");
-    assert_eq!(m.lock().unwrap().created.len(), SLOTS as usize);
+    assert_eq!(again, slots, "every site gets one of the slots, in order");
+    assert_eq!(m.lock().unwrap().created.len(), 2 * SLOTS as usize, "every slot was regenerated once more");
 }
 
 // ---------------------------------------------------------------- flash page of the directory
@@ -2578,6 +2594,95 @@ mod backup_key_tests {
         m.lock().unwrap().drop_writes = true;
         assert!(matches!(ecdsa::backup_key(), BackupKey::NoKey));
         assert_eq!(m.lock().unwrap().slot_writes, 1, "the write was tried");
+    }
+
+    fn rotated(r: ecdsa::Rotation) -> Option<[u8; 32]> {
+        match r {
+            ecdsa::Rotation::Rotated(d) => Some(*d),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn every_rotation_writes_a_new_random_key_even_if_the_slot_already_has_one() {
+        let (_g, m) = install(false, 0);
+        let key: [u8; 32] = core::array::from_fn(|i| i as u8);
+        m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize] = key;
+        let d0 = key_of(ecdsa::backup_key()).unwrap();
+        let mut seen = vec![key];
+        let mut digests = vec![d0];
+        for n in 1..=3u32 {
+            let d = rotated(ecdsa::rotate_backup_key()).expect("rotated");
+            let (now, writes) = {
+                let g = m.lock().unwrap();
+                (g.slot_data[ecdsa::BACKUP_SLOT as usize], g.slot_writes)
+            };
+            assert_eq!(writes, n, "one clear write per rotation");
+            assert!(!seen.contains(&now), "a key that was never used before");
+            assert_eq!(d, sw_hmac(&now), "the digest is the chip's HMAC with the new key");
+            assert!(!digests.contains(&d));
+            // The next start reads the new key and writes nothing.
+            assert_eq!(key_of(ecdsa::backup_key()).unwrap(), d);
+            assert_eq!(m.lock().unwrap().slot_writes, n);
+            seen.push(now);
+            digests.push(d);
+        }
+    }
+
+    #[test]
+    fn a_rotation_that_cannot_write_keeps_the_old_key_and_says_so() {
+        // Locked data zone: the clear write is refused, the old key and its digest stay.
+        let (_g, m) = install(false, 0);
+        let key: [u8; 32] = core::array::from_fn(|i| 0x40 + i as u8);
+        m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize] = key;
+        m.lock().unwrap().data_locked = true;
+        match ecdsa::rotate_backup_key() {
+            ecdsa::Rotation::Kept(d) => assert_eq!(*d, sw_hmac(&key)),
+            _ => panic!("expected Kept"),
+        }
+        assert_eq!(m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize], key);
+        // A write that is accepted but does not stick is caught by the check: still the old digest.
+        let (_g, m) = install(false, 0);
+        m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize] = key;
+        m.lock().unwrap().drop_writes = true;
+        match ecdsa::rotate_backup_key() {
+            ecdsa::Rotation::Kept(d) => assert_eq!(*d, sw_hmac(&key)),
+            _ => panic!("expected Kept"),
+        }
+    }
+
+    #[test]
+    fn a_rotation_without_a_chip_fails() {
+        let (_g, m) = install(false, 0);
+        m.lock().unwrap().fail_next_wake = 1000;
+        assert!(matches!(ecdsa::rotate_backup_key(), ecdsa::Rotation::Failed));
+    }
+
+    #[test]
+    fn a_record_made_before_a_rotation_is_not_opened_by_the_new_key() {
+        let (_g, m) = install(false, 0);
+        let key: [u8; 32] = core::array::from_fn(|i| 0x80 + i as u8);
+        m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize] = key;
+        let old = key_of(ecdsa::backup_key()).unwrap();
+        let secret = [0x77u8; puf_backup::SECRET_LEN];
+        let mut sector = vec![0xFFu8; puf_backup::PAGE];
+        let apply = |sector: &mut Vec<u8>, plan: puf_backup::Plan| match plan {
+            puf_backup::Plan::Format { data } => {
+                sector.fill(0xFF);
+                sector[..data.len()].copy_from_slice(&data);
+            }
+            puf_backup::Plan::Append { offset, data } => sector[offset..offset + data.len()].copy_from_slice(&data),
+            p => panic!("unexpected plan {p:?}"),
+        };
+        apply(&mut sector, puf_backup::plan(&sector, &old, &secret));
+        assert!(puf_backup::find(&sector, &old).is_some());
+        // The firmware's sequence for a new record: plan with the current key says "write", so the key
+        // is rotated first and the record is sealed under the new digest.
+        let new = rotated(ecdsa::rotate_backup_key()).unwrap();
+        assert!(puf_backup::find(&sector, &new).is_none(), "the old record needs the old key");
+        let other_secret = [0x78u8; puf_backup::SECRET_LEN];
+        apply(&mut sector, puf_backup::plan(&sector, &new, &other_secret));
+        assert_eq!(&*puf_backup::find(&sector, &new).unwrap(), &other_secret);
     }
 
     #[test]

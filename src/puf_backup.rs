@@ -5,7 +5,7 @@
 //! secret is written to the backup sector sealed (AES-256-GCM, `seal.rs`) with a key derived from
 //! that chip's **HMAC digest**: HMAC-SHA-256, computed INSIDE the chip, of a fixed challenge with a
 //! random 32-byte key that lives in one of the chip's secret data slots (`se::ecdsa::backup_key`,
-//! slot 11). That key was made by the chip's own RNG, is written once and never leaves the chip. If
+//! slot 11). That key was made by the chip's own RNG, is replaced by a new random key whenever a new record is written (`rotate_backup_key`) and never leaves the chip. If
 //! the PUF later cannot be read (noisy sample, damaged or lost helper sector), connecting any chip
 //! that has a record brings the secret back, and every key derived from it with it.
 //!
@@ -18,7 +18,7 @@
 //! log of records `[chip id (8)][sealed secret (60)][6-byte check]`. The chip id is a hash of the
 //! digest (it names the record, it does not reveal the digest). The newest record of a chip that
 //! really opens with that chip's key is its secret; a half-written record fails its check and is
-//! skipped. Records are never removed: a chip is written once (again only if the secret changed,
+//! skipped. Records are never removed: a chip is written once (again only if the secret changed, each time under a new slot-11 key,
 //! after a re-enrolment), up to `MAX_RECS` records; a full sector refuses new chips (`Plan::Full`)
 //! and keeps what it has. A sector without a valid header holds no backup and may be formatted
 //! (this also drops records of the older, slot-0-public-key format, which cannot be opened any more;

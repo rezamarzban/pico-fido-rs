@@ -67,7 +67,10 @@ linker's FLASH region by `build.rs`. From the end of flash downwards:
   chip's own RNG and is written once: by the firmware itself the first time it finds slot 11 blank (all zeros or all
   ones; possible only while the chip lets a clear write through, i.e. before the data zone is locked, and checked by
   comparing the chip's HMAC with the software HMAC of the key), or beforehand with `hmac-write-key 11 0 key_file` of atecc-util-py.
-  A slot that already holds a key is never written; a blank slot that cannot be written means no backup (the OLED says
+  Every time a NEW backup record is about to be written (first record of a chip, or after a re-enrolment), slot 11 first
+  gets a **new random key** (`rotate_backup_key`, proven with the chip's HMAC) and the record is sealed under it; the old
+  key is not used again, so older records of that chip can no longer be opened. If the slot cannot be rewritten (e.g. data
+  zone locked), the current key is used for that record. A start that needs no new record writes nothing. A blank slot that cannot be written means no backup (the OLED says
   NO HMAC KEY), because a blank slot would give a known constant. One record per chip (55 fit). If a later start cannot
   read the PUF (the sample does not decode, the helper sector is damaged or erased), connecting any chip that has a record
   brings the secret back and with it every key; if the sample allows it (power-on reset, balanced pattern) a new helper
@@ -82,79 +85,4 @@ linker's FLASH region by `build.rs`. From the end of flash downwards:
 * **First start.** With an erased helper sector the firmware wipes store, directory and counter (an older firmware left
   plaintext there), then writes the helper sector (the commit). This needs a **power-on reset: unplug the key and plug it
   in again after flashing**; otherwise the LED shows 3 short blinks + pause and nothing runs. The same blink means
-  "no usable key" later (damaged helper sector, sample does not decode and the connected chip has no backup record: re-plug,
-  or connect a chip that has one; still failing: erase the flash). The OLED then stays on its SRAM PUF page and says why.
-* **Upgrading** from an unencrypted build, or from an earlier encrypted one (the helper format is now `PUF3`, 4 KiB of RAM,
-  and the store entries have a new format): erase the whole flash first (BOOTSEL `flash_nuke.uf2`). Credentials of the old
-  firmware are not kept; the chip's keys stay and are taken over again (see "Key slots"). Directory capacity: unchanged.
-* Values: one store entry holds 994 bytes of plaintext once sealed; a longer value (OpenSK's 1023-byte large-blob
-  shards) is split over two entries (the second at key + 2048, one store transaction, `src/spill.rs`), up to 1988 bytes.
-  Key ids and value sizes are visible; no rollback protection. See `SECURITY.md`.
-
-## Key slots (one key per site)
-The site directory (which site owns which of the 9 credential slots) is in the Pico's flash, not in the chip. For a
-site that has no slot yet, `se/ecdsa.rs` takes, in this order: (1) the first slot that already **holds a private key**
-and belongs to no other site (the key is used as it is, no GenKey); (2) otherwise the first **empty** slot, where it runs
-GenKey. Slots owned by another site are never touched. A power failure cannot lose the directory (see above). If it is lost anyway (flash erased from outside), the keys are still in
-the chip and are taken over again, one per site, in slot order; credentials registered earlier keep working (their
-credential ID names the slot), but a site may then end up with another site's old key (see `SECURITY.md`).
-
-## Several chips
-Every ATECC608A has a unique 9-byte serial number. The Pico's flash keeps the **site directory** and the **signature count**
-separately for each serial number (`src/se/dirlog.rs`, `src/se/tallylog.rs`). The serial is read from the chip at start-up
-(and again before each new registration), and from then on that chip's own information is used; swapping the chip
-(with the key unplugged) switches to the information of the chip that is now connected, and a chip that was never seen
-starts empty. Up to 14 completely used chips fit in a directory sector (127 records); the signature log keeps the 32 chips
-with the highest totals. The OLED chip page shows the serial of the chip that is in use.
-What is NOT per chip: the PIN, the credential-ID encryption keys and resident credentials are OpenSK's single store.
-A credential made with chip A cannot sign while chip B is connected (the handle in its credential ID names a key B does
-not have); it works again when A is back. After updating from a build with the single-chip pages, the directory and the
-count start empty once (the keys stay in the chip and are taken over again, see above).
-
-## Build
-Needs the **nightly** pinned in `rust-toolchain.toml` and `flip-link`. Release builds are size-optimised.
-
-    git submodule add --depth 1 https://github.com/google/OpenSK.git third_party/OpenSK
-    git -C third_party/OpenSK fetch --depth 1 origin $(cat third_party/OPENSK_REV)
-    git -C third_party/OpenSK checkout $(cat third_party/OPENSK_REV)
-    sh third_party/apply-opensk-patch.sh          # the RP-hint patch
-
-    cargo build --release                         # 2 MiB board, no USB serial number
-    cargo build --release --no-default-features --features rp2040_board,flash_4m,usb_serial
-
-Enable **exactly one** `flash_*` feature. `usb_serial` adds the flash unique ID as USB serial number (off by
-default: it lets hosts recognise the device). `oled` (default) is an SSD1306 on I2C0 (SDA GP16, SCL GP17,
-0x3C); build without it by leaving it out of `--features`. **Commit `Cargo.lock`** (none in this tree).
-`build.sh [-s 2|4|8|16] [-u] [-O]` builds a UF2 from the repository (needs network).
-
-## Provisioning the chip (once per chip)
-See `atecc608a/CONFIG.md`: write and lock the configuration (`tools/gen_atecc_config.py`), then `tools/make_attest_cert.py` creates the attestation key in the chip and its self-signed
-certificate, which is stored in the token once with OpenSK's `tools/configure.py`.
-
-## Tests
-    sh host-test/run.sh        # OpenSK's library unit tests + host-test/se (chip protocol, command layer,
-                               # OpenSK ECDSA adapter incl. attestation slot, against a software chip model)
-    python3 atecc608a/tools/test_gen_config.py
-    python3 atecc608a/tools/make_attest_cert.py --selftest
-
-## Verification status
-**The `atecc1` code up to "OpenSK based ATECC support v2.1" was built and tested on browsers and operating
-systems** (reported by the maintainer, not independently verified). Everything after it, including the flash
-encryption, was checked like this (stable Rust 1.99 with `RUSTC_BOOTSTRAP=1`, `-Zbuild-std=core,alloc`, no nightly pin):
-
-* `cargo check`, `cargo clippy -- --deny=warnings` and `cargo build --release` for `thumbv6m-none-eabi` pass (linked with
-  `rust-lld`; flip-link is not installed in that setup); the image is about 230 KB, `.data`+`.bss` end well below the
-  PUF region, and `rustfmt --check` is clean.
-* `host-test/se` (87 tests): the chip model and the OpenSK adapter, the two-sector directory with the power cut after
-  every step and in the middle of every program/erase step, the sealed log layouts with known-answer vectors from
-  `host-test/seal_ref.py`, the PUF arithmetic (bit-sliced majority against a naive one, noise at 10 %, bias
-  refusal), the long-value splitting and the PUF-secret backup (record format, torn writes, forgery, capacity, and the
-  start-up policy that decides between restore, first start and halt).
-* OpenSK's own unit tests pass at the pinned revision with the patch applied (350, and 401 with `config_command,ctap1`).
-* **Not done:** nothing was run on a Pico, a real ATECC608A or real SRAM. **Before relying on the flash encryption, flash a spare Pico and
-  read the `puf: ... bit errors ... ones: raw ... pairs ...` line at several boots, temperatures and on several
-  boards:** the sample must stay near 50 % pairs and the error rate well below 10 %.
-Run `host-test/run.sh` and the acceptance test in `atecc608a/CONFIG.md` on a spare chip before locking a chip you care
-about. USB VID/PID (`0xc0de:0xcafe`) are prototype placeholders (`src/usb/mod.rs`).
-
-`guide.md` is the user guide (udev rule, PIN, registering, LED).
+  "no usable key" later (damaged
