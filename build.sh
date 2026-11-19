@@ -11,6 +11,8 @@
 #   -o  output directory (default ./out)
 # Environment: OPENSK_URL / OPENSK_REV override where and which OpenSK commit is fetched
 #   (default: google/OpenSK at the commit in third_party/OPENSK_REV).
+# Note: chip slot 11 (PUF-backup key) gets a NEW random key each time a new backup record is written; a
+#   damaged backup sector is never erased by the firmware (erase the flash to start over). See README.
 # Result: <OUT_DIR>/pico-fido-rs-<N>m.uf2   (hold BOOTSEL while plugging in, copy the file to the RPI-RP2 drive)
 set -euo pipefail
 
@@ -23,7 +25,7 @@ BRANCH="atecc1"
 OUT_DIR="$PWD/out"
 OPENSK_URL="${OPENSK_URL:-https://github.com/google/OpenSK.git}"
 
-usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while getopts "s:uOnt:r:b:o:h" opt; do
   case "$opt" in
     s) FLASH_MB="$OPTARG" ;;

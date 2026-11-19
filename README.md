@@ -63,7 +63,7 @@ linker's FLASH region by `build.rs`. From the end of flash downwards:
 * **Backup of the PUF secret.** Whenever the PUF works and the connected chip can give its **backup key**, the PUF secret
   is also written once to the backup sector: AES-256-GCM sealed with a key derived (SHA-256) from an **HMAC digest computed
   inside the chip**: HMAC-SHA-256 of a fixed challenge with a random 32-byte key kept in the chip's data slot 11 (the SHA
-  command in HMAC mode, the same as `hmac-dgst` of atecc-util-py; the key never leaves the chip). That key comes from the
+  command in HMAC mode, the same as `hmac-dgst` of atecc-util-py; the key cannot be read back out of the chip). That key comes from the
   chip's own RNG and is written once: by the firmware itself the first time it finds slot 11 blank (all zeros or all
   ones; possible only while the chip lets a clear write through, i.e. before the data zone is locked, and checked by
   comparing the chip's HMAC with the software HMAC of the key), or beforehand with `hmac-write-key 11 0 key_file` of atecc-util-py.
@@ -72,7 +72,10 @@ linker's FLASH region by `build.rs`. From the end of flash downwards:
   written to flash and read back, and only then the key is written into the chip and checked with the chip's HMAC. A power cut
   in between leaves the old key and the old record usable. The old key is not used again; older records of that chip no longer
   open and stay in the sector as dead records (they use up room, and the OLED chip count may count a chip more than once).
-  If the slot cannot be rewritten (e.g. data zone locked), the record is written again under the key that is in the chip. A start that needs no new record writes nothing. A blank slot that cannot be written means no backup (the OLED says
+  If the slot cannot be rewritten (e.g. data zone locked), the record is written again under the key that is in the chip. A start that needs no new record writes nothing. With fewer than two free records the key is not replaced (the record is written under the current key).
+  **A backup sector with unknown or damaged content is never erased** (it could still hold other chips' records): no
+  backup is written (the OLED shows the backup error) and, if the PUF helper is also blank, start-up halts instead of
+  wiping; erase the whole flash (BOOTSEL `flash_nuke.uf2`) to start over. Blank, half-formatted and older-format sectors are formatted as before. A blank slot that cannot be written means no backup (the OLED says
   NO HMAC KEY), because a blank slot would give a known constant. One record per chip (55 fit). If a later start cannot
   read the PUF (the sample does not decode, the helper sector is damaged or erased), connecting any chip that has a record
   brings the secret back and with it every key; if the sample allows it (power-on reset, balanced pattern) a new helper

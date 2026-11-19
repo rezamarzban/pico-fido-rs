@@ -41,7 +41,8 @@ pub enum Domain {
     /// Signature counter (`env/tally_flash.rs`).
     Tally,
     /// Backup of the SRAM-PUF secret, one record per chip (`puf_backup.rs`); its "root" is derived
-    /// from the public key of the chip's slot 0, not from the PUF.
+    /// from the HMAC digest of the key in the chip's slot 11 (`se::ecdsa::backup_key`), not from the
+    /// PUF, so the record can only be opened with the chip.
     Backup,
 }
 

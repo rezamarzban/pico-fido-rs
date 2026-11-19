@@ -2320,7 +2320,7 @@ mod backup_tests {
     fn apply(sector: &mut Vec<u8>, plan: &Plan) -> bool {
         match plan {
             Plan::Nothing => true,
-            Plan::Full => false,
+            Plan::Full | Plan::Refuse => false,
             Plan::Append { offset, data } => {
                 for (i, b) in data.iter().enumerate() {
                     sector[offset + i] &= b;
@@ -2432,7 +2432,56 @@ mod backup_tests {
     }
 
     #[test]
-    fn a_torn_format_leaves_nothing_wrong_and_a_foreign_sector_is_formatted() {
+    fn a_damaged_or_foreign_sector_is_never_erased() {
+        // A sector with records of two chips whose header got a bit flip: not valid, but it must not be
+        // formatted (the records may still be recoverable).
+        let mut sec = blank();
+        back_up(&mut sec, 1, 7);
+        back_up(&mut sec, 2, 7);
+        let good = sec.clone();
+        assert_eq!(classify(&good), Kind::Valid);
+        for byte in [0usize, 1, 3, 7] {
+            // A bit flip in the magic ("PFRSPBK\x02": every one of these bytes has a bit set).
+            let mut bad = good.clone();
+            bad[byte] &= !(good[byte] & good[byte].wrapping_neg()); // clear the lowest set bit
+            assert_ne!(bad, good);
+            assert_eq!(classify(&bad), Kind::Damaged, "byte {byte}");
+            assert!(!readable(&bad));
+            assert_eq!(plan(&bad, &pk(3), &secret(7)), Plan::Refuse);
+            assert_eq!(plan(&bad, &pk(1), &secret(7)), Plan::Refuse);
+        }
+        // Foreign data (old firmware image bytes): refused as well.
+        for fill in [0x00u8, 0x5A] {
+            let junk = vec![fill; PAGE];
+            assert_eq!(classify(&junk), Kind::Damaged);
+            assert_eq!(plan(&junk, &pk(1), &secret(7)), Plan::Refuse);
+        }
+        // A sector of the wrong size is not trusted either.
+        assert_eq!(classify(&good[..100]), Kind::Damaged);
+        // Blank, torn and legacy sectors are readable (nothing in them can be lost).
+        assert!(readable(&blank()));
+        assert_eq!(classify(&blank()), Kind::Blank);
+        let mut torn = blank();
+        torn[..4].copy_from_slice(&header()[..4]);
+        assert_eq!(classify(&torn), Kind::Torn);
+        assert!(readable(&torn));
+    }
+
+    #[test]
+    fn free_records_counts_what_still_fits() {
+        let mut sec = blank();
+        assert_eq!(free_records(&sec), MAX_RECS, "a blank sector is all free");
+        back_up(&mut sec, 1, 7);
+        assert_eq!(free_records(&sec), MAX_RECS - 1);
+        back_up(&mut sec, 2, 7);
+        assert_eq!(free_records(&sec), MAX_RECS - 2);
+        let mut junk = vec![0x5Au8; PAGE];
+        junk[0] = 0;
+        assert_eq!(free_records(&junk), MAX_RECS, "no valid header: counted as empty (and refused anyway)");
+    }
+
+    #[test]
+    fn a_torn_format_leaves_nothing_wrong_and_a_legacy_sector_is_formatted() {
         // The first backup: header and record in one program. Power fails inside the header: the
         // sector is not valid, the next boot formats it again.
         let mut sec = blank();
@@ -2453,11 +2502,12 @@ mod backup_tests {
         }
         assert!(find(&half, &pk(1)).is_none());
         assert!(matches!(plan(&half, &pk(1), &secret(7)), Plan::Append { .. }));
-        // Old firmware image bytes or older formats: formatted.
-        for fill in [0x00u8, 0x5A] {
-            let junk = vec![fill; PAGE];
-            assert!(matches!(plan(&junk, &pk(1), &secret(7)), Plan::Format { .. }));
-        }
+        // The known older format is formatted away (its records cannot be opened any more).
+        let mut legacy = blank();
+        legacy[..8].copy_from_slice(&LEGACY_MAGIC);
+        legacy[8..40].fill(0x11);
+        assert_eq!(classify(&legacy), Kind::Legacy);
+        assert!(matches!(plan(&legacy, &pk(1), &secret(7)), Plan::Format { .. }));
         assert!(apply(&mut sec, &p));
         assert_eq!(&*find(&sec, &pk(1)).unwrap(), &secret(7));
     }
@@ -2674,12 +2724,14 @@ mod backup_key_tests {
             puf_backup::Plan::Append { offset, data } => sector[offset..offset + data.len()].copy_from_slice(&data),
             p => panic!("unexpected plan {p:?}"),
         };
-        apply(&mut sector, puf_backup::plan(&sector, &old, &secret));
+        let first = puf_backup::plan(&sector, &old, &secret);
+        apply(&mut sector, first);
         // The secret changed (re-enrolment): a new record under a new key.
         let new_secret = [0x78u8; puf_backup::SECRET_LEN];
         let p = ecdsa::prepare_backup_key().unwrap();
         let new = *p.digest();
-        apply(&mut sector, puf_backup::plan(&sector, &new, &new_secret));
+        let second = puf_backup::plan(&sector, &new, &new_secret);
+        apply(&mut sector, second);
         // --- power cut here: the chip still has the old key ---
         assert_eq!(key_of(ecdsa::backup_key()).unwrap(), old);
         assert_eq!(&*puf_backup::find(&sector, &old).unwrap(), &secret, "the old record still opens");

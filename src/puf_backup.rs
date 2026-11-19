@@ -5,7 +5,7 @@
 //! secret is written to the backup sector sealed (AES-256-GCM, `seal.rs`) with a key derived from
 //! that chip's **HMAC digest**: HMAC-SHA-256, computed INSIDE the chip, of a fixed challenge with a
 //! random 32-byte key that lives in one of the chip's secret data slots (`se::ecdsa::backup_key`,
-//! slot 11). That key was made by the chip's own RNG, is replaced by a new random key whenever a new record is written (`prepare_backup_key` / `commit_backup_key`, record first, key second) and never leaves the chip. If
+//! slot 11). That key was made by the chip's own RNG, is replaced by a new random key whenever a new record is written (`prepare_backup_key` / `commit_backup_key`, record first, key second) and cannot be read back out of the chip (it is in the RP2040's RAM, zeroized afterwards, only while it is being written). If
 //! the PUF later cannot be read (noisy sample, damaged or lost helper sector), connecting any chip
 //! that has a record brings the secret back, and every key derived from it with it.
 //!
@@ -20,8 +20,8 @@
 //! really opens with that chip's key is its secret; a half-written record fails its check and is
 //! skipped. Records are never removed: a chip is written once (again only if the secret changed, each time under a new slot-11 key,
 //! after a re-enrolment), up to `MAX_RECS` records; a full sector refuses new chips (`Plan::Full`)
-//! and keeps what it has. A sector without a valid header holds no backup and may be formatted
-//! (this also drops records of the older, slot-0-public-key format, which cannot be opened any more;
+//! and keeps what it has. A sector that is blank, was only half formatted (torn first write) or is of the older format holds no usable backup and may be formatted (`classify`); a sector with any OTHER content (foreign or damaged data, e.g. a bit flip in the header, which may still hold records of other chips) is never erased: `Plan::Refuse`, and a blank PUF helper then halts instead of wiping (`readable`). Erase the whole flash to start over. A rotation of the chip key needs room for two records (`free_records`), otherwise the current key is used.
+//! (Formatting also drops records of the older, slot-0-public-key format, which cannot be opened any more;
 //! they are written again from the live PUF secret).
 
 use alloc::vec::Vec;
@@ -33,6 +33,9 @@ use crate::seal::{Domain, Sealer, OVERHEAD};
 pub const PAGE: usize = 4096;
 pub const SECRET_LEN: usize = 32;
 pub const MAGIC: [u8; 8] = *b"PFRSPBK\x02";
+/// Magic of the older format (sealed with the slot-0 public key). Its records cannot be opened any more
+/// and may be formatted away.
+pub const LEGACY_MAGIC: [u8; 8] = *b"PFRSPBK\x01";
 pub const HEADER_LEN: usize = 16;
 pub const ID_LEN: usize = 8;
 const CHECK_LEN: usize = 6;
@@ -87,6 +90,55 @@ pub fn header() -> [u8; HEADER_LEN] {
 
 fn header_ok(sector: &[u8]) -> bool {
     sector.len() == PAGE && sector[..HEADER_LEN] == header()
+}
+
+/// What a backup sector holds, as far as the header says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A valid header: a log of records.
+    Valid,
+    /// Erased (all 0xFF): nothing was ever written.
+    Blank,
+    /// The older, known format: its records cannot be opened any more.
+    Legacy,
+    /// The first write (header + first record, one program) was cut short: only a prefix of the header
+    /// (bits can only be cleared by programming) and at most part of the first record are there.
+    Torn,
+    /// Anything else: foreign or damaged data. It may still hold records of other chips (a bit flip in
+    /// the header would look like this), so it is never erased by the firmware.
+    Damaged,
+}
+
+pub fn classify(sector: &[u8]) -> Kind {
+    if sector.len() != PAGE {
+        return Kind::Damaged;
+    }
+    if header_ok(sector) {
+        return Kind::Valid;
+    }
+    if sector.iter().all(|&b| b == 0xFF) {
+        return Kind::Blank;
+    }
+    if sector[..8] == LEGACY_MAGIC {
+        return Kind::Legacy;
+    }
+    let h = header();
+    let prefix_of_header = sector[..HEADER_LEN].iter().zip(h.iter()).all(|(&s, &e)| s & e == e);
+    if prefix_of_header && sector[HEADER_LEN + REC..].iter().all(|&b| b == 0xFF) {
+        return Kind::Torn;
+    }
+    Kind::Damaged
+}
+
+/// Can the sector be trusted to hold nothing that is worth keeping when it has no valid header? False
+/// for `Damaged`: start-up must then not wipe the flash (`boot_decision` gets `sector_readable` false).
+pub fn readable(sector: &[u8]) -> bool {
+    classify(sector) != Kind::Damaged
+}
+
+/// Records that still fit (a sector without a valid header counts as empty).
+pub fn free_records(sector: &[u8]) -> usize {
+    MAX_RECS - usage(sector).1
 }
 
 fn rec_check(body: &[u8]) -> [u8; CHECK_LEN] {
@@ -177,10 +229,16 @@ pub enum Plan {
     Format { data: Vec<u8> },
     /// No room for one more record.
     Full,
+    /// The sector holds foreign or damaged data (`Kind::Damaged`): nothing is written or erased, it
+    /// might still contain the records of other chips. Erase the whole flash to start over.
+    Refuse,
 }
 
 pub fn plan(sector: &[u8], digest: &Digest32, secret: &[u8; SECRET_LEN]) -> Plan {
     let rec = record(digest, secret);
+    if classify(sector) == Kind::Damaged {
+        return Plan::Refuse;
+    }
     if !header_ok(sector) {
         let mut data = Vec::with_capacity(HEADER_LEN + REC);
         data.extend_from_slice(&header());

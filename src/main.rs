@@ -186,7 +186,7 @@ fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) 
         helper,
         backed_up.is_some(),
         chips_backed_up,
-        sector.is_some(),
+        sector.as_deref().is_some_and(puf_backup::readable),
     ) {
         puf_backup::Boot::Go => {}
         puf_backup::Boot::Restore => {
@@ -256,10 +256,15 @@ fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) 
                 warn!("puf: the backup sector is full, this chip gets no backup");
                 status::BK_FULL
             }
+            Plan::Refuse => {
+                warn!("puf: the backup sector holds unknown data and is left alone (erase the flash)");
+                status::BK_ERR
+            }
             _ => {
                 let st = backup_new_record(flash, s, d, &secret);
                 if st == status::BK_NEW {
-                    chips = env::backup_flash::read(flash).map_or(chips, |s| puf_backup::usage(&s).0);
+                    chips = env::backup_flash::read(flash)
+                        .map_or(chips, |s| puf_backup::usage(&s).0);
                 }
                 st
             }
@@ -324,6 +329,10 @@ fn backup_new_record(
                 warn!("puf: the backup sector is full, this chip gets no backup");
                 status::BK_FULL
             }
+            Plan::Refuse => {
+                warn!("puf: the backup sector holds unknown data and is left alone");
+                status::BK_ERR
+            }
             plan if env::backup_flash::apply(flash, &plan) => {
                 info!("puf: secret backed up for this chip");
                 status::BK_NEW
@@ -333,6 +342,12 @@ fn backup_new_record(
                 status::BK_ERR
             }
         }
+    }
+    // The rotation needs room for TWO records in the worst case: the one under the new key and, if the
+    // chip's key cannot be replaced, one under the current key. With less room the key is not replaced.
+    if puf_backup::free_records(sector) < 2 {
+        warn!("puf: little room left in the backup sector, the current backup key is used");
+        return write(flash, sector, current, secret);
     }
     let Some(pending) = se::ecdsa::prepare_backup_key() else {
         warn!("puf: no new backup key available, the current one is used");

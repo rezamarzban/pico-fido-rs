@@ -25,10 +25,11 @@ pub fn apply(flash: &RefCell<Fl>, plan: &Plan) -> bool {
     let mut f = flash.borrow_mut();
     let (offset, data) = match plan {
         Plan::Nothing => return true,
-        Plan::Full => return false,
+        Plan::Full | Plan::Refuse => return false,
         Plan::Append { offset, data } => (*offset, data),
         Plan::Format { data } => {
-            // No valid header: nothing in this sector is a backup, so erasing loses nothing.
+            // Blank, torn or legacy sector (`puf_backup::classify`): nothing in it can be opened, so erasing
+            // loses nothing. A damaged sector never gets here (`Plan::Refuse`).
             if flash_io::erase(&mut f, BACKUP_START, PAGE).is_err() {
                 return false;
             }

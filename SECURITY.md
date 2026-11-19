@@ -24,8 +24,8 @@ Experimental firmware; read this before relying on it.
   a device that is attacked live.
 * **The PUF-secret backup ties the flash encryption to the chip.** The secret that every flash key is derived from is also
   stored in the backup sector, sealed with SHA-256 of an HMAC digest that only a chip with the right key in its data
-  slot 11 can compute (HMAC-SHA-256 of a fixed challenge; the key is random, from the chip's own RNG, and never leaves
-  the chip). The secret is the same for every chip, so ANY chip with a record opens the backup. Therefore: a copy of the
+  slot 11 can compute (HMAC-SHA-256 of a fixed challenge; the key is random, from the chip's own RNG; it cannot be read back out of the chip, but while a new key is being written it is
+  briefly in the RP2040's RAM, like the PUF secret itself, and is zeroized afterwards). The secret is the same for every chip, so ANY chip with a record opens the backup. Therefore: a copy of the
   Pico's flash alone, or public data (attestation certificate, public keys) does not open it; anyone who holds a chip
   with a record does, because the chip answers HMAC to whoever talks to it (no authentication). With the chip in the
   attacker's hands the same attacker could in any case use its signing keys. The backup was added on purpose, for
