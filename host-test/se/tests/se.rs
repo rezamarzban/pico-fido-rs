@@ -2596,70 +2596,70 @@ mod backup_key_tests {
         assert_eq!(m.lock().unwrap().slot_writes, 1, "the write was tried");
     }
 
-    fn rotated(r: ecdsa::Rotation) -> Option<[u8; 32]> {
-        match r {
-            ecdsa::Rotation::Rotated(d) => Some(*d),
-            _ => None,
-        }
+    fn slot11(m: &Arc<Mutex<Model>>) -> [u8; 32] {
+        m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize]
     }
 
     #[test]
-    fn every_rotation_writes_a_new_random_key_even_if_the_slot_already_has_one() {
+    fn preparing_a_key_writes_nothing_and_committing_replaces_the_key_every_time() {
         let (_g, m) = install(false, 0);
         let key: [u8; 32] = core::array::from_fn(|i| i as u8);
         m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize] = key;
-        let d0 = key_of(ecdsa::backup_key()).unwrap();
         let mut seen = vec![key];
-        let mut digests = vec![d0];
+        let mut digests = vec![key_of(ecdsa::backup_key()).unwrap()];
         for n in 1..=3u32 {
-            let d = rotated(ecdsa::rotate_backup_key()).expect("rotated");
-            let (now, writes) = {
-                let g = m.lock().unwrap();
-                (g.slot_data[ecdsa::BACKUP_SLOT as usize], g.slot_writes)
-            };
-            assert_eq!(writes, n, "one clear write per rotation");
-            assert!(!seen.contains(&now), "a key that was never used before");
-            assert_eq!(d, sw_hmac(&now), "the digest is the chip's HMAC with the new key");
+            let p = ecdsa::prepare_backup_key().expect("a new key");
+            assert_eq!(m.lock().unwrap().slot_writes, n - 1, "preparing writes nothing into the chip");
+            assert_eq!(slot11(&m), *seen.last().unwrap(), "the old key is still in the chip");
+            let d = *p.digest();
             assert!(!digests.contains(&d));
-            // The next start reads the new key and writes nothing.
+            assert!(matches!(ecdsa::commit_backup_key(p), ecdsa::Rotation::Rotated));
+            let now = slot11(&m);
+            assert_eq!(m.lock().unwrap().slot_writes, n, "one clear write per rotation");
+            assert!(!seen.contains(&now), "a key that was never used before");
+            assert_eq!(d, sw_hmac(&now), "the digest known beforehand is the chip's HMAC with the new key");
             assert_eq!(key_of(ecdsa::backup_key()).unwrap(), d);
-            assert_eq!(m.lock().unwrap().slot_writes, n);
+            assert_eq!(m.lock().unwrap().slot_writes, n, "a start writes nothing");
             seen.push(now);
             digests.push(d);
         }
     }
 
     #[test]
-    fn a_rotation_that_cannot_write_keeps_the_old_key_and_says_so() {
-        // Locked data zone: the clear write is refused, the old key and its digest stay.
-        let (_g, m) = install(false, 0);
+    fn a_commit_that_cannot_write_keeps_the_old_key_and_says_so() {
         let key: [u8; 32] = core::array::from_fn(|i| 0x40 + i as u8);
-        m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize] = key;
-        m.lock().unwrap().data_locked = true;
-        match ecdsa::rotate_backup_key() {
-            ecdsa::Rotation::Kept(d) => assert_eq!(*d, sw_hmac(&key)),
-            _ => panic!("expected Kept"),
-        }
-        assert_eq!(m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize], key);
-        // A write that is accepted but does not stick is caught by the check: still the old digest.
-        let (_g, m) = install(false, 0);
-        m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize] = key;
-        m.lock().unwrap().drop_writes = true;
-        match ecdsa::rotate_backup_key() {
-            ecdsa::Rotation::Kept(d) => assert_eq!(*d, sw_hmac(&key)),
-            _ => panic!("expected Kept"),
+        for locked in [true, false] {
+            let (_g, m) = install(false, 0);
+            m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize] = key;
+            let p = ecdsa::prepare_backup_key().unwrap();
+            {
+                let mut g = m.lock().unwrap();
+                if locked { g.data_locked = true } else { g.drop_writes = true } // refused / accepted but not stored
+            }
+            match ecdsa::commit_backup_key(p) {
+                ecdsa::Rotation::Kept(d) => assert_eq!(*d, sw_hmac(&key)),
+                _ => panic!("expected Kept (locked: {locked})"),
+            }
+            assert_eq!(slot11(&m), key);
         }
     }
 
     #[test]
-    fn a_rotation_without_a_chip_fails() {
+    fn without_a_chip_nothing_is_prepared_or_committed() {
         let (_g, m) = install(false, 0);
+        let key: [u8; 32] = core::array::from_fn(|i| 0x10 + i as u8);
+        m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize] = key;
+        let p = ecdsa::prepare_backup_key().unwrap();
         m.lock().unwrap().fail_next_wake = 1000;
-        assert!(matches!(ecdsa::rotate_backup_key(), ecdsa::Rotation::Failed));
+        assert!(ecdsa::prepare_backup_key().is_none());
+        assert!(matches!(ecdsa::commit_backup_key(p), ecdsa::Rotation::Failed));
     }
 
+    /// The firmware's order (`backup_new_record` in main.rs): the record under the NEW digest is written
+    /// first, the chip's key is replaced afterwards. A power cut between the two steps must leave the
+    /// old record openable; after the commit the new one opens.
     #[test]
-    fn a_record_made_before_a_rotation_is_not_opened_by_the_new_key() {
+    fn a_power_cut_between_the_record_and_the_key_change_loses_nothing() {
         let (_g, m) = install(false, 0);
         let key: [u8; 32] = core::array::from_fn(|i| 0x80 + i as u8);
         m.lock().unwrap().slot_data[ecdsa::BACKUP_SLOT as usize] = key;
@@ -2675,14 +2675,19 @@ mod backup_key_tests {
             p => panic!("unexpected plan {p:?}"),
         };
         apply(&mut sector, puf_backup::plan(&sector, &old, &secret));
-        assert!(puf_backup::find(&sector, &old).is_some());
-        // The firmware's sequence for a new record: plan with the current key says "write", so the key
-        // is rotated first and the record is sealed under the new digest.
-        let new = rotated(ecdsa::rotate_backup_key()).unwrap();
-        assert!(puf_backup::find(&sector, &new).is_none(), "the old record needs the old key");
-        let other_secret = [0x78u8; puf_backup::SECRET_LEN];
-        apply(&mut sector, puf_backup::plan(&sector, &new, &other_secret));
-        assert_eq!(&*puf_backup::find(&sector, &new).unwrap(), &other_secret);
+        // The secret changed (re-enrolment): a new record under a new key.
+        let new_secret = [0x78u8; puf_backup::SECRET_LEN];
+        let p = ecdsa::prepare_backup_key().unwrap();
+        let new = *p.digest();
+        apply(&mut sector, puf_backup::plan(&sector, &new, &new_secret));
+        // --- power cut here: the chip still has the old key ---
+        assert_eq!(key_of(ecdsa::backup_key()).unwrap(), old);
+        assert_eq!(&*puf_backup::find(&sector, &old).unwrap(), &secret, "the old record still opens");
+        // --- no cut: the commit makes the new record the usable one ---
+        assert!(matches!(ecdsa::commit_backup_key(p), ecdsa::Rotation::Rotated));
+        let now = key_of(ecdsa::backup_key()).unwrap();
+        assert_eq!(now, new);
+        assert_eq!(&*puf_backup::find(&sector, &now).unwrap(), &new_secret);
     }
 
     #[test]

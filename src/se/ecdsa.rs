@@ -258,39 +258,55 @@ pub fn backup_key() -> BackupKey {
     }
 }
 
-/// Result of `rotate_backup_key`.
+/// A new backup key that is NOT in the chip yet: its digest is already known (the chip's HMAC is the
+/// standard one), so the backup record can be sealed and written to flash BEFORE the chip's key is
+/// replaced (`commit_backup_key`). A power cut in between leaves the old key in the chip and the old
+/// record usable.
+pub struct PendingBackupKey {
+    key: zeroize::Zeroizing<[u8; 32]>,
+    digest: zeroize::Zeroizing<[u8; 32]>,
+}
+
+impl PendingBackupKey {
+    /// The digest the chip will give once the key is in `BACKUP_SLOT`.
+    pub fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+/// Result of `commit_backup_key`.
 pub enum Rotation {
-    /// A new random key is in `BACKUP_SLOT` (checked with the chip's HMAC); this is its digest.
-    /// The old key is gone, records sealed with its digest can no longer be opened.
-    Rotated(zeroize::Zeroizing<[u8; 32]>),
+    /// The new key is in `BACKUP_SLOT` (proven with the chip's HMAC). The old key is gone.
+    Rotated,
     /// The slot could not be rewritten (e.g. the data zone is locked and clear writes are refused,
-    /// or the chip failed); the key that is in it now gives this digest.
+    /// or the write did not stick); the key that is in it now gives this digest.
     Kept(zeroize::Zeroizing<[u8; 32]>),
     /// Not even the digest of the current key could be had.
     Failed,
 }
 
-/// Replaces the key in `BACKUP_SLOT` with a new random one from the chip's RNG. Called by the
-/// firmware every time a NEW backup record is about to be written, so that every backup is sealed
-/// under a key that has never been used before. The new key is proven with the chip's own HMAC
-/// (compared with the software HMAC of the key that was written). If the slot cannot be rewritten
-/// the current digest is returned as `Kept` so that the caller can still make its backup.
-pub fn rotate_backup_key() -> Rotation {
+/// Draws a new random backup key from the chip's RNG. Nothing is written to the chip.
+pub fn prepare_backup_key() -> Option<PendingBackupKey> {
+    let key = zeroize::Zeroizing::new(with_chip(|c| c.random()).ok()?);
+    if is_blank_answer(&software_hmac(&key, BACKUP_CHALLENGE)) {
+        return None;
+    }
+    let digest = zeroize::Zeroizing::new(software_hmac(&key, BACKUP_CHALLENGE));
+    Some(PendingBackupKey { key, digest })
+}
+
+/// Writes the prepared key into `BACKUP_SLOT` (replacing the old key) and proves with the chip's own
+/// HMAC that it is in. Call it only AFTER the record sealed under `digest()` is safely in flash.
+pub fn commit_backup_key(p: PendingBackupKey) -> Rotation {
     let kept = || match with_chip(|c| c.hmac(BACKUP_SLOT, BACKUP_CHALLENGE)) {
         Ok(d) if !is_blank_answer(&d) => Rotation::Kept(zeroize::Zeroizing::new(d)),
         _ => Rotation::Failed,
     };
-    let Ok(r) = with_chip(|c| c.random()) else {
-        return kept();
-    };
-    let r = zeroize::Zeroizing::new(r);
-    if with_chip(|c| c.write_slot(BACKUP_SLOT, &r)).is_err() {
+    if with_chip(|c| c.write_slot(BACKUP_SLOT, &p.key)).is_err() {
         return kept();
     }
     match with_chip(|c| c.hmac(BACKUP_SLOT, BACKUP_CHALLENGE)) {
-        Ok(d) if d == software_hmac(&r, BACKUP_CHALLENGE) => {
-            Rotation::Rotated(zeroize::Zeroizing::new(d))
-        }
+        Ok(d) if d == *p.digest => Rotation::Rotated,
         _ => kept(),
     }
 }

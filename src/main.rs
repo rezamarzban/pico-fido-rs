@@ -245,48 +245,25 @@ fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) 
         fail(led, status::PUF_FAIL_RESTORE);
     }
 
-    // Back up the secret for the connected chip (once; again only if the secret changed). Every time a
-    // NEW record is about to be written, slot 11 first gets a new random key and the record is sealed
-    // under that one (`se::ecdsa::rotate_backup_key`); if the slot cannot be rewritten, the key that is
-    // in it is used. Nothing is rotated when the chip already has its record or the sector is full.
+    // Back up the secret for the connected chip (once; again only if the secret changed). A NEW record
+    // is sealed under a NEW random key for slot 11, in a power-fail safe order (`backup_new_record`).
+    // Nothing is rotated when the chip already has its record or the sector is full.
     let mut chips = chips_backed_up;
     let backup_state = match (&digest, puf.secret(), &sector) {
-        (Some(d), Some(secret), Some(s)) => {
-            let mut plan = puf_backup::plan(s, d, &secret);
-            if matches!(plan, Plan::Append { .. } | Plan::Format { .. }) {
-                match se::ecdsa::rotate_backup_key() {
-                    se::ecdsa::Rotation::Rotated(n) => {
-                        info!("puf: new backup key written to the chip");
-                        plan = puf_backup::plan(s, &n, &secret);
-                    }
-                    se::ecdsa::Rotation::Kept(n) => {
-                        warn!("puf: the backup key could not be replaced, the current one is used");
-                        plan = puf_backup::plan(s, &n, &secret);
-                    }
-                    se::ecdsa::Rotation::Failed => {
-                        warn!("puf: the backup key could not be replaced and not be read");
-                    }
-                }
+        (Some(d), Some(secret), Some(s)) => match puf_backup::plan(s, d, &secret) {
+            Plan::Nothing => status::BK_HAVE,
+            Plan::Full => {
+                warn!("puf: the backup sector is full, this chip gets no backup");
+                status::BK_FULL
             }
-            match plan {
-                Plan::Nothing => status::BK_HAVE,
-                Plan::Full => {
-                    warn!("puf: the backup sector is full, this chip gets no backup");
-                    status::BK_FULL
+            _ => {
+                let st = backup_new_record(flash, s, d, &secret);
+                if st == status::BK_NEW {
+                    chips = env::backup_flash::read(flash).map_or(chips, |s| puf_backup::usage(&s).0);
                 }
-                plan => {
-                    if env::backup_flash::apply(flash, &plan) {
-                        info!("puf: secret backed up for this chip");
-                        chips = env::backup_flash::read(flash)
-                            .map_or(chips, |s| puf_backup::usage(&s).0);
-                        status::BK_NEW
-                    } else {
-                        warn!("puf: could not write the backup");
-                        status::BK_ERR
-                    }
-                }
+                st
             }
-        }
+        },
         (_, _, None) => status::BK_ERR,
         _ if no_key => {
             warn!("puf: the HMAC slot of the chip is blank and no key could be written: no backup possible");
@@ -315,6 +292,73 @@ fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) 
 
     static PUF: StaticCell<puf::Puf> = StaticCell::new();
     puf::install(PUF.init(puf));
+}
+
+/// Writes a new backup record for the connected chip under a NEW slot-11 key, in this order:
+/// 1. draw the new key (not written yet; its digest is computed in software);
+/// 2. write the record sealed under the NEW digest to flash and read it back (the chip still has the
+///    old key, so the old record stays usable: a power cut here loses nothing);
+/// 3. only then write the new key into the chip and check it with the chip's HMAC (a power cut
+///    before this leaves an unusable extra record; after it the new record opens).
+///
+/// If the slot cannot be rewritten (data zone locked, write did not stick) the key stays; the record
+/// is then written again under the key that is in the chip (the extra record stays unusable). If no
+/// new key can be had at all, the record is written under the current key. If the chip cannot even
+/// give its digest afterwards, no further record is written.
+fn backup_new_record(
+    flash: &'static RefCell<keys::Fl>,
+    sector: &[u8],
+    current: &puf_backup::Digest32,
+    secret: &[u8; puf_backup::SECRET_LEN],
+) -> u8 {
+    use puf_backup::Plan;
+    fn write(
+        flash: &'static RefCell<keys::Fl>,
+        sector: &[u8],
+        digest: &puf_backup::Digest32,
+        secret: &[u8; puf_backup::SECRET_LEN],
+    ) -> u8 {
+        match puf_backup::plan(sector, digest, secret) {
+            Plan::Nothing => status::BK_HAVE,
+            Plan::Full => {
+                warn!("puf: the backup sector is full, this chip gets no backup");
+                status::BK_FULL
+            }
+            plan if env::backup_flash::apply(flash, &plan) => {
+                info!("puf: secret backed up for this chip");
+                status::BK_NEW
+            }
+            _ => {
+                warn!("puf: could not write the backup");
+                status::BK_ERR
+            }
+        }
+    }
+    let Some(pending) = se::ecdsa::prepare_backup_key() else {
+        warn!("puf: no new backup key available, the current one is used");
+        return write(flash, sector, current, secret);
+    };
+    let st = write(flash, sector, pending.digest(), secret);
+    if st != status::BK_NEW {
+        return st; // nothing was changed in the chip
+    }
+    match se::ecdsa::commit_backup_key(pending) {
+        se::ecdsa::Rotation::Rotated => {
+            info!("puf: new backup key written to the chip");
+            status::BK_NEW
+        }
+        se::ecdsa::Rotation::Kept(cur) => {
+            warn!("puf: the backup key could not be replaced, the current one is used");
+            match env::backup_flash::read(flash) {
+                Some(s2) => write(flash, &s2, &cur, secret),
+                None => status::BK_ERR,
+            }
+        }
+        se::ecdsa::Rotation::Failed => {
+            warn!("puf: the chip gave no backup digest after the key change");
+            status::BK_ERR
+        }
+    }
 }
 
 /// Publishes which chip slots hold a key and how many belong to a site (for the status display;
