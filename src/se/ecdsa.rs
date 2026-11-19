@@ -130,6 +130,12 @@ const STATUS_EMPTY_SLOT: u8 = 0x0F;
 /// Credential slots known to hold a key (`None` until `scan_slots` ran).
 static USED: Mutex<Cell<Option<u8>>> = Mutex::new(Cell::new(None));
 static PUBKEYS: Mutex<RefCell<[Option<[u8; 64]>; 16]>> = Mutex::new(RefCell::new([None; 16]));
+/// Activity of the key slots since power-up, for the status display (bit n / index n = slot n):
+/// slots that got a freshly generated key (GenKey), signatures per slot, and the slot that signed last.
+/// RAM only, reset when another chip is connected; nothing here is secret.
+static FRESH: Mutex<Cell<u16>> = Mutex::new(Cell::new(0));
+static SLOT_SIGNS: Mutex<RefCell<[u16; 16]>> = Mutex::new(RefCell::new([0; 16]));
+static LAST_USED: Mutex<Cell<Option<u8>>> = Mutex::new(Cell::new(None));
 
 /// Registers the chip driver. Call once at start-up.
 pub fn install(chip: Chip) {
@@ -164,6 +170,9 @@ pub fn uninstall() {
         SERIAL.borrow(cs).set(None);
         *PUBKEYS.borrow(cs).borrow_mut() = [None; 16];
         USED.borrow(cs).set(None);
+        FRESH.borrow(cs).set(0);
+        *SLOT_SIGNS.borrow(cs).borrow_mut() = [0; 16];
+        LAST_USED.borrow(cs).set(None);
     });
 }
 
@@ -328,6 +337,9 @@ fn activate(serial: ChipSerial) {
             KEYS.borrow(cs).set(None);
             USED.borrow(cs).set(None);
             *PUBKEYS.borrow(cs).borrow_mut() = [None; 16];
+            FRESH.borrow(cs).set(0);
+            *SLOT_SIGNS.borrow(cs).borrow_mut() = [0; 16];
+            LAST_USED.borrow(cs).set(None);
         });
     }
     let _ = with_dir(|d| d.select(&serial));
@@ -379,6 +391,26 @@ pub fn slot_report() -> Option<SlotReport> {
         }
     }
     Some(SlotReport { has_key, owned })
+}
+
+/// What the key slots did since power-up (see `FRESH`). Bit n / index n = slot n (0 = attestation).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SlotUse {
+    /// Slots whose key was generated (GenKey) since power-up, a replaced key included.
+    pub fresh: u16,
+    /// Signatures made with the key of each slot since power-up (a slot that got a fresh key starts at 0).
+    pub signs: [u16; 16],
+    /// The slot that signed last.
+    pub last: Option<u8>,
+}
+
+/// Key generation and signature counts per slot since power-up (RAM only, no chip access).
+pub fn slot_use() -> SlotUse {
+    critical_section::with(|cs| SlotUse {
+        fresh: FRESH.borrow(cs).get(),
+        signs: *SLOT_SIGNS.borrow(cs).borrow(),
+        last: LAST_USED.borrow(cs).get(),
+    })
 }
 
 /// Credential slots in use as of the last `scan_slots()` plus the keys created since (no chip
@@ -574,6 +606,10 @@ impl EcSecretKey for SeSecretKey {
                         }
                         let k = KEYS.borrow(cs);
                         k.set(k.get().map(|m| m | (1 << slot)));
+                        // A new key: flagged as fresh, its signature count starts again.
+                        let f = FRESH.borrow(cs);
+                        f.set(f.get() | (1 << slot));
+                        SLOT_SIGNS.borrow(cs).borrow_mut()[slot as usize] = 0;
                     });
                     if let (Some(rp), Some(dir)) = (&rp, dir.as_mut()) {
                         dir_record(dir, slot, rp)?;
@@ -603,6 +639,12 @@ impl EcSecretKey for SeSecretKey {
         // relying party. The command layer has already retried once from the wake-up.
         let sig = with_chip(|c| c.sign(self.slot, &digest)).map_err(|_| SignError)?;
         tally_bump();
+        critical_section::with(|cs| {
+            let mut signs = SLOT_SIGNS.borrow(cs).borrow_mut();
+            let n = &mut signs[self.slot as usize];
+            *n = n.saturating_add(1);
+            LAST_USED.borrow(cs).set(Some(self.slot));
+        });
         let mut r = [0u8; 32];
         let mut s = [0u8; 32];
         r.copy_from_slice(&sig[..32]);

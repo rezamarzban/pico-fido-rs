@@ -10,7 +10,7 @@
 //! * While a command is being processed (signature, flash compaction) the display keeps the last
 //!   frame; the BUSY state shows up in the next one.
 //!
-//! Four pages of 8 lines (21 characters per line, upper case only), switched every `PAGE_MS`. If the flash
+//! Five pages of 8 lines (21 characters per line, upper case only), switched every `PAGE_MS`. If the flash
 //! key is not available (the firmware halts with the fault blink) the SRAM PUF page stays on screen.
 //!
 //! Page 1, the device:
@@ -33,7 +33,18 @@
 //! SITES 2/9 ASSIGNED          credential slots that belong to a site (the directory in the Pico's flash)
 //! SIGNS 1234                  total signatures (kept in the Pico's flash)
 //! ```
-//! Page 3, the data the Pico's flash keeps about chips (site directory + signature counters):
+//! Page 3, the key slots and the HMAC key (what happened since power-up is RAM only):
+//! ```text
+//! HMAC SLOT 11: KEY OK        the chip's HMAC key slot: KEY OK / BLANK / NO CHIP / --
+//! FRESH HMAC KEY: YES         YES = a new random key was written to the slot at this start-up
+//! KEY RECORDS 3/55            backup records in flash, each sealed under a different HMAC key
+//! SLOT 123456789              the nine credential slots
+//! KEY  KK.N.....              K key present, N key generated since power-up, . empty
+//! SIGN 3.2.....+              signatures per slot since power-up (. none, 1-9, + = 10 or more)
+//! GEN 3/9 NEW 1 ATT OK        keys present, generated since power-up, attestation key present
+//! LAST USED SLOT 3            the slot that signed last
+//! ```
+//! Page 4, the data the Pico's flash keeps about chips (site directory + signature counters):
 //! ```text
 //! FLASH: DATA OF CHIPS
 //! CHIPS STORED 3              different chips found in either flash page
@@ -44,7 +55,7 @@
 //! TOTAL 640B/8192B            both pages together
 //! FREE 7552B
 //! ```
-//! Page 4, the SRAM PUF and its backup:
+//! Page 5, the SRAM PUF and its backup:
 //! ```text
 //! SRAM PUF: READY             READY (key from the RAM sample), BACKUP RAM / BACKUP HEALED (the
 //!                             sample did not decode, the secret came from the backup), FAIL ...
@@ -78,10 +89,10 @@ const W: usize = 128;
 const PAGES: usize = 8;
 const COLS: usize = 21;
 const FRAME_MS: u32 = 500;
-/// The flash pages are re-read (checksums included) at most this often while page 3 is shown.
+/// The flash pages are re-read (checksums included) at most this often while page 4 is shown.
 const FLASH_STATS_MS: u32 = 2_000;
 const FLASH_PAGE: usize = 4096;
-/// Each of the four pages stays this long.
+/// Each of the five pages stays this long.
 const PAGE_MS: u32 = 5_000;
 const RETRY_MS: u32 = 5_000;
 /// The first retry after a failed start-up probe comes this early (modules need up to ~100 ms
@@ -256,22 +267,113 @@ impl Oled {
     }
 
     fn render(&mut self) {
-        // Four pages, switched every PAGE_MS (the display only has 8 lines). While the flash key is
+        // Five pages, switched every PAGE_MS (the display only has 8 lines). While the flash key is
         // not available the firmware halts and the reason stays on the SRAM PUF page.
         let page = if st::PUF_STATE.load(Ordering::Relaxed) >= st::PUF_FAIL_NOISY {
-            3
+            4
         } else {
-            (now_ms() / PAGE_MS) % 4
+            (now_ms() / PAGE_MS) % 5
         };
         match page {
             0 => self.render_device(),
             1 => self.render_chip(),
-            2 => self.render_flash(),
+            2 => self.render_slots(),
+            3 => self.render_flash(),
             _ => self.render_puf(),
         }
     }
 
-    /// Page 4: the SRAM PUF (quality of this boot's sample, where the key came from) and the backup of
+    /// Page 3: the HMAC key slot and the credential key slots (which hold a key, which got a fresh key
+    /// since power-up, how often each signed).
+    fn render_slots(&mut self) {
+        let b = &mut self.buf;
+        let hm = match st::HMAC_STATE.load(Ordering::Relaxed) {
+            st::HM_KEY => "KEY OK",
+            st::HM_NONE => "BLANK",
+            st::HM_NOCHIP => "NO CHIP",
+            _ => "--",
+        };
+        put_fmt(
+            b,
+            0,
+            format_args!("HMAC SLOT {}: {}", crate::se::ecdsa::BACKUP_SLOT, hm),
+        );
+        let rot = st::HMAC_ROT.load(Ordering::Relaxed);
+        put_fmt(
+            b,
+            1,
+            format_args!("FRESH HMAC KEY: {}", if rot > 0 { "YES" } else { "NO" }),
+        );
+        put_fmt(
+            b,
+            2,
+            format_args!(
+                "KEY RECORDS {}/{}",
+                st::BACKUP_RECS.load(Ordering::Relaxed),
+                crate::puf_backup::MAX_RECS
+            ),
+        );
+        // One column per credential slot: 1 2 3 ... SLOTS.
+        let first = crate::se::ecdsa::FIRST_CRED_SLOT as usize;
+        let n = SLOTS as usize;
+        let mask = st::SE_MASK.load(Ordering::Relaxed);
+        let fresh = st::SE_FRESH.load(Ordering::Relaxed);
+        let known = st::SE_REGS.load(Ordering::Relaxed) != st::SE_UNKNOWN;
+        let mut head: String<32> = String::new();
+        let mut keys: String<32> = String::new();
+        let mut signs: String<32> = String::new();
+        let _ = head.push_str("SLOT ");
+        let _ = keys.push_str("KEY  ");
+        let _ = signs.push_str("SIGN ");
+        for slot in first..first + n {
+            let _ = head.push((b'0' + slot as u8) as char);
+            let _ = keys.push(if !known {
+                '-'
+            } else if fresh & (1 << slot) != 0 {
+                'N'
+            } else if mask & (1 << slot) != 0 {
+                'K'
+            } else {
+                '.'
+            });
+            let c = st::SE_SLOT_SIGNS
+                .get(slot)
+                .map_or(0, |a| a.load(Ordering::Relaxed));
+            let _ = signs.push(match c {
+                0 => '.',
+                1..=9 => (b'0' + c) as char,
+                _ => '+',
+            });
+        }
+        put_line(b, 3, &head);
+        put_line(b, 4, &keys);
+        put_line(b, 5, &signs);
+        let present = ((mask >> first) & ((1u16 << n) - 1)).count_ones();
+        let new = ((fresh >> first) & ((1u16 << n) - 1)).count_ones();
+        let att = if !known {
+            "--"
+        } else if mask & 1 != 0 {
+            "OK"
+        } else {
+            "NO"
+        };
+        if known {
+            put_fmt(
+                b,
+                6,
+                format_args!("GEN {}/{} NEW {} ATT {}", present, n, new, att),
+            );
+        } else {
+            put_fmt(b, 6, format_args!("GEN --/{} NEW {} ATT {}", n, new, att));
+        }
+        match st::SE_LAST.load(Ordering::Relaxed) {
+            st::SE_NO_SLOT => put_line(b, 7, "LAST USED SLOT --"),
+            0 => put_line(b, 7, "LAST USED ATT KEY"),
+            s => put_fmt(b, 7, format_args!("LAST USED SLOT {}", s)),
+        }
+    }
+
+    /// Page 5: the SRAM PUF (quality of this boot's sample, where the key came from) and the backup of
     /// its secret.
     fn render_puf(&mut self) {
         let state = st::PUF_STATE.load(Ordering::Relaxed);
@@ -353,7 +455,7 @@ impl Oled {
         put_line(b, 7, "");
     }
 
-    /// Page 3: how many chips the flash knows and how much data it keeps about them.
+    /// Page 4: how many chips the flash knows and how much data it keeps about them.
     fn render_flash(&mut self) {
         let now = now_ms();
         if !self.fl_valid || now.wrapping_sub(self.fl_ms) >= FLASH_STATS_MS {

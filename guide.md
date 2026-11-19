@@ -17,8 +17,8 @@ The whole key is experimental (see `SECURITY.md`).
   options, PIN state).
 
 ## 2. Set a PIN
-- Without a PIN, anyone who touches the key can use it. The PIN is checked by the Pico firmware; it is stored as a
-  hash in the Pico's flash, so it does not protect against someone who can read that flash (see `SECURITY.md`).
+- Without a PIN, anyone who touches the key can use it. The Pico firmware checks the PIN, and the PIN hash is
+  sealed in flash. This does not protect a device against all forms of physical access (see [security notes](SECURITY.md)).
 - Set the PIN with `fido2-token -S <device>`, `ykman fido access change-pin`, or the browser's security-key settings:
   - **Chrome / Edge:** Settings -> Privacy and security -> Security -> Manage security keys.
   - **Windows:** Settings -> Accounts -> Sign-in options -> Security key.
@@ -43,21 +43,24 @@ LED: fast blink (200 ms on/off) = ready; very fast flicker = busy (or the browse
 almost solid = waiting for your button press.
 
 ## 5. Things to know
-- **Nine sites at most.** Each *site* uses one key slot (1-9) in the secure element. A new site first takes a slot that
-  already holds a key and belongs to no other site; if there is none it takes an empty slot and a new key is generated
-  in it. Keys owned by a site are never overwritten. Further accounts at a site that already has a key reuse that key
+- **Nine sites at most.** Each site uses one key slot (1-9) in the secure element. A new site uses a populated slot
+  with no owner first, otherwise an empty slot. Either way a new key is generated. Keys owned by a site are never
+  overwritten. Further accounts at a site that already has a key reuse that key
   and use no new slot (the site can tell that those accounts come from the same key). Registering at a 10th site is
-  refused (the key restarts; unplug and replug). The list of which site owns which slot is kept in the Pico's flash (not
-  in the chip); a FIDO reset does not clear it, erasing the whole flash does (the keys stay in the chip and are handed
-  out again to new sites). The OLED's chip page shows `KEYS n/9 PRESENT` (slots that really hold a key, asked from the chip) and `SITES n/9 ASSIGNED` (slots that belong to a site, from the flash directory) separately, then `SIGNS` (total signatures).
+  refused with a CTAP error. The list of which site owns which slot is kept in the Pico's flash (not
+  in the chip); a FIDO reset does not clear it, but erasing the whole flash does. The chip may still hold old keys
+  after a flash erase; they are replaced when their slots are reassigned. The OLED's chip page shows `KEYS n/9 PRESENT`
+  and `SITES n/9 ASSIGNED` separately, then `SIGNS` (total signatures).
 - **Several chips.** Each chip is recognised by its unique serial number; the site list and the signature count are kept
   per chip in the Pico's flash. After swapping the chip (unplug the key first), the key uses the information of the chip
   that is connected now, and a chip it has never seen starts empty. Your PIN is shared by all chips; accounts registered
   with chip A do not work while chip B is connected and work again when A is back.
-- **Unlimited signatures.** Signatures are not counted, there is no budget. (If your chip was provisioned with the old
-  500-signature Counter 0, that counter is simply ignored now.)
-- **OLED.** Four pages, switching every 5 s: the device (state, USB, uptime, RAM, flash), the ATECC608A (I2C
-  address, serial number, revision, config/data lock state, key slots in use), the flash data about chips (how many
+- **Unlimited signatures.** The Pico counts signatures for display only; there is no signing budget. The old
+  chip Counter 0 value is ignored.
+- **OLED.** Five pages, switching every 5 s: the device (state, USB, uptime, RAM, flash), the ATECC608A (I2C
+  address, serial number, revision, config/data lock state, key slots in use), the key slots and the HMAC key (state of
+  the HMAC slot 11, whether a fresh HMAC key was written at this start-up, backup records in use, and per credential
+  slot: key present, key generated since power-up, signatures since power-up, plus the slot that signed last), the flash data about chips (how many
   different chips are stored, chips and bytes used in the site-directory page and in the signature-counter page) and the
   SRAM PUF (state, bit errors of this boot's sample, share of ones, whether this boot was a power-on reset, whether this
   chip has a backup of the PUF secret and how many chips do, and whether the key came from the PUF or from the backup).

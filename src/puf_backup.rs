@@ -20,7 +20,7 @@
 //! really opens with that chip's key is its secret; a half-written record fails its check and is
 //! skipped. Records are never removed: a chip is written once (again only if the secret changed, each time under a new slot-11 key,
 //! after a re-enrolment), up to `MAX_RECS` records; a full sector refuses new chips (`Plan::Full`)
-//! and keeps what it has. A sector that is blank, was only half formatted (torn first write) or is of the older format holds no usable backup and may be formatted (`classify`); a sector with any OTHER content (foreign or damaged data, e.g. a bit flip in the header, which may still hold records of other chips) is never erased: `Plan::Refuse`, and a blank PUF helper then halts instead of wiping (`readable`). Erase the whole flash to start over. A rotation of the chip key needs room for two records (`free_records`), otherwise the current key is used.
+//! and keeps what it has. A sector that is blank, was only half formatted (torn first write) or is of the older format (its complete header, not just its magic) holds no usable backup and may be formatted (`classify`); a sector with any OTHER content (foreign or damaged data, e.g. a bit flip in the header, which may still hold records of other chips) is never erased: `Plan::Refuse`, and a blank PUF helper then halts instead of wiping (`readable`). Erase the whole flash to start over. A rotation of the chip key needs room for two records (`free_records`), otherwise the current key is used.
 //! (Formatting also drops records of the older, slot-0-public-key format, which cannot be opened any more;
 //! they are written again from the live PUF secret).
 
@@ -80,12 +80,25 @@ fn aad(id: &ChipId) -> [u8; 8 + ID_LEN] {
     a
 }
 
-pub fn header() -> [u8; HEADER_LEN] {
+/// The 16-byte header for a magic: the magic, then 8 bytes of SHA-256 over a label and the magic (the
+/// older format used the same construction with its own magic).
+fn header_for(magic: &[u8; 8]) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
-    h[..8].copy_from_slice(&MAGIC);
-    let d = Sha256::digest([b"pfrs-pbk-hdr".as_slice(), &MAGIC].concat());
+    h[..8].copy_from_slice(magic);
+    let d = Sha256::digest([b"pfrs-pbk-hdr".as_slice(), magic].concat());
     h[8..].copy_from_slice(&d[..8]);
     h
+}
+
+pub fn header() -> [u8; HEADER_LEN] {
+    header_for(&MAGIC)
+}
+
+/// The complete header the older firmware wrote. Only a sector that carries ALL of its 16 bytes is of
+/// the older format: the magic alone is not enough (a damaged current sector whose version byte got
+/// flipped must stay `Damaged`, it may still hold records).
+pub fn legacy_header() -> [u8; HEADER_LEN] {
+    header_for(&LEGACY_MAGIC)
 }
 
 fn header_ok(sector: &[u8]) -> bool {
@@ -99,7 +112,8 @@ pub enum Kind {
     Valid,
     /// Erased (all 0xFF): nothing was ever written.
     Blank,
-    /// The older, known format: its records cannot be opened any more.
+    /// The older, known format (its complete 16-byte header is there): its records cannot be opened
+    /// any more.
     Legacy,
     /// The first write (header + first record, one program) was cut short inside the header: only an
     /// exact prefix of the header (plus a partly programmed byte) is there, everything else is erased.
@@ -119,7 +133,7 @@ pub fn classify(sector: &[u8]) -> Kind {
     if sector.iter().all(|&b| b == 0xFF) {
         return Kind::Blank;
     }
-    if sector[..8] == LEGACY_MAGIC {
+    if sector[..HEADER_LEN] == legacy_header() {
         return Kind::Legacy;
     }
     // A torn first write (header + first record are one program, which runs front to back): the first
@@ -127,7 +141,11 @@ pub fn classify(sector: &[u8]) -> Kind {
     // go from 1 to 0, so it holds all the bits of the header's byte) and EVERYTHING after it is erased.
     // No record byte can be there yet, so nothing recoverable is lost by formatting.
     let h = header();
-    let k = sector.iter().zip(h.iter()).take_while(|(s, e)| s == e).count();
+    let k = sector
+        .iter()
+        .zip(h.iter())
+        .take_while(|(s, e)| s == e)
+        .count();
     if k < HEADER_LEN && sector[k] & h[k] == h[k] && sector[k + 1..].iter().all(|&b| b == 0xFF) {
         return Kind::Torn;
     }

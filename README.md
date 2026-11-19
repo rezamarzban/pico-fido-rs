@@ -1,14 +1,17 @@
 # pico-fido-rs
 
 A FIDO2 / U2F security key for the Raspberry Pi Pico (RP2040) with an ATECC608A secure element, written
-in Rust with Embassy. The CTAP protocol is **Google's OpenSK library** (Apache-2.0, plus one 14-line patch); this
+in Rust with Embassy. The CTAP protocol is **Google's OpenSK library** (Apache-2.0, plus one small patch); this
 repository is the RP2040 platform layer around it. **Experimental. Read `SECURITY.md`.**
+
+The optional carrier-board design and wiring are documented in [PCB/HARDWARE.md](PCB/HARDWARE.md).
 
 ## What is where
 | In the ATECC608A (`src/se/`) | On the Pico |
 |---|---|
-| 9 credential private keys, **one per site** (GenKey, ECDSA signing; unlimited signatures). **Nothing else is stored in the chip** | OpenSK with its standard key-value store (`src/env/persist.rs`, `flash_store.rs`) and the **site directory** (which site owns which key slot, `src/env/dir_flash.rs`, `src/se/dirlog.rs`) |
+| 9 credential private keys, **one per site** (GenKey, ECDSA signing; unlimited signatures) | OpenSK with its key-value store (`src/env/persist.rs`, `flash_store.rs`) and the **site directory** (which site owns which key slot, `src/env/dir_flash.rs`, `src/se/dirlog.rs`); both are sealed in flash |
 | 1 attestation private key (slot 0, created once) | ClientPIN, PIN hash, credential-ID encryption keys, resident credentials: all OpenSK standard |
+| HMAC key for the PUF-secret backup (data slot 11, when provisioned) | Sealed PUF backup records and signature tallies |
 | Public-key extraction | SHA-256 / HMAC / AES / HKDF / ECDH in software (`src/se/crypto.rs`) |
 | Random (the only entropy source) | RNG = ChaCha20 DRBG seeded and re-seeded from the chip (`src/env/rng.rs`) |
 | | BOOTSEL as user presence (`src/env/user_presence.rs`), USB HID (`src/usb/`, `src/env/hid.rs`) |
@@ -31,7 +34,7 @@ the packet pump run on a higher-priority interrupt executor (`SWI_IRQ_1`). OpenS
 
 ## OpenSK version
 Pinned in `third_party/OPENSK_REV` (`f53621c33a02eee001cae82a87aa719fca61565b`, "Allow custom PIN hash verification
-(#836)") plus **one 14-line patch**,
+(#836)") plus **one small patch** (12 added lines in three OpenSK files),
 `third_party/opensk-rp-hint.patch`: OpenSK tells the RNG which site (RP ID hash) a new key is for, so the chip
 keeps one key per site (`src/se/ecdsa.rs`). It only adds two default methods to `Rng` and two calls; nothing else
 changes. This revision has OpenSK's fallible `EcSecretKey::random` / `sign` (#835), which `src/se/ecdsa.rs` uses to
@@ -47,9 +50,9 @@ linker's FLASH region by `build.rs`. From the end of flash downwards:
 |---|---|---|
 | OpenSK key-value store | 72 KiB | **every value sealed** (PIN hash, master keys, resident credentials, attestation certificate, counters), `src/env/persist.rs` |
 | Site directory sectors A, B | 2 x 8 KiB | **every record sealed** (chip serials, site hashes), `src/env/dir_flash.rs` |
-| Signature counter, region A | 12 KiB | **every record sealed**, `src/env/tally_flash.rs` (copy-on-write between regions A and B, like the directory: a power cut never loses the counts) |
+| Signature counter, region A | 12 KiB | **every record sealed**, `src/env/tally_flash.rs` (copy-on-write between regions A and B; a signature interrupted before its count is committed may be missing) |
 | SRAM-PUF helper data | 4 KiB | public by design (useless without this chip's SRAM pattern) |
-| Backup of the PUF secret | 4 KiB | one sealed record per chip, `src/puf_backup.rs` (see below); below the helper sector, so the first-start wipe never touches it |
+| Backup of the PUF secret | 4 KiB | sealed backup records, `src/puf_backup.rs` (see below); below the helper sector, so the first-start wipe never touches it |
 | Signature counter, region B | 12 KiB | as region A; lies below the backup so that the helper and the backup keep their place; the first-start wipe erases it explicitly |
 
 * **Key.** 4 KiB at the TOP of the striped SRAM (0x2003F000..0x20040000) are carved out of the linker's RAM
@@ -75,8 +78,8 @@ linker's FLASH region by `build.rs`. From the end of flash downwards:
   If the slot cannot be rewritten (e.g. data zone locked), the record is written again under the key that is in the chip. A start that needs no new record writes nothing. With fewer than two free records the key is not replaced (the record is written under the current key).
   **A backup sector with unknown or damaged content is never erased** (it could still hold other chips' records): no
   backup is written (the OLED shows the backup error) and, if the PUF helper is also blank, start-up halts instead of
-  wiping; erase the whole flash (BOOTSEL `flash_nuke.uf2`) to start over. Blank, half-formatted and older-format sectors are formatted as before. A blank slot that cannot be written means no backup (the OLED says
-  NO HMAC KEY), because a blank slot would give a known constant. One record per chip (55 fit). If a later start cannot
+  wiping; erase the whole flash (BOOTSEL `flash_nuke.uf2`) to start over. Blank, half-formatted and older-format sectors are formatted as before; "older format" means the complete 16-byte header of the old format, not just its magic (a current sector whose version byte got damaged is `Damaged` and never erased). A blank slot that cannot be written means no backup (the OLED says
+  NO HMAC KEY), because a blank slot would give a known constant. The sector holds 55 records total, including records made obsolete by key rotation. If a later start cannot
   read the PUF (the sample does not decode, the helper sector is damaged or erased), connecting any chip that has a record
   brings the secret back and with it every key; if the sample allows it (power-on reset, balanced pattern) a new helper
   sector is written from the current power-up pattern, so the next starts use the PUF again, otherwise the secret stays in
@@ -122,17 +125,15 @@ count start empty once (the keys stay in the chip; new sites regenerate them, se
 ## Build
 Needs the **nightly** pinned in `rust-toolchain.toml` and `flip-link`. Release builds are size-optimised.
 
-    git submodule add --depth 1 https://github.com/google/OpenSK.git third_party/OpenSK
-    git -C third_party/OpenSK fetch --depth 1 origin $(cat third_party/OPENSK_REV)
-    git -C third_party/OpenSK checkout $(cat third_party/OPENSK_REV)
+    sh third_party/fetch-opensk.sh               # fetch the pinned OpenSK commit
     sh third_party/apply-opensk-patch.sh          # the RP-hint patch
 
-    cargo build --release                         # 2 MiB board, no USB serial number
-    cargo build --release --no-default-features --features rp2040_board,flash_4m,usb_serial
+    cargo build --release --locked                # 2 MiB board, no USB serial number
+    cargo build --release --locked --no-default-features --features rp2040_board,flash_4m,usb_serial
 
 Enable **exactly one** `flash_*` feature. `usb_serial` adds the flash unique ID as USB serial number (off by
 default: it lets hosts recognise the device). `oled` (default) is an SSD1306 on I2C0 (SDA GP16, SCL GP17,
-0x3C); build without it by leaving it out of `--features`. **Commit `Cargo.lock`** (none in this tree).
+0x3C); build without it by leaving it out of `--features` with `--no-default-features`. The root `Cargo.lock` is committed.
 `build.sh [-s 2|4|8|16] [-u] [-O]` builds a UF2 from the repository (needs network).
 
 ## Provisioning the chip (once per chip)
@@ -146,23 +147,14 @@ certificate, which is stored in the token once with OpenSK's `tools/configure.py
     python3 atecc608a/tools/make_attest_cert.py --selftest
 
 ## Verification status
-**The `atecc1` code up to "OpenSK based ATECC support v2.1" was built and tested on browsers and operating
-systems** (reported by the maintainer, not independently verified). Everything after it, including the flash
-encryption, was checked like this (stable Rust 1.99 with `RUSTC_BOOTSTRAP=1`, `-Zbuild-std=core,alloc`, no nightly pin):
+The maintainer reports that every `atecc1` firmware revision was tested on all browsers and operating systems.
+No version-by-platform test matrix was supplied, and these results have not been independently reproduced.
+The PCB commit contains design files only; it does not change the tested v6.5 firmware.
 
-* `cargo check`, `cargo clippy -- --deny=warnings` and `cargo build --release` for `thumbv6m-none-eabi` pass (linked with
-  `rust-lld`; flip-link is not installed in that setup); the image is about 230 KB, `.data`+`.bss` end well below the
-  PUF region, and `rustfmt --check` is clean.
-* `host-test/se` (87 tests): the chip model and the OpenSK adapter, the two-sector directory with the power cut after
-  every step and in the middle of every program/erase step, the sealed log layouts with known-answer vectors from
-  `host-test/seal_ref.py`, the PUF arithmetic (bit-sliced majority against a naive one, noise at 10 %, bias
-  refusal), the long-value splitting and the PUF-secret backup (record format, torn writes, forgery, capacity, and the
-  start-up policy that decides between restore, first start and halt).
-* OpenSK's own unit tests pass at the pinned revision with the patch applied (350, and 401 with `config_command,ctap1`).
-* **Not done:** nothing was run on a Pico, a real ATECC608A or real SRAM. **Before relying on the flash encryption, flash a spare Pico and
-  read the `puf: ... bit errors ... ones: raw ... pairs ...` line at several boots, temperatures and on several
-  boards:** the sample must stay near 50 % pairs and the error rate well below 10 %.
-Run `host-test/run.sh` and the acceptance test in `atecc608a/CONFIG.md` on a spare chip before locking a chip you care
-about. USB VID/PID (`0xc0de:0xcafe`) are prototype placeholders (`src/usb/mod.rs`).
+Host-model coverage includes the chip adapter, flash interruption handling, sealing, PUF decoding, large-value
+splitting and backups. Compatibility testing does not establish real-SRAM reliability across boards and conditions,
+hardware power-loss behavior, or a security audit. Before relying on the encryption, check PUF logs over multiple
+cold boots and on your target boards. Run `sh host-test/run.sh` and the [chip acceptance tests](atecc608a/CONFIG.md)
+on a spare chip before locking hardware. The USB VID/PID (`0xc0de:0xcafe`) are prototype placeholders.
 
 `guide.md` is the user guide (udev rule, PIN, registering, LED).

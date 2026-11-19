@@ -655,6 +655,33 @@ fn used_slots_are_counted_from_the_chip_and_by_new_keys() {
 }
 
 #[test]
+fn slot_use_shows_fresh_keys_and_signatures_per_slot() {
+    let (_g, _m) = install(false, 0);
+    let none = ecdsa::slot_use();
+    assert_eq!((none.fresh, none.signs, none.last), (0, [0; 16], None));
+    let mut rng = TestRng(ChaCha8Rng::seed_from_u64(12));
+    let a = SeSecretKey::random(&mut rng).unwrap();
+    let b = SeSecretKey::random(&mut rng).unwrap();
+    let (sa, sb) = (a.export()[1], b.export()[1]);
+    assert_eq!((sa, sb), (FIRST_CRED_SLOT, FIRST_CRED_SLOT + 1));
+    // Two keys were generated; nothing has signed yet.
+    let u = ecdsa::slot_use();
+    assert_eq!(u.fresh, (1 << sa) | (1 << sb));
+    assert_eq!((u.signs, u.last), ([0; 16], None));
+    // Signatures are counted per slot and the last signer is remembered.
+    check_sig(&a, b"one");
+    check_sig(&b, b"two");
+    check_sig(&b, b"three");
+    let u = ecdsa::slot_use();
+    assert_eq!(u.signs[sa as usize], 1);
+    assert_eq!(u.signs[sb as usize], 2);
+    assert_eq!(u.last, Some(sb));
+    assert_eq!(u.signs.iter().map(|&n| n as u32).sum::<u32>(), 3);
+    // A slot that is not used stays at zero and not fresh.
+    assert_eq!(u.fresh & (1 << (sb + 1)), 0);
+}
+
+#[test]
 fn a_bus_error_never_makes_a_used_slot_look_free() {
     let (_g, m) = install(false, 0);
     let mut rng = TestRng(ChaCha8Rng::seed_from_u64(10));
@@ -2523,10 +2550,31 @@ mod backup_tests {
         assert!(matches!(plan(&half, &pk(1), &secret(7)), Plan::Append { .. }));
         // The known older format is formatted away (its records cannot be opened any more).
         let mut legacy = blank();
-        legacy[..8].copy_from_slice(&LEGACY_MAGIC);
-        legacy[8..40].fill(0x11);
+        legacy[..HEADER_LEN].copy_from_slice(&legacy_header());
+        legacy[HEADER_LEN..HEADER_LEN + 32].fill(0x11);
         assert_eq!(classify(&legacy), Kind::Legacy);
         assert!(matches!(plan(&legacy, &pk(1), &secret(7)), Plan::Format { .. }));
+        // The magic of the older format alone is NOT the older format: a current sector (valid header,
+        // records of two chips) whose version byte reads \x01, or any sector that merely starts with that
+        // magic, is damaged data and must never be erased.
+        let mut cur = blank();
+        back_up(&mut cur, 1, 7);
+        back_up(&mut cur, 2, 7);
+        let mut flipped = cur.clone();
+        flipped[7] = LEGACY_MAGIC[7];
+        assert_eq!(classify(&flipped), Kind::Damaged);
+        assert!(!readable(&flipped));
+        assert_eq!(plan(&flipped, &pk(1), &secret(7)), Plan::Refuse);
+        assert_eq!(plan(&flipped, &pk(3), &secret(7)), Plan::Refuse);
+        let mut only_magic = blank();
+        only_magic[..8].copy_from_slice(&LEGACY_MAGIC);
+        only_magic[8..40].fill(0x11);
+        assert_eq!(classify(&only_magic), Kind::Damaged);
+        assert_eq!(plan(&only_magic, &pk(1), &secret(7)), Plan::Refuse);
+        // One flipped bit in the check bytes of a real older header: damaged as well.
+        let mut half_legacy = legacy.clone();
+        half_legacy[HEADER_LEN - 1] ^= 0x01;
+        assert_eq!(classify(&half_legacy), Kind::Damaged);
         assert!(apply(&mut sec, &p));
         assert_eq!(&*find(&sec, &pk(1)).unwrap(), &secret(7));
     }

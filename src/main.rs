@@ -164,6 +164,14 @@ fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) 
         se::ecdsa::BackupKey::NoKey => (None, true),
         se::ecdsa::BackupKey::NoChip => (None, false),
     };
+    status::HMAC_STATE.store(
+        match (&digest, no_key) {
+            (Some(_), _) => status::HM_KEY,
+            (None, true) => status::HM_NONE,
+            (None, false) => status::HM_NOCHIP,
+        },
+        Relaxed,
+    );
     let sector = env::backup_flash::read(flash);
     let stats = puf.stats();
     status::PUF_POR.store(puf.por(), Relaxed);
@@ -249,6 +257,7 @@ fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) 
     // is sealed under a NEW random key for slot 11, in a power-fail safe order (`backup_new_record`).
     // Nothing is rotated when the chip already has its record or the sector is full.
     let mut chips = chips_backed_up;
+    let mut recs = sector.as_deref().map_or(0, |s| puf_backup::usage(s).1);
     let backup_state = match (&digest, puf.secret(), &sector) {
         (Some(d), Some(secret), Some(s)) => match puf_backup::plan(s, d, &secret) {
             Plan::Nothing => status::BK_HAVE,
@@ -263,8 +272,9 @@ fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) 
             _ => {
                 let st = backup_new_record(flash, s, d, &secret);
                 if st == status::BK_NEW {
-                    chips = env::backup_flash::read(flash)
-                        .map_or(chips, |s| puf_backup::usage(&s).0);
+                    if let Some(s2) = env::backup_flash::read(flash) {
+                        (chips, recs) = puf_backup::usage(&s2);
+                    }
                 }
                 st
             }
@@ -281,6 +291,7 @@ fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) 
     };
     status::BACKUP_STATE.store(backup_state, Relaxed);
     status::BACKUP_CHIPS.store(chips as u32, Relaxed);
+    status::BACKUP_RECS.store(recs as u32, Relaxed);
     status::PUF_STATE.store(
         match puf.restored() {
             puf::Restored::No => status::PUF_OK,
@@ -360,6 +371,7 @@ fn backup_new_record(
     match se::ecdsa::commit_backup_key(pending) {
         se::ecdsa::Rotation::Rotated => {
             info!("puf: new backup key written to the chip");
+            status::HMAC_ROT.fetch_add(1, portable_atomic::Ordering::Relaxed);
             status::BK_NEW
         }
         se::ecdsa::Rotation::Kept(cur) => {
@@ -383,6 +395,14 @@ fn refresh_slot_status() {
     if let Some(r) = se::ecdsa::slot_report() {
         status::SE_REGS.store(r.keys() as u32, Relaxed);
         status::SE_SITES.store(r.sites() as u32, Relaxed);
+        status::SE_MASK.store(r.has_key, Relaxed);
+    }
+    // Which slots got a fresh key since power-up, and how often each key signed.
+    let u = se::ecdsa::slot_use();
+    status::SE_FRESH.store(u.fresh, Relaxed);
+    status::SE_LAST.store(u.last.unwrap_or(status::SE_NO_SLOT), Relaxed);
+    for (n, a) in status::SE_SLOT_SIGNS.iter().enumerate() {
+        a.store(u.signs[n].min(u8::MAX as u16) as u8, Relaxed);
     }
 }
 

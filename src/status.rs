@@ -1,6 +1,6 @@
 //! Device status shared between the firmware parts and the OLED display (`src/oled.rs`). Plain
 //! atomics: written where the state changes, read by the display. Nothing here is secret.
-use portable_atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use portable_atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
 
 /// HID packets handled.
 pub static PKTS: AtomicU32 = AtomicU32::new(0);
@@ -29,6 +29,27 @@ pub static SE_REGS: AtomicU32 = AtomicU32::new(SE_UNKNOWN);
 
 /// Credential slots that belong to a site (0..=9; `SE_UNKNOWN` = not known yet).
 pub static SE_SITES: AtomicU32 = AtomicU32::new(SE_UNKNOWN);
+/// Key slots since power-up (bit n / index n = slot n, 0 = attestation): slots that got a freshly
+/// generated key, signatures per slot (saturating at 255), and the slot that signed last
+/// (`SE_NO_SLOT` = none yet).
+pub const SE_NO_SLOT: u8 = u8::MAX;
+/// Slots (bit n = slot n) that hold a private key, as of the last scan plus the keys created since.
+pub static SE_MASK: AtomicU16 = AtomicU16::new(0);
+pub static SE_FRESH: AtomicU16 = AtomicU16::new(0);
+pub static SE_LAST: AtomicU8 = AtomicU8::new(SE_NO_SLOT);
+pub static SE_SLOT_SIGNS: [AtomicU8; 10] = [const { AtomicU8::new(0) }; 10];
+
+/// `HMAC_STATE`: the HMAC key of the chip's backup slot (`se::ecdsa::BACKUP_SLOT`).
+pub const HM_UNKNOWN: u8 = 0; // not checked yet
+pub const HM_KEY: u8 = 1; // the slot holds a key and the chip answers HMAC with it
+pub const HM_NONE: u8 = 2; // the slot is blank and no key could be written
+pub const HM_NOCHIP: u8 = 3; // no chip that can do HMAC
+pub static HMAC_STATE: AtomicU8 = AtomicU8::new(HM_UNKNOWN);
+/// Fresh random HMAC keys written to the chip since power-up (0 or 1: one rotation per start-up).
+pub static HMAC_ROT: AtomicU32 = AtomicU32::new(0);
+/// Records in the backup sector in use (every one was sealed under a different HMAC key).
+pub static BACKUP_RECS: AtomicU32 = AtomicU32::new(0);
+
 /// Signatures made: lifetime total (kept in the Pico's flash) and since power-up.
 pub static SIGS_TOTAL: AtomicU32 = AtomicU32::new(0);
 pub static SIGS_BOOT: AtomicU32 = AtomicU32::new(0);
