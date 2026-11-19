@@ -6,8 +6,9 @@ branch you use before relying on it.**
 
 **Hardware testing (reported by the maintainer, not independently verified):** every branch except the ATECC branches was built, flashed to a Raspberry Pi Pico and tested. The OpenSK-based branches (`openSK-based`, `-se0` .. `-se5`) were tested and work on **Linux, Windows and Android** browsers; the `se-harden*` branches were tested and work on **Linux only**. The `atecc1` branch was built and tested on **all browsers and operating systems**. None of the other ATECC branches (`atecc0`, `atecc-se0` .. `atecc-se3`, `atecc-support`) was compiled or run.
 
-This branch (`main`) carries no firmware documentation of its own, but it is **not empty**: it still holds the earliest custom firmware (stateless ES256 credentials from one 32-byte master key kept in plain flash, in the last 4 KiB of a 2 MiB chip; no PIN, no resident keys; a USB keyboard HID interface next to the FIDO one; no `flash_*` features, no `build.sh`). The `build.sh` scripts of the other branches default to `-b main`, which does not build (no `flash_*` features): always pass `-b <branch>`. The documented work lives in the branches below;
-each has its own `README.md` / `SECURITY.md` / `REVIEW.md` (some also `guide.md`; `atecc-se0` and `atecc-support` only have `README-ATECC.md`; the other ATECC branches also keep `atecc608a/CONFIG.md`).
+`main` holds the original custom firmware: stateless ES256 credentials derived from a master key in plaintext flash, no PIN or resident keys, and a USB keyboard HID interface next to FIDO HID. It has no `build.sh` or `flash_*` features. When building another branch with its `build.sh`, explicitly pass `-b <branch>` if the script supports that option: defaults differ and several scripts select `main` or another branch.
+
+Start with the [commit-by-commit branch history](BRANCH-HISTORY.md) to pick a snapshot. Use the documentation at that snapshot rather than assuming another branch's build, flash layout or provisioning instructions apply.
 
 | Branch | What it is |
 |--------|------------|
@@ -23,7 +24,7 @@ each has its own `README.md` / `SECURITY.md` / `REVIEW.md` (some also `guide.md`
 | `atecc-se1` | `openSK-based-se5` plus the default `se_atecc` feature: 8 credential keys, signature budget (LimitedUse + Counter 0) and TRNG in an ATECC608A. Software parts unchanged. Not compiled or run. |
 | `atecc-se2`, `atecc-se3` | As `atecc-se1` with 7 credential slots and an optional chip-side PIN (`se_pin`, off by default). `atecc-se3` adds `table.md` (what is in the chip and what is not). Not compiled or run. |
 | `atecc0` | Slimmed ATECC608A firmware on unpatched OpenSK: 7 credential keys + attestation slot 7, signature budget, PIN hash in the clear on the Pico (no vault, PUF or RAM guard). Not compiled. |
-| `atecc1` | As `atecc0` with 9 credential slots (1-9), attestation key in slot 0 and no signature limit; OLED shows chip status. Built and tested on all browsers and operating systems. |
+| `atecc1` | Started as a continuation of `atecc0`'s firmware; the tip uses nine site-key slots (1–9), slot 0 for attestation, sealed flash with SRAM-PUF recovery, an OLED status display and optional carrier-board design files. Every firmware revision was tested on all browsers and operating systems, as reported by the maintainer. |
 
 `openSK-based/REVIEW.md` records why the project moved from the custom implementation to OpenSK: the custom firmware
 worked in Linux browsers but not on Windows and Android, and the cause was never established.
@@ -33,8 +34,7 @@ Usage guides: `guide.md` in `openSK-based`, `openSK-based-se0` .. `openSK-based-
 
 # Project Changelog & Branch History
 
-> Note: `openSK-based` branches from the "basic edition" commit (`9aa7f6b`), not from `se-harden3`.
-> The `se-harden*` chain and the `openSK-based*` chain are two separate lines of development.
+> The firmware lines branch from the shared "basic edition" commit `90c9e5d`, not from today's `main` tip `e1192fc`. Several named branches end with documentation variants of commits carried in another branch's ancestry. The [commit index](BRANCH-HISTORY.md) distinguishes stored ancestry from the feature progression below.
 
 ## Line 1: custom firmware
 
@@ -116,8 +116,8 @@ Usage guides: `guide.md` in `openSK-based`, `openSK-based-se0` .. `openSK-based-
 `atecc-support` / `atecc-se0` (see their `README-ATECC.md`) are the older single-file variants. The newer branches:
 - **`atecc-se1`** (from `openSK-based-se5`): feature `se_atecc` (default; `build.sh -X` disables it): credential keys, ECDSA signing, a signature budget (LimitedUse slots + Counter 0) and extra entropy in an ATECC608A on I2C1 (GP14/GP15). 8 slots (`se_slots_16`: 16, unverified). Seed vault, PUF and RAM guard stay in software.
 - **`atecc-se2`**: 7 credential slots, slot 7 configured as attestation key but not used by the firmware; optional chip-side PIN (`se_pin`, `gen_atecc_config.py --pin-gate`, PIN key in slot 11). **`atecc-se3`**: the same plus `table.md`.
-- **`atecc0`** (from `atecc-se1`): removes the vault, PUF, RAM guard and PIN gate; OpenSK stays unpatched with its standard store. **`atecc1`**: 9 credential slots (1-9), attestation key in slot 0, no signature limit (Counter 0 unused).
-- None of these except `atecc1` was compiled or run on a Pico; `atecc1` was built and tested on all browsers and operating systems.
+- **`atecc0`** (from the firmware commit behind `atecc-se1`): removes the vault, PUF, RAM guard and PIN gate; OpenSK stays unpatched with its standard store. **`atecc1`** continues from `atecc0`'s v1 firmware commit, not its documentation tip. Slot policy, the location of the site directory, signature accounting and flash protection all change across its versions; see the [release ledger](BRANCH-HISTORY.md#atecc1-release-ledger).
+- The maintainer reports that every `atecc1` firmware revision was tested on all browsers and operating systems. No per-platform/browser matrix was supplied, and this report does not establish validation of every firmware feature or fabrication of the PCB. The other ATECC branches were not compiled or run.
 
 ## Caveat
 Per the repository's own `REVIEW.md`, much of the code in the `openSK-based-se*` branches was first written without a Rust toolchain; the maintainer has since built and run them (see above) but there is no detailed test record, and the ATECC branches other than `atecc1` were never compiled or run. Treat the entries above as describing what the code changes, not as verified behaviour.
