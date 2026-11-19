@@ -257,7 +257,7 @@ fn init_flash_key(flash: &'static RefCell<keys::Fl>, led: &mut Output<'static>) 
                 status::BK_FULL
             }
             Plan::Refuse => {
-                warn!("puf: the backup sector holds unknown data and is left alone (erase the flash)");
+                warn!("puf: unknown data in the backup sector, left alone (erase the flash)");
                 status::BK_ERR
             }
             _ => {
@@ -346,7 +346,7 @@ fn backup_new_record(
     // The rotation needs room for TWO records in the worst case: the one under the new key and, if the
     // chip's key cannot be replaced, one under the current key. With less room the key is not replaced.
     if puf_backup::free_records(sector) < 2 {
-        warn!("puf: little room left in the backup sector, the current backup key is used");
+        warn!("puf: little room in the backup sector, the current key is used");
         return write(flash, sector, current, secret);
     }
     let Some(pending) = se::ecdsa::prepare_backup_key() else {
@@ -363,7 +363,7 @@ fn backup_new_record(
             status::BK_NEW
         }
         se::ecdsa::Rotation::Kept(cur) => {
-            warn!("puf: the backup key could not be replaced, the current one is used");
+            warn!("puf: the backup key could not be replaced, keeping the current one");
             match env::backup_flash::read(flash) {
                 Some(s2) => write(flash, &s2, &cur, secret),
                 None => status::BK_ERR,

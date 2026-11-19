@@ -101,8 +101,8 @@ pub enum Kind {
     Blank,
     /// The older, known format: its records cannot be opened any more.
     Legacy,
-    /// The first write (header + first record, one program) was cut short: only a prefix of the header
-    /// (bits can only be cleared by programming) and at most part of the first record are there.
+    /// The first write (header + first record, one program) was cut short inside the header: only an
+    /// exact prefix of the header (plus a partly programmed byte) is there, everything else is erased.
     Torn,
     /// Anything else: foreign or damaged data. It may still hold records of other chips (a bit flip in
     /// the header would look like this), so it is never erased by the firmware.
@@ -122,9 +122,13 @@ pub fn classify(sector: &[u8]) -> Kind {
     if sector[..8] == LEGACY_MAGIC {
         return Kind::Legacy;
     }
+    // A torn first write (header + first record are one program, which runs front to back): the first
+    // `k` bytes (k < HEADER_LEN) are exactly the header's, byte `k` is partly programmed (bits only
+    // go from 1 to 0, so it holds all the bits of the header's byte) and EVERYTHING after it is erased.
+    // No record byte can be there yet, so nothing recoverable is lost by formatting.
     let h = header();
-    let prefix_of_header = sector[..HEADER_LEN].iter().zip(h.iter()).all(|(&s, &e)| s & e == e);
-    if prefix_of_header && sector[HEADER_LEN + REC..].iter().all(|&b| b == 0xFF) {
+    let k = sector.iter().zip(h.iter()).take_while(|(s, e)| s == e).count();
+    if k < HEADER_LEN && sector[k] & h[k] == h[k] && sector[k + 1..].iter().all(|&b| b == 0xFF) {
         return Kind::Torn;
     }
     Kind::Damaged

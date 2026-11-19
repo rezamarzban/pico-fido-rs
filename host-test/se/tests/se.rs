@@ -2465,6 +2465,25 @@ mod backup_tests {
         torn[..4].copy_from_slice(&header()[..4]);
         assert_eq!(classify(&torn), Kind::Torn);
         assert!(readable(&torn));
+        // The torn pattern is narrow: an exact header prefix (a partly programmed next byte is fine) and
+        // nothing but erased bytes after it ...
+        let mut partial = torn.clone();
+        partial[4] = header()[4] | 0x0C; // some of the bits of the next byte are not programmed yet
+        assert_eq!(classify(&partial), Kind::Torn);
+        // ... anything else is damaged and left alone: a changed byte inside the prefix, a byte after the
+        // torn point that is not erased, or record-like data behind a (damaged) header.
+        let mut changed = torn.clone();
+        changed[2] &= !(header()[2] & header()[2].wrapping_neg());
+        assert_eq!(classify(&changed), Kind::Damaged);
+        let mut behind = torn.clone();
+        behind[100] = 0x00;
+        assert_eq!(classify(&behind), Kind::Damaged);
+        let mut records = blank();
+        records[..4].copy_from_slice(&header()[..4]);
+        records[HEADER_LEN..HEADER_LEN + REC].fill(0x3C);
+        assert_eq!(classify(&records), Kind::Damaged);
+        assert_eq!(plan(&records, &pk(1), &secret(7)), Plan::Refuse);
+        assert_eq!(plan(&behind, &pk(1), &secret(7)), Plan::Refuse);
     }
 
     #[test]
