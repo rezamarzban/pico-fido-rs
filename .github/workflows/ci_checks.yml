@@ -22,6 +22,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
+      - name: Apply the OpenSK hardening patch (idempotent)
+        shell: bash
+        run: grep -q cancel_in_flight third_party/OpenSK/libraries/opensk/src/lib.rs || patch -p1 -d third_party/OpenSK < third_party/opensk-harden.patch
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.NIGHTLY }}
@@ -44,6 +47,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
+      - name: Apply the OpenSK hardening patch (idempotent)
+        shell: bash
+        run: grep -q cancel_in_flight third_party/OpenSK/libraries/opensk/src/lib.rs || patch -p1 -d third_party/OpenSK < third_party/opensk-harden.patch
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.NIGHTLY }}
@@ -55,6 +61,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
+      - name: Apply the OpenSK hardening patch (idempotent)
+        shell: bash
+        run: grep -q cancel_in_flight third_party/OpenSK/libraries/opensk/src/lib.rs || patch -p1 -d third_party/OpenSK < third_party/opensk-harden.patch
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.NIGHTLY }}
