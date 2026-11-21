@@ -17,14 +17,10 @@ jobs:
         os: [ubuntu-latest, macOS-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      # `submodules: true` fetches third_party/OpenSK but NOT its nested submodules, which is what we want
-      # (the opensk library does not use third_party/wasefire).
       - uses: actions/checkout@v4
-        with:
-          submodules: true
-      - name: Apply the OpenSK hardening patch (idempotent)
+      - name: Fetch OpenSK (pinned commit) and apply the hardening patch
         shell: bash
-        run: grep -q cancel_in_flight third_party/OpenSK/libraries/opensk/src/lib.rs || patch -p1 -d third_party/OpenSK < third_party/opensk-harden.patch
+        run: sh third_party/setup-opensk.sh
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.NIGHTLY }}
@@ -45,11 +41,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
-      - name: Apply the OpenSK hardening patch (idempotent)
+      - name: Fetch OpenSK (pinned commit) and apply the hardening patch
         shell: bash
-        run: grep -q cancel_in_flight third_party/OpenSK/libraries/opensk/src/lib.rs || patch -p1 -d third_party/OpenSK < third_party/opensk-harden.patch
+        run: sh third_party/setup-opensk.sh
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.NIGHTLY }}
@@ -59,11 +53,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
-      - name: Apply the OpenSK hardening patch (idempotent)
+      - name: Fetch OpenSK (pinned commit) and apply the hardening patch
         shell: bash
-        run: grep -q cancel_in_flight third_party/OpenSK/libraries/opensk/src/lib.rs || patch -p1 -d third_party/OpenSK < third_party/opensk-harden.patch
+        run: sh third_party/setup-opensk.sh
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.NIGHTLY }}

@@ -4,16 +4,14 @@
 # After the move to OpenSK the protocol logic (CTAP2/CTAP1, CBOR, PIN protocol, credential
 # storage, CTAPHID) lives in the OpenSK library, so its own unit tests are the protocol test suite.
 # This script runs them the same way OpenSK's run_desktop_tests.sh does. Needs third_party/OpenSK
-# (see README: git submodule, or build.sh fetches it). Builds for the host, not for the Pico.
+# (fetched by third_party/setup-opensk.sh, which this script runs if it is missing). Builds for the host, not for the Pico.
 #
 # NOT covered here (needs hardware, see README "Verification status"): src/env/* (flash store,
 # BOOTSEL user presence, HID bridge, RNG), the USB stack and the interrupt-executor split.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
-cd "$HERE/../third_party/OpenSK" || {
-  echo "third_party/OpenSK is missing: git submodule update --init --depth 1 third_party/OpenSK" >&2
-  exit 1
-}
+[ -f "$HERE/../third_party/OpenSK/libraries/opensk/Cargo.toml" ] || sh "$HERE/../third_party/setup-opensk.sh"
+cd "$HERE/../third_party/OpenSK"
 if [ -f ../OPENSK_REV ]; then
   want=$(tr -d '[:space:]' < ../OPENSK_REV)
   have=$(git rev-parse HEAD 2>/dev/null || true)

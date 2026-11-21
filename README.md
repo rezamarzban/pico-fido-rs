@@ -7,7 +7,7 @@ around it (USB, flash store, button, RNG). This branch adds a PIN-wrapped master
 ## Architecture
 | Part | Where |
 |------|-------|
-| CTAP2 / CTAP1 (U2F), CTAPHID, ClientPIN, credential logic | OpenSK, `third_party/OpenSK/libraries/opensk` (git submodule; commit in `third_party/OPENSK_REV`) |
+| CTAP2 / CTAP1 (U2F), CTAPHID, ClientPIN, credential logic | OpenSK, `third_party/OpenSK/libraries/opensk` (fetched by `third_party/setup-opensk.sh`, not a git submodule; commit in `third_party/OPENSK_REV`) |
 | `opensk::env::Env` for the Pico | `src/env/mod.rs` (`PicoEnv`; customization: minimum PIN length 10, batch attestation off) |
 | Persistent store (credentials, metadata, PIN length) | `src/env/persist.rs` + `src/env/flash_store.rs`, on the `wasefire-store` crate (cleartext backend) |
 | Hardening: master key + resident-credential encryption, PIN check (AES-256-GCM tag, no stored PIN hash), retry counter | `src/env/harden.rs` (`HardenPersist`), `src/vault.rs`, `src/store.rs`, `src/wrap.rs`; PIN hook in `third_party/opensk-harden.patch` |
@@ -49,11 +49,9 @@ Needs the **nightly** pinned in `rust-toolchain.toml` (`nightly-2026-06-03`, the
 edition 2024). There is no stable firmware build. Release builds are size-optimised (`opt-level = "s"`, LTO,
 stripped).
 
-    # one-time: OpenSK as a submodule at the pinned commit (do NOT fetch its nested submodules)
-    git submodule add --depth 1 https://github.com/google/OpenSK.git third_party/OpenSK
-    git -C third_party/OpenSK fetch --depth 1 origin $(cat third_party/OPENSK_REV)
-    git -C third_party/OpenSK checkout $(cat third_party/OPENSK_REV)
-    git add .gitmodules third_party/OpenSK
+    # one-time: fetch OpenSK at the pinned commit into third_party/OpenSK and apply the hardening patch
+    # (a plain clone, not a git submodule; its nested submodules are never fetched)
+    sh third_party/setup-opensk.sh
 
     cargo build --release                       # 2 MiB board; USB serial number off (default)
     cargo build --release --no-default-features \
@@ -69,7 +67,7 @@ commit it; `build.sh` then builds `--locked` only.
 
 ### One-command UF2 build (`build.sh`)
 `bash build.sh [-s 2|4|8|16] [-u] [-t TOOLCHAIN] [-r REPO_URL] [-b BRANCH] [-o OUT_DIR]` clones the repository,
-fetches OpenSK at the pinned commit (or the submodule commit), installs the toolchain and `elf2uf2-rs`, builds with
+fetches OpenSK at the pinned commit , installs the toolchain and `elf2uf2-rs`, builds with
 the right `--features` (`-s` flash size in MiB, `-u` adds the USB serial number) and writes
 `out/pico-fido-rs-<N>m.uf2`. Hold BOOTSEL while plugging in and copy the file to the `RPI-RP2` drive. It builds the
 *committed* revision of the repository. **The default `-b` is `openSK-based-se5`** (this branch); pass `-b` to build another branch. With a committed `Cargo.lock` the script builds with `--locked` only and fails instead of resolving newer crates; without one it warns and builds unlocked. This script itself was only syntax-checked; the maintainer's Colab build

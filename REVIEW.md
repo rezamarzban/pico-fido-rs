@@ -73,7 +73,7 @@ available when the fixes were written): build, `cargo clippy`, `sh host-test/run
 * **Verified:** the firmware patch applies cleanly; `src/` here equals it. The OpenSK library alone, at the pinned
   commit, type-checks for `thumbv6m-none-eabi`. Everything else about the build and the hardware behaviour is
   maintainer-reported.
-* [ ] Commit `Cargo.lock` and the submodule pointer at the pinned commit.
+* [ ] Commit `Cargo.lock`.
 * [ ] Run `cargo fmt --check`, `cargo clippy -- --deny=warnings` and the CI workflow (never run on this tree).
 * [ ] Test matrix on hardware: PIN dialogs, discoverable credentials, U2F-only sites, reset, power loss during a flash
   write, long idle, two clients, repeated registrations, P-256 timing, RAM headroom.

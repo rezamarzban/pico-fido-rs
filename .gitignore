@@ -5,3 +5,4 @@ target/
 # build.sh output
 out/
 work/
+third_party/OpenSK/
