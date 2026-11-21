@@ -226,3 +226,8 @@ Fixes the issue that a PUF failure could silently produce a plain / unbound seed
 
 ---
 **Update:** Argon2id was removed. `src/wrap.rs` now wraps the master seed with AES-256-GCM (key = HMAC-SHA-256(salt, PIN hash or PUF-mixed PIN hash)). Mentions of Argon2 above describe the earlier design. Old Argon2id records are refused (CTAP reset needed).
+
+---
+**Update (retry counter, USB race):**
+* `store::begin_try` no longer erases the counter sector with failures pending (it fails closed on a full sector); it makes room before the first failure instead. New host tests inject erase failures (`full_sector_with_pending_failures_fails_closed_without_erasing`, `failing_recycle_never_lets_the_counter_reset`, ...). Hardware test still open: power cut during a recycle.
+* `usb::ctap::usb_io` samples the epoch after clearing `RESET_SIG` and compares it with the last handled epoch, so a reset between the two statements (or one that arrives while the task writes) drains the endpoint and no longer drops the first packet of the new session. Not testable on the host; needs a hardware test (unplug/replug loop with an immediate CTAPHID_INIT).

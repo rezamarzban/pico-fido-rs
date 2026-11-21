@@ -22,16 +22,46 @@ pub const FIDO_REPORT_DESC: &[u8] = &[
     0x02, 0xC0,
 ];
 
+/// Reads and discards whatever the endpoint still holds until nothing arrives for a moment (a
+/// host needs far longer than this before its first packet of the new session).
+async fn drain(rd: &mut Reader, buf: &mut [u8; 64]) {
+    for _ in 0..8 {
+        let again = select(
+            async {
+                rd.ready().await;
+                rd.read(&mut buf[..]).await
+            },
+            Timer::after_millis(2),
+        )
+        .await;
+        if matches!(again, Either::Second(_)) {
+            break;
+        }
+    }
+    *buf = [0u8; 64];
+}
+
 #[embassy_executor::task]
 pub async fn usb_io(mut rd: Reader, mut wr: Writer) {
     let mut buf = [0u8; 64];
+    // The epoch whose reset has been handled (endpoint drained). A reset is recognised by
+    // `epoch() != handled`, NOT only by the signal: the signal is cleared below and can also be
+    // consumed while this task is busy with a write, so the epoch is the record that cannot be lost.
+    let mut handled = epoch();
     loop {
         // A read that was started before a reset must never deliver its packet afterwards:
-        // `cancel_all` raises RESET_SIG (the read is dropped and restarted, which also makes the
-        // first packet of the new session acceptable) and the epoch is compared once more when the
-        // read completes. The signal arm is polled first, so a reset wins over a ready read.
-        let e = epoch();
+        // `cancel_all` bumps the epoch and raises RESET_SIG (the read is dropped and restarted).
+        // The epoch is sampled AFTER the signal was cleared, so a reset in that window is seen
+        // either as a changed epoch (handled right here) or as a raised signal (first arm below);
+        // it can no longer slip between the two statements and drop the first packet of the new
+        // session. The signal arm is polled first, so a reset wins over a ready read.
         RESET_SIG.reset();
+        let e = epoch();
+        if e != handled {
+            drain(&mut rd, &mut buf).await;
+            handled = e;
+            continue;
+        }
         let ev = {
             let read = async {
                 rd.ready().await;
@@ -40,25 +70,8 @@ pub async fn usb_io(mut rd: Reader, mut wr: Writer) {
             select3(RESET_SIG.wait(), read, OUT_CH.receive()).await
         };
         match ev {
-            Either3::First(()) => {
-                // Reset, suspend or deconfigure: whatever the endpoint still holds belongs to the
-                // old session. Read and discard it until nothing arrives for a moment (a host
-                // needs far longer than this before its first packet of the new session).
-                for _ in 0..8 {
-                    let again = select(
-                        async {
-                            rd.ready().await;
-                            rd.read(&mut buf).await
-                        },
-                        Timer::after_millis(2),
-                    )
-                    .await;
-                    if matches!(again, Either::Second(_)) {
-                        break;
-                    }
-                }
-                buf = [0u8; 64];
-            }
+            // Reset, suspend or deconfigure: the loop head sees the new epoch and drains.
+            Either3::First(()) => {}
             Either3::Second(Ok(64)) => {
                 if epoch() != e {
                     warn!("USB: packet read across a reset dropped");

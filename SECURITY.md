@@ -83,10 +83,11 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   by default).
 * Not protected: RAM while a session is open, side channels, fault injection; the RNG is the ROSC
   (not a certified TRNG).
-* **PIN retry counter, full sector:** the counter sector is erased by `finish_try`, i.e. right after a correct PIN, when every
-  earlier failure has just been forgiven, and only when fewer than `TRIES_MAX` (8) pages are left. A power cut during that erase
-  therefore cannot lose a pending failure, and `begin_try` can no longer meet a full sector with failures pending (its old
-  erase-and-rewrite path remains only as a fallback if that erase failed). A torn erase can only count against the user.
+* **PIN retry counter, full sector:** the counter sector is erased only while NO failure is pending: by `finish_try` right after
+  a correct PIN (when fewer than `TRIES_MAX` (8) pages are left), and by `begin_try` before the first failure of a run if fewer than 8
+  pages are left. With failures pending it is never erased: if the erase failed earlier and the sector is full, `begin_try` fails
+  closed (no PIN attempt until a CTAP reset). The old erase-and-rewrite path was removed: a power cut between the erase and the
+  rewrite zeroed the counter. A torn erase can only count against the user.
 * Reflash with a full flash erase: the layout moved (vault at the end, store 12 KiB lower).
 * An interrupted setPIN is repaired at the next boot (see "setPIN power cut" below). A damaged vault makes the device refuse to
   work until a reset.

@@ -380,26 +380,32 @@ pub fn count_tries<S: Sectors>(s: &mut S) -> Result<u8, SaveError> {
 }
 
 /// Persists a STARTED flag and returns its page. Fails (without writing) if the limit is reached.
+///
+/// The counter sector is erased ONLY while no failure is pending (the last flag is DONE, or the
+/// sector is blank): then every possible outcome of the erase, including a power cut or a torn
+/// erase, means "0 failures" or "more failures than before", never fewer than were pending. With
+/// failures pending the sector is never erased: if it is full, the call fails closed (no PIN
+/// attempt until a CTAP reset), because copying the pending marks into a freshly erased sector
+/// cannot be made atomic and a power cut in between would zero the counter.
 pub fn begin_try<S: Sectors>(s: &mut S) -> Result<usize, SaveError> {
-    let f = read_tries(s)?;
-    let (fails, free) = analyse(&f);
+    let mut f = read_tries(s)?;
+    let (mut fails, mut free) = analyse(&f);
     if fails as usize >= TRIES_MAX {
         return Err(SaveError::Io);
     }
-    let page = match free {
-        Some(p) => p,
-        None => {
-            // Sector full. `finish_try` recycles the sector while no failure is pending, so this
-            // is only reached if that erase failed (or the sector was filled by an older
-            // firmware). Re-write the pending failures after the erase; a power cut in this
-            // window can only forgive failures that were counted since the last success.
-            s.tries_clear().map_err(|_| SaveError::Io)?;
-            for p in 0..fails as usize {
-                s.tries_mark(p, T_START).map_err(|_| SaveError::Io)?;
-            }
-            fails as usize
+    // Make room for a worst-case run of failures BEFORE the first one is recorded. A failed
+    // erase is not fatal while pages are left; it is fatal once none is (see below).
+    if fails == 0 && free.map_or(0, |p| TRIES_PAGES - p) < TRIES_MAX {
+        let _ = s.tries_clear();
+        f = read_tries(s)?;
+        (fails, free) = analyse(&f);
+        if fails as usize >= TRIES_MAX {
+            return Err(SaveError::Io);
         }
-    };
+    }
+    // No free page: either the erase above failed, or failures are pending in a full sector.
+    // Fail closed in both cases, never erase here with failures pending.
+    let page = free.ok_or(SaveError::Io)?;
     s.tries_mark(page, T_START).map_err(|_| SaveError::Io)?;
     let g = read_tries(s)?;
     if g[page] != T_START || analyse(&g).0 != fails + 1 {
@@ -414,7 +420,8 @@ pub fn begin_try<S: Sectors>(s: &mut S) -> Result<usize, SaveError> {
 /// erasing the sector loses no count whatever happens to the power: a cut leaves either the old
 /// marks (ending in this DONE flag) or a blank sector, both meaning "0 failures". Doing it only
 /// when the sector would be too full for a worst-case run of failed attempts (`TRIES_MAX` pages)
-/// guarantees that `begin_try` never has to erase with failures pending (see there).
+/// together with the room check in `begin_try` (which erases only with no failure pending)
+/// guarantees that the sector is never erased with failures pending.
 pub fn finish_try<S: Sectors>(s: &mut S, page: usize) -> Result<(), SaveError> {
     s.tries_mark(page, T_DONE).map_err(|_| SaveError::Io)?;
     let f = read_tries(s)?;
