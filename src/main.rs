@@ -25,6 +25,7 @@ use {defmt_rtt as _, panic_probe as _};
 mod env;
 mod guard;
 mod health;
+mod idle;
 mod keys;
 mod puf;
 mod ram_guard;
@@ -34,7 +35,6 @@ mod scrub;
 #[cfg(feature = "stack_probe")]
 mod stack_probe;
 mod status;
-mod wdog;
 mod store;
 mod usb;
 mod vault;
@@ -125,15 +125,13 @@ pub fn heap_used() -> usize {
 #[entry]
 fn main() -> ! {
     unsafe { HEAP.init(core::ptr::addr_of_mut!(HEAP_MEM) as usize, HEAP_SIZE) }
-    // A warm reset (watchdog, panic) keeps RAM: overwrite what the previous run left on the stack.
+    // A warm reset (panic) keeps RAM: overwrite what the previous run left on the stack.
     scrub::stack_boot();
     #[cfg(feature = "stack_probe")]
     stack_probe::paint();
     info!("Starting (OpenSK)");
 
     let p = embassy_rp::init(Default::default());
-    #[cfg(feature = "watchdog")]
-    wdog::start(embassy_rp::watchdog::Watchdog::new(p.WATCHDOG));
     #[cfg(feature = "oled")]
     oled::init(p.I2C0, p.PIN_17, p.PIN_16);
     let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
@@ -195,7 +193,6 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
     let mut last_store_ms = 0u32;
     LED_SIGNAL.signal(LedState::Active);
     loop {
-        wdog::feed();
         // Key-value store figures for the display (reads the store: every 15 s at most).
         #[cfg(feature = "oled")]
         {

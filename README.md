@@ -23,7 +23,7 @@ meanwhile. OpenSK features enabled: `ctap1` (U2F), `config_command`, `software_c
 What the device really reports is whatever `authenticatorGetInfo` returns (`fido2-token -I`).
 
 ## OpenSK version
-The commit is pinned in **`third_party/OPENSK_REV`** (`79e85b9a72a1ad99745e0d07aec9708d2f7ad6a9`). Always build
+The commit is pinned in **`third_party/OPENSK_REV`** (`7b369f097dfa55b84ff9f37d2b176c6ec13c308d`, upstream `develop` of 2026-11-18, "Support uvCountSinceLastPinEntry in GetInfo (#842)"). Always build
 the pinned commit: an unpinned OpenSK (for example a branch name) can change between builds. When you update the
 pin, rebuild, retest on hardware and update the file.
 
@@ -74,11 +74,6 @@ the right `--features` (`-s` flash size in MiB, `-u` adds the USB serial number)
 `out/pico-fido-rs-<N>m.uf2`. Hold BOOTSEL while plugging in and copy the file to the `RPI-RP2` drive. It builds the
 *committed* revision of the repository. **The default `-b` is `openSK-based-se5`** (this branch); pass `-b` to build another branch. With a committed `Cargo.lock` the script builds with `--locked` only and fails instead of resolving newer crates; without one it warns and builds unlocked. This script itself was only syntax-checked; the maintainer's Colab build
 (same toolchain and features) is what was run on hardware.
-
-## Watchdog (optional)
-Build with `--features watchdog` to enable the RP2040 watchdog (8 s). Only the main thread feeds it (`src/wdog.rs`), so a hang or a
-stack-overflow fault ends in a reset. It is off by default: a single blocking step longer than 8 s without feeding (a signature, a
-store compaction) would reset the device in the middle of a command, so time the longest step on your hardware first. Not built or tested.
 
 ## Stack protection and measurement
 The firmware is linked with [`flip-link`](https://github.com/knurling-rs/flip-link) (`.cargo/config.toml`; `cargo install flip-link --locked`,
@@ -156,7 +151,7 @@ signs or waits for the button):
 * **Scrubbing:** after every command, on a cancel, and (32 KiB) at boot, `src/scrub.rs` overwrites the dead stack
   frames below the caller with volatile stores, to remove copies left by moves and by the hash/HMAC code. Registers
   are not touched.
-* **Idle:** the main thread sleeps in `wfi` between polls (`wdog::poll_wait`) instead of spinning; the guard task's
+* **Idle:** the main thread sleeps in `wfi` between polls (`idle::poll_wait`) instead of spinning; the guard task's
   timer and the USB interrupts wake it. Time asleep is the idle share of the CPU load on the display.
 
 More frequent refreshing does not by itself make the secret safer; see `SECURITY.md` for what the guard does and
@@ -169,8 +164,7 @@ Build with `--features guard_log,stack_probe` (defmt over RTT/probe) and run, ea
    below the USB frame time, and that no operation fails or times out;
 2. USB reset / suspend / replug cycles during traffic (see "USB cancellation");
 3. a long idle period with the seed held (the period must settle at 2000 us, the CPU load near 0 %);
-4. with `--features watchdog`: the longest PIN derivation, signature and store compaction against the 8 s limit;
-5. current draw of the board idle (guard at 2 ms, `wfi` sleep) and under load, compared with the old build.
+4. current draw of the board idle (guard at 2 ms, `wfi` sleep) and under load, compared with the old build.
 Record the numbers in `REVIEW.md`; none of this has been measured yet.
 
 ## Status display (SSD1306 OLED)
@@ -219,8 +213,8 @@ discarded.
 
 ## OpenSK patch
 `third_party/opensk-harden.patch` (applied by `build.sh`, or manually with `patch -p1 -d third_party/OpenSK <
-third_party/opensk-harden.patch`) adds `Persist::unlock_with_pin` (default: legacy behaviour), calls it in
-`verify_pin_hash_enc`, and adds `Ctap::cancel_in_flight()` (drops the pending U2F touch, PIN tokens, HID state and
+third_party/opensk-harden.patch`) adds `Persist::unlock_with_pin` (default: legacy behaviour), calls it first in the default
+`KeyStore::verify_pin_hash` (`api/key_store.rs`; since OpenSK #836/#838 every PIN check goes through the key store), and adds `Ctap::cancel_in_flight()` (drops the pending U2F touch, PIN tokens, HID state and
 stateful commands, but keeps the power-up Reset window). `build.sh` replaces an older version of the patch.
 Re-check it whenever `OPENSK_REV` changes.
 

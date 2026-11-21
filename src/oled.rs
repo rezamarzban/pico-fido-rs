@@ -3,7 +3,7 @@
 //!
 //! * Feature `oled` (on by default; `build.sh` adds it too, `-O` leaves it out). No display connected: the init write is not acknowledged,
 //!   the display stays off and is probed again every 5 s. Nothing else depends on it.
-//! * Everything runs on the MAIN thread from `wdog::poll_wait` (the idle / user-presence waits):
+//! * Everything runs on the MAIN thread from `idle::poll_wait` (the idle / user-presence waits):
 //!   no extra task, and the interrupt executor (USB, RAM-guard refresh) is never blocked by I2C.
 //!   A frame is rendered every `FRAME_MS`, then pushed one 128-byte page per call (~12 ms each at
 //!   100 kHz, ~3 ms at 400 kHz), so one call delays the main thread by at most one page.
@@ -339,7 +339,7 @@ impl Oled {
     }
 }
 
-/// Main-thread-only cell: `init` runs once in `main`, `poll` only from `wdog::poll_wait` (which
+/// Main-thread-only cell: `init` runs once in `main`, `poll` only from `idle::poll_wait` (which
 /// only the main thread calls), never from an interrupt or another task.
 struct MainOnly(UnsafeCell<Option<Oled>>);
 // SAFETY: see above, there is a single accessor thread.

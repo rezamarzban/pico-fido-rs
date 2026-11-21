@@ -12,7 +12,7 @@
 //!   derived from the master. Everything else (RP IDs of non-resident credentials are never
 //!   stored; counters, large blobs, settings) stays in clear.
 //! * PIN verification: the AES-GCM tag is the verifier. The stored PIN "hash" is all zeros. The
-//!   patched `verify_pin_hash_enc` (third_party/opensk-harden.patch) calls `unlock_with_pin`.
+//!   patched default `KeyStore::verify_pin_hash` (third_party/opensk-harden.patch) calls `unlock_with_pin`.
 //! * The PIN retry counter is the vault's power-cut-safe counter, not OpenSK's.
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -457,8 +457,13 @@ impl Persist for HardenPersist {
 
     // ---- PIN ---------------------------------------------------------------------------------
 
-    /// Called by the patched `verify_pin_hash_enc`. AES-GCM tag = verifier (compared in constant
+    /// Called by the patched `KeyStore::verify_pin_hash`. AES-GCM tag = verifier (compared in constant
     /// time in `wrap::unwrap`).
+    ///
+    /// OpenSK also calls `verify_pin_hash` with the NEW PIN hash while a forced PIN change is
+    /// pending, to refuse reusing the old PIN. That lands here too: the new hash only unwraps the
+    /// vault if it equals the current PIN (`Some(true)`, reported as a policy violation); it never
+    /// touches the retry counter (that is `incr_pin_fails`, called only by the PIN-entry path).
     fn unlock_with_pin(&mut self, pin_hash: &[u8; 16]) -> CtapResult<Option<bool>> {
         let st = self.st.get_mut();
         let rec = match st.rec.clone() {

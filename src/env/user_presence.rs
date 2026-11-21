@@ -84,7 +84,7 @@ impl UserPresence for PicoUserPresence {
             if Instant::now() >= deadline {
                 return Ok((Err(UserPresenceError::Timeout), RecvStatus::Timeout));
             }
-            crate::wdog::poll_wait(POLL);
+            crate::idle::poll_wait(POLL);
         }
     }
 

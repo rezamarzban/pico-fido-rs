@@ -132,14 +132,11 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   without a PIN-wrapped vault (cut before the commit: the metadata is removed, the seed is intact, set the PIN again) and, for
   vaults written by older firmware, a PIN-wrapped vault without metadata (restored with the minimum PIN length). No CTAP reset is
   needed any more. A failed commit that leaves the old plain record removes the metadata again.
-* **Watchdog (feature `watchdog`, off by default):** fed only by the main thread (polling waits and the main loop), so a hang or a
-  stack-overflow HardFault ends in a reset after 8 s. Off because a single blocking step longer than that (a signature, a
-  store compaction) would reset the device mid-command: measure the longest step on hardware first.
 * **set_pin with an unwipable older record:** the new record and the PIN metadata are both written, then an error is returned; the
   device then needs the older record wiped (next boot retries; with the PUF required the vault stays locked until then).
 * **Stack overflow:** the firmware is linked with `flip-link`, so the stack is the lowest RAM region and an overflow runs off the
-  bottom of RAM into a HardFault instead of corrupting the heap or the RAM-guard state. The fault stops the device (no reset unless built
-  with the `watchdog` feature): unplug it. An overflow first passes through the 512 reserved PUF bytes, so a power cycle is needed before the PUF key
+  bottom of RAM into a HardFault instead of corrupting the heap or the RAM-guard state. The fault stops the device (there is no watchdog
+  reset): unplug it. An overflow first passes through the 512 reserved PUF bytes, so a power cycle is needed before the PUF key
   works again. Peak stack use is measured with `--features stack_probe` (development builds; see README).
 * **Key-value store:** only a store reported as invalid (foreign, older layout or corrupt: indistinguishable) is formatted; flash I/O
   and other errors stop the boot without erasing credentials or a pending reset marker.

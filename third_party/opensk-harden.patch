@@ -1,5 +1,21 @@
+diff --git a/libraries/opensk/src/api/key_store.rs b/libraries/opensk/src/api/key_store.rs
+index f36d3f9..3e8e2c3 100644
+--- a/libraries/opensk/src/api/key_store.rs
++++ b/libraries/opensk/src/api/key_store.rs
+@@ -216,6 +216,11 @@ impl<T: Helper> KeyStore for T {
+     }
+ 
+     fn verify_pin_hash(&mut self, candidate: &[u8; 16]) -> CtapResult<bool> {
++        // Hardened-vault hook: a persist backend that verifies PINs itself (and unlocks its master
++        // key on success) answers here. `None` means: compare with the stored PIN hash.
++        if let Some(ok) = self.persist().unlock_with_pin(candidate)? {
++            return Ok(ok);
++        }
+         let stored = self
+             .persist()
+             .pin_hash()?
 diff --git a/libraries/opensk/src/api/persist.rs b/libraries/opensk/src/api/persist.rs
-index ed4d41d..d78ed37 100644
+index 68aab23..5e04a3c 100644
 --- a/libraries/opensk/src/api/persist.rs
 +++ b/libraries/opensk/src/api/persist.rs
 @@ -81,6 +81,15 @@ pub trait Persist {
@@ -18,35 +34,11 @@ index ed4d41d..d78ed37 100644
      /// Returns the byte array representation of a stored credential.
      fn credential_bytes(&self, key: usize) -> CtapResult<Vec<u8>> {
          if !keys::CREDENTIALS.contains(&key) {
-diff --git a/libraries/opensk/src/ctap/client_pin.rs b/libraries/opensk/src/ctap/client_pin.rs
-index fa929ed..1ef0920 100644
---- a/libraries/opensk/src/ctap/client_pin.rs
-+++ b/libraries/opensk/src/ctap/client_pin.rs
-@@ -198,7 +198,18 @@ impl<E: Env> ClientPin<E> {
-                     .decrypt(&pin_hash_enc)
-                     .map_err(|_| Ctap2StatusCode::CTAP2_ERR_PIN_INVALID)?;
- 
--                if !bool::from(pin_hash.ct_eq(&pin_hash_dec)) {
-+                let pin_ok = if pin_hash_dec.len() == PIN_AUTH_LENGTH {
-+                    match env
-+                        .persist()
-+                        .unlock_with_pin(array_ref![pin_hash_dec, 0, PIN_AUTH_LENGTH])?
-+                    {
-+                        Some(ok) => ok,
-+                        None => bool::from(pin_hash.ct_eq(&pin_hash_dec)),
-+                    }
-+                } else {
-+                    false
-+                };
-+                if !pin_ok {
-                     self.get_mut_pin_protocol(pin_uv_auth_protocol)
-                         .regenerate(env);
-                     if storage::pin_retries(env)? == 0 {
 diff --git a/libraries/opensk/src/ctap/mod.rs b/libraries/opensk/src/ctap/mod.rs
-index 6eeb16d..e2303e2 100644
+index 9a3b026..eeb3ac8 100644
 --- a/libraries/opensk/src/ctap/mod.rs
 +++ b/libraries/opensk/src/ctap/mod.rs
-@@ -449,6 +449,14 @@ impl<E: Env> StatefulPermission<E> {
+@@ -450,6 +450,14 @@ impl<E: Env> StatefulPermission<E> {
          self.channel = None;
      }
  
@@ -61,7 +53,7 @@ index 6eeb16d..e2303e2 100644
      /// Clears all state if communication is coming from a different channel.
      pub fn clear_old_channels(&mut self, channel: Channel) {
          // There are different possible choices for incoming traffic on a different channel:
-@@ -599,6 +607,17 @@ impl<E: Env> CtapState<E> {
+@@ -600,6 +608,17 @@ impl<E: Env> CtapState<E> {
          }
      }
  
@@ -80,7 +72,7 @@ index 6eeb16d..e2303e2 100644
          if env.customization().use_signature_counter() {
              let increment = env.rng().next_u32() % 8 + 1;
 diff --git a/libraries/opensk/src/lib.rs b/libraries/opensk/src/lib.rs
-index a0dd7c9..7c05fe4 100644
+index c56a4b8..adff98a 100644
 --- a/libraries/opensk/src/lib.rs
 +++ b/libraries/opensk/src/lib.rs
 @@ -112,6 +112,12 @@ impl<E: Env> Ctap<E> {

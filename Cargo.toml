@@ -17,8 +17,6 @@ usb_serial = []
 sram_puf = []
 # Development only: paint the stack and log its peak use (src/stack_probe.rs). Needs flip-link.
 stack_probe = []
-# Hardware watchdog fed by the main thread only (src/wdog.rs). Off until the longest blocking step is measured.
-watchdog = []
 # Status display: SSD1306 128x64 on I2C0 (SDA GP16, SCL GP17, 0x3C), src/oled.rs. Harmless without a display.
 oled = []
 # Development: log the RAM-guard refresh statistics (rate, longest critical section, tick lateness) every 5 s.
@@ -63,7 +61,7 @@ futures = { version = "0.3.17", default-features = false, features = [
 embedded-storage = { version = "0.3" }
 static_cell = "2"
 rand = { version = "0.8.5", default-features = false }
-rand_core = { version = "0.6", default-features = false }
+rand_core = { version = "0.6", default-features = false } # only for rand_chacha (src/ram_guard.rs); OpenSK uses rand_core 0.10 (src/env/rng.rs goes through its re-export)
 rand_chacha = { version = "0.3", default-features = false } # ChaCha20 DRBG for the share-refresh masks (src/ram_guard.rs)
 subtle = { version = "2", default-features = false }                   # constant-time tag / PIN comparisons
 sha2 = { version = "0.10", default-features = false }

@@ -1,7 +1,15 @@
 //! RNG adapter for OpenSK: reuses the existing ROSC + SHA-256 conditioning.
+//!
+//! OpenSK's `Rng` trait is built on rand_core 0.10, where an infallible generator implements
+//! `TryRng<Error = Infallible>` (and the `TryCryptoRng` marker); `Rng` / `CryptoRng` follow from
+//! that. The crate is used through OpenSK's re-export so there is a single rand_core 0.10 in the
+//! build (the firmware's own `rand_core` 0.6 dependency only serves `rand_chacha` in
+//! `src/ram_guard.rs`).
 
+use core::convert::Infallible;
+
+use opensk::api::rng::rand_core::{utils, TryCryptoRng, TryRng};
 use opensk::api::rng::Rng;
-use rand_core::{CryptoRng, RngCore};
 
 /// Thin wrapper that satisfies OpenSK's `Rng` trait.
 pub struct PicoRng;
@@ -12,30 +20,24 @@ impl PicoRng {
     }
 }
 
-impl RngCore for PicoRng {
-    fn next_u32(&mut self) -> u32 {
-        let mut b = [0u8; 4];
-        self.fill_bytes(&mut b);
-        u32::from_le_bytes(b)
+impl TryRng for PicoRng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        utils::next_word_via_fill(self)
     }
 
-    fn next_u64(&mut self) -> u64 {
-        let mut b = [0u8; 8];
-        self.fill_bytes(&mut b);
-        u64::from_le_bytes(b)
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        utils::next_word_via_fill(self)
     }
 
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
         // Reuse the existing conditioned ROSC RNG from keys.rs.
         crate::keys::fill_random(dest);
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.fill_bytes(dest);
         Ok(())
     }
 }
 
-impl CryptoRng for PicoRng {}
+impl TryCryptoRng for PicoRng {}
 
 impl Rng for PicoRng {}

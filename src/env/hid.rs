@@ -98,7 +98,7 @@ pub fn recv_packet(buf: &mut HidPacket, timeout_ms: Option<usize>) -> bool {
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return false;
         }
-        crate::wdog::poll_wait(POLL);
+        crate::idle::poll_wait(POLL);
     }
 }
 
@@ -122,7 +122,7 @@ pub fn wait_packet(buf: &mut HidPacket, timeout_ms: Option<usize>, seen: u32) ->
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return false;
         }
-        crate::wdog::poll_wait(POLL);
+        crate::idle::poll_wait(POLL);
     }
 }
 
@@ -150,7 +150,7 @@ impl HidConnection for PicoHidConnection {
             if Instant::now() >= deadline {
                 return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_HARDWARE_FAILURE);
             }
-            crate::wdog::poll_wait(POLL);
+            crate::idle::poll_wait(POLL);
         }
     }
 

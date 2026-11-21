@@ -26,7 +26,7 @@ pub fn stack() {
     wipe::<1024>();
 }
 
-/// Scrubs 32 KiB below the caller. At boot, because a warm reset (watchdog, panic) keeps RAM.
+/// Scrubs 32 KiB below the caller. At boot, because a warm reset (panic) keeps RAM.
 pub fn stack_boot() {
     wipe::<8192>();
 }
