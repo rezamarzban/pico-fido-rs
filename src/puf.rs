@@ -19,9 +19,9 @@
 use core::cell::RefCell;
 use defmt::{info, warn};
 use hmac::{Hmac, Mac};
+use portable_atomic::{AtomicBool, Ordering};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use portable_atomic::{AtomicBool, Ordering};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::keys::{fill_random, Fl};
@@ -117,7 +117,11 @@ enum Parsed {
 /// `None` = the sector could not be read (never assumed blank).
 fn read_slot(flash: &RefCell<Fl>, i: usize) -> Option<Parsed> {
     let mut img = [0u8; IMG_LEN];
-    if flash.borrow_mut().blocking_read(slot_offset(i), &mut img).is_err() {
+    if flash
+        .borrow_mut()
+        .blocking_read(slot_offset(i), &mut img)
+        .is_err()
+    {
         return None;
     }
     if img.iter().all(|&b| b == 0xFF) {
@@ -126,9 +130,13 @@ fn read_slot(flash: &RefCell<Fl>, i: usize) -> Option<Parsed> {
     if img[..4] == MAGIC
         && Sha256::digest(&img[..IMG_LEN - HASH_LEN])[..HASH_LEN] == img[IMG_LEN - HASH_LEN..]
     {
-        let mut s = Slot { check: [0; CHECK_LEN], helper: [0; CODE_BYTES] };
+        let mut s = Slot {
+            check: [0; CHECK_LEN],
+            helper: [0; CODE_BYTES],
+        };
         s.check.copy_from_slice(&img[4..4 + CHECK_LEN]);
-        s.helper.copy_from_slice(&img[4 + CHECK_LEN..4 + CHECK_LEN + CODE_BYTES]);
+        s.helper
+            .copy_from_slice(&img[4 + CHECK_LEN..4 + CHECK_LEN + CODE_BYTES]);
         return Some(Parsed::Valid(s));
     }
     Some(Parsed::Damaged)
@@ -299,7 +307,11 @@ impl Puf {
             return;
         }
         let off = slot_offset(other);
-        let ok = self.flash.borrow_mut().blocking_erase(off, off + SECTOR as u32).is_ok();
+        let ok = self
+            .flash
+            .borrow_mut()
+            .blocking_erase(off, off + SECTOR as u32)
+            .is_ok();
         if ok {
             self.slots[other] = None;
             info!("puf: previous helper slot {} erased", other);
@@ -369,7 +381,10 @@ impl Puf {
         let ones: u32 = r.iter().map(|b| b.count_ones()).sum();
         // A real power-up pattern is roughly balanced; stuck / cleared RAM is not.
         if !(CODE_BITS as u32 * 25 / 100..=CODE_BITS as u32 * 75 / 100).contains(&ones) {
-            warn!("puf: RAM sample is not usable ({} ones of {})", ones, CODE_BITS);
+            warn!(
+                "puf: RAM sample is not usable ({} ones of {})",
+                ones, CODE_BITS
+            );
             r.zeroize();
             return false;
         }
@@ -380,7 +395,10 @@ impl Puf {
         img[..4].copy_from_slice(&MAGIC);
         let chk = mac(&s, b"sram-puf-check-v1");
         img[4..4 + CHECK_LEN].copy_from_slice(&chk[..CHECK_LEN]);
-        for (i, o) in img[4 + CHECK_LEN..4 + CHECK_LEN + CODE_BYTES].iter_mut().enumerate() {
+        for (i, o) in img[4 + CHECK_LEN..4 + CHECK_LEN + CODE_BYTES]
+            .iter_mut()
+            .enumerate()
+        {
             *o = r[i] ^ c[i];
         }
         let h = Sha256::digest(&img[..IMG_LEN - HASH_LEN]);
@@ -390,7 +408,11 @@ impl Puf {
 
         // Write the slot that is NOT in use: the old helper (and the vault record bound to it)
         // stays intact until `commit`, so a power cut anywhere in here loses nothing.
-        let target = if self.slots[self.active].is_some() { 1 - self.active } else { 0 };
+        let target = if self.slots[self.active].is_some() {
+            1 - self.active
+        } else {
+            0
+        };
         let off = slot_offset(target);
         let ok = {
             let mut f = self.flash.borrow_mut();
@@ -405,9 +427,13 @@ impl Puf {
             self.slots[target] = None;
             return false;
         }
-        let mut slot = Slot { check: [0; CHECK_LEN], helper: [0; CODE_BYTES] };
+        let mut slot = Slot {
+            check: [0; CHECK_LEN],
+            helper: [0; CODE_BYTES],
+        };
         slot.check.copy_from_slice(&img[4..4 + CHECK_LEN]);
-        slot.helper.copy_from_slice(&img[4 + CHECK_LEN..4 + CHECK_LEN + CODE_BYTES]);
+        slot.helper
+            .copy_from_slice(&img[4 + CHECK_LEN..4 + CHECK_LEN + CODE_BYTES]);
         self.slots[target] = Some(slot);
         self.active = target;
         self.status = self.decode_status();
@@ -417,7 +443,10 @@ impl Puf {
             true
         } else {
             // The helper data was written, but this very sample does not decode: no usable key.
-            warn!("puf: helper written but the key cannot be reconstructed, status {}", self.status);
+            warn!(
+                "puf: helper written but the key cannot be reconstructed, status {}",
+                self.status
+            );
             false
         }
     }

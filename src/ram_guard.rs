@@ -223,7 +223,10 @@ mod tests {
         assert!(snap.iter().all(|s| *s != secret));
         m.refresh(&mut pool, &mut r);
         for (k, &i) in m.idx.iter().enumerate() {
-            assert_ne!(snap[k], pool.slots[i as usize], "share {k} unchanged by refresh");
+            assert_ne!(
+                snap[k], pool.slots[i as usize],
+                "share {k} unchanged by refresh"
+            );
         }
         assert_eq!(*m.reveal(&pool), secret);
     }

@@ -19,7 +19,11 @@ unsafe extern "C" {
 }
 
 /// Bottom of the stack region: start of the linker's RAM region (see build.rs).
-const BOTTOM: usize = if cfg!(feature = "sram_puf") { 0x2000_0200 } else { 0x2000_0000 };
+const BOTTOM: usize = if cfg!(feature = "sram_puf") {
+    0x2000_0200
+} else {
+    0x2000_0000
+};
 const PAINT: u32 = 0xC5C5_C5C5;
 /// Words left unpainted below the stack pointer: the frames of `paint` itself and its callers.
 const MARGIN: usize = 512;
@@ -40,7 +44,11 @@ pub fn paint() {
         unsafe { write_volatile(a as *mut u32, PAINT) };
         a += 4;
     }
-    info!("stack: {} of {} bytes painted", end - BOTTOM, top() - BOTTOM);
+    info!(
+        "stack: {} of {} bytes painted",
+        end - BOTTOM,
+        top() - BOTTOM
+    );
 }
 
 /// Peak stack use in bytes seen so far (updated by `report`).

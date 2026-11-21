@@ -82,7 +82,11 @@ const FONT: [[u8; 5]; 64] = [
 
 fn glyph(c: u8) -> &'static [u8; 5] {
     let c = c.to_ascii_uppercase();
-    let i = if (32..=95).contains(&c) { c - 32 } else { b'?' - 32 };
+    let i = if (32..=95).contains(&c) {
+        c - 32
+    } else {
+        b'?' - 32
+    };
     &FONT[i as usize]
 }
 
@@ -242,7 +246,14 @@ impl Oled {
         let up = Instant::now().as_secs();
         let cpu = self.cpu;
         line(&mut self.buf, 2, &|s| {
-            let _ = write!(s, "CPU {}% UP {}:{:02}:{:02}", cpu, up / 3600, up / 60 % 60, up % 60);
+            let _ = write!(
+                s,
+                "CPU {}% UP {}:{:02}:{:02}",
+                cpu,
+                up / 3600,
+                up / 60 % 60,
+                up % 60
+            );
         });
 
         // ---- 3: RAM
@@ -251,7 +262,8 @@ impl Oled {
             let sdata = &raw const __sdata as usize;
             (
                 (&raw const __ebss as usize).saturating_sub(sdata),
-                (&raw const __sidata as usize) + (&raw const __edata as usize).saturating_sub(sdata),
+                (&raw const __sidata as usize)
+                    + (&raw const __edata as usize).saturating_sub(sdata),
                 &raw const _stack_start as usize,
             )
         };
@@ -326,7 +338,11 @@ impl Oled {
                     self.retry_ms = now;
                     return;
                 }
-                self.next_page = if (p as usize) + 1 < PAGES { Some(p + 1) } else { None };
+                self.next_page = if (p as usize) + 1 < PAGES {
+                    Some(p + 1)
+                } else {
+                    None
+                };
             }
             None => {
                 if now.wrapping_sub(self.last_frame_ms) >= FRAME_MS {

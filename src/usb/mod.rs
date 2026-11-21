@@ -112,7 +112,11 @@ impl Handler for UsbHandler {
     fn configured(&mut self, configured: bool) {
         self.configured.store(configured, Ordering::Relaxed);
         crate::status::USB.store(
-            if configured { crate::status::USB_CONFIGURED } else { crate::status::USB_NONE },
+            if configured {
+                crate::status::USB_CONFIGURED
+            } else {
+                crate::status::USB_NONE
+            },
             portable_atomic::Ordering::Relaxed,
         );
         if configured {

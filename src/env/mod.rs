@@ -14,8 +14,8 @@ mod rng;
 mod user_presence;
 
 use clock::PicoClock;
-use hid::PicoHidConnection;
 pub use harden::HardenPersist;
+use hid::PicoHidConnection;
 pub use persist::PicoPersist;
 use rng::PicoRng;
 pub use user_presence::PicoUserPresence;

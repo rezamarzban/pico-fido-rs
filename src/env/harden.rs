@@ -17,19 +17,19 @@
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use defmt::{error, warn};
-use portable_atomic::{AtomicBool, Ordering};
 use hmac::{Hmac, Mac};
 use opensk::api::persist::{keys, Persist, PersistIter};
 use opensk::ctap::secret::Secret;
 use opensk::ctap::status_code::{Ctap2StatusCode, CtapResult};
+use portable_atomic::{AtomicBool, Ordering};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::PicoPersist;
 use crate::guard;
-use crate::puf::{self, Puf, Status as PufStatus};
 use crate::keys::fill_random;
+use crate::puf::{self, Puf, Status as PufStatus};
 use crate::store::{Record, Replaced, Vault, TRIES_MAX};
 use crate::vault::FlashVault;
 use crate::wrap;
@@ -109,7 +109,9 @@ fn seal(master: &[u8; 128], key: usize, plain: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&nonce);
     out.extend_from_slice(plain);
     xor_stream(&k_enc, &nonce, &mut out[NONCE..]);
-    let t = tag(&k_mac, key, &nonce, &out[NONCE..]).finalize().into_bytes();
+    let t = tag(&k_mac, key, &nonce, &out[NONCE..])
+        .finalize()
+        .into_bytes();
     out.extend_from_slice(&t);
     out
 }
@@ -243,10 +245,17 @@ impl HardenPersist {
         // locked (LED fault pattern) until a boot with a working key, a CTAP reset on a power-on
         // reset, or a build without `sram_puf`.
         if puf.required() && key.is_none() {
-            error!("puf: REQUIRED but no key (status {}) - device locked, no record created or used", puf.status());
+            error!(
+                "puf: REQUIRED but no key (status {}) - device locked, no record created or used",
+                puf.status()
+            );
             puf::set_fault(true);
             WRAPPED.store(false, Ordering::Relaxed);
-            return HardenPersist { raw, st: RefCell::new(st), puf };
+            return HardenPersist {
+                raw,
+                st: RefCell::new(st),
+                puf,
+            };
         }
         puf::set_fault(false);
         // Blank vault, PUF required: create the first seed already bound to the PUF key.
@@ -266,7 +275,11 @@ impl HardenPersist {
                     }
                 }
             }
-            return HardenPersist { raw, st: RefCell::new(st), puf };
+            return HardenPersist {
+                raw,
+                st: RefCell::new(st),
+                puf,
+            };
         }
         if let Some(r) = rec {
             WRAPPED.store(r.wrapped, Ordering::Relaxed);
@@ -293,22 +306,31 @@ impl HardenPersist {
                                             // the binding does not protect anything yet.
                                             error!("puf: the unbound record could not be wiped - device locked");
                                             st.fail_closed();
-                                            return HardenPersist { raw, st: RefCell::new(st), puf };
+                                            return HardenPersist {
+                                                raw,
+                                                st: RefCell::new(st),
+                                                puf,
+                                            };
                                         }
                                         keep = up;
                                     }
                                     // Kept = the unbound record is still the current one. With the
                                     // PUF required it must not be used: fail closed.
                                     Replaced::Kept(_) | Replaced::NoKey | Replaced::Unknown => {
-                                        error!("puf: could not bind the seed record - device locked");
+                                        error!(
+                                            "puf: could not bind the seed record - device locked"
+                                        );
                                         puf::set_fault(true);
                                         st.fail_closed();
-                                        return HardenPersist { raw, st: RefCell::new(st), puf };
+                                        return HardenPersist {
+                                            raw,
+                                            st: RefCell::new(st),
+                                            puf,
+                                        };
                                     }
                                 }
                             }
-                        }
-                        else if wrap::legacy_plain_puf(&keep) {
+                        } else if wrap::legacy_plain_puf(&keep) {
                             // Seal an old PUF-masked record with its authentication tag.
                             if let Some(k) = key.as_ref() {
                                 let up = bind_slot(wrap::plain_puf(&seed, k), &puf);
@@ -317,7 +339,11 @@ impl HardenPersist {
                                         if !st.old_gone(s.old_wiped) {
                                             error!("puf: the untagged record could not be wiped - device locked");
                                             st.fail_closed();
-                                            return HardenPersist { raw, st: RefCell::new(st), puf };
+                                            return HardenPersist {
+                                                raw,
+                                                st: RefCell::new(st),
+                                                puf,
+                                            };
                                         }
                                         keep = up;
                                     }
@@ -327,7 +353,11 @@ impl HardenPersist {
                                     Replaced::Kept(_) | Replaced::NoKey | Replaced::Unknown => {
                                         error!("puf: could not seal the record with its tag - device locked");
                                         st.fail_closed();
-                                        return HardenPersist { raw, st: RefCell::new(st), puf };
+                                        return HardenPersist {
+                                            raw,
+                                            st: RefCell::new(st),
+                                            puf,
+                                        };
                                     }
                                 }
                             }
@@ -414,7 +444,7 @@ impl Persist for HardenPersist {
         match value {
             Some(blob) if keys::CREDENTIALS.contains(&key) => {
                 let mut m = Zeroizing::new([0u8; 128]);
-        self.master_into(&mut m)?;
+                self.master_into(&mut m)?;
                 Ok(Some(open(&m, key, &blob)?))
             }
             other => Ok(other),
@@ -424,7 +454,7 @@ impl Persist for HardenPersist {
     fn insert(&mut self, key: usize, value: &[u8]) -> CtapResult<()> {
         if keys::CREDENTIALS.contains(&key) {
             let mut m = Zeroizing::new([0u8; 128]);
-        self.master_into(&mut m)?;
+            self.master_into(&mut m)?;
             let blob = seal(&m, key, value);
             self.raw.insert(key, &blob)
         } else {

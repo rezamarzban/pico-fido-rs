@@ -27,10 +27,10 @@ mod guard;
 mod health;
 mod idle;
 mod keys;
-mod puf;
-mod ram_guard;
 #[cfg(feature = "oled")]
 mod oled;
+mod puf;
+mod ram_guard;
 mod scrub;
 #[cfg(feature = "stack_probe")]
 mod stack_probe;
@@ -43,10 +43,10 @@ mod wrap;
 use core::cell::RefCell;
 use embassy_rp::adc::{Adc, Channel as AdcChannel, Config as AdcConfig};
 use env::{HardenPersist, PicoEnv, PicoPersist, PicoUserPresence};
-use static_cell::StaticCell;
 use opensk::api::connection::{HidConnection as _, UsbEndpoint};
 use opensk::env::Env as _;
 use opensk::{Ctap, Transport};
+use static_cell::StaticCell;
 
 // Flash size is a deliberate board setting: enable exactly one `flash_*` Cargo feature.
 // build.rs derives the linker script (memory.x) from the same feature.
@@ -209,7 +209,11 @@ fn opensk_loop(ctap: &mut Ctap<PicoEnv>) -> ! {
         let wink = ctap.should_wink();
         if wink != winking {
             winking = wink;
-            LED_SIGNAL.signal(if wink { LedState::Processing } else { LedState::Active });
+            LED_SIGNAL.signal(if wink {
+                LedState::Processing
+            } else {
+                LedState::Active
+            });
         }
 
         // Block for a packet; wake up regularly while something needs polling.

@@ -73,7 +73,11 @@ pub fn wrap(
     let cipher = Aes256Gcm::new_from_slice(&key[..]).ok()?;
     let mut body = *seed;
     let t = cipher
-        .encrypt_in_place_detached(Nonce::from_slice(&salt[..12]), &aad(puf.is_some()), &mut body)
+        .encrypt_in_place_detached(
+            Nonce::from_slice(&salt[..12]),
+            &aad(puf.is_some()),
+            &mut body,
+        )
         .ok()?;
     let mut tag = [0u8; 32];
     tag[..16].copy_from_slice(&t);
@@ -148,7 +152,10 @@ pub fn plain_puf(seed: &[u8; 32], puf: &[u8; 32]) -> Record {
 }
 
 fn plain_tag(puf: &[u8; 32], body: &[u8; 32]) -> [u8; 32] {
-    hmac_of(puf, &[b"puf-plain-tag", body]).finalize().into_bytes().into()
+    hmac_of(puf, &[b"puf-plain-tag", body])
+        .finalize()
+        .into_bytes()
+        .into()
 }
 
 /// A PUF-masked no-PIN record written before the tag existed (all-zero tag). It is still
@@ -163,7 +170,8 @@ pub fn plain_seed(rec: &Record, puf: Option<&[u8; 32]>) -> Option<Zeroizing<[u8;
         return None;
     }
     if let Some(k) = puf {
-        if !legacy_plain_puf(rec) && !bool::from(plain_tag(k, &rec.body).as_slice().ct_eq(&rec.tag)) {
+        if !legacy_plain_puf(rec) && !bool::from(plain_tag(k, &rec.body).as_slice().ct_eq(&rec.tag))
+        {
             return None; // wrong PUF key or damaged record
         }
     }
