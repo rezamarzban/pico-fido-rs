@@ -9,9 +9,12 @@
 //!   Up to 15 of 31 votes per bit may be wrong; the measured raw bit-error count is logged on
 //!   every boot (`puf: ... bit errors`): use it to judge your chip (see SECURITY.md).
 //! * Key = HMAC-SHA-256(s, "sram-puf-key-v1"). It is derived on demand and never kept in RAM.
-//! * Enrolment only happens on a power-on reset (`CHIP_RESET.HAD_POR`), because after a warm
-//!   reset the RAM may hold something else than a fresh power-up pattern. Decoding is attempted
-//!   on every boot: after a warm reset the sample is usually still intact and the check decides.
+//! * Enrolment only happens after a reset that looks like a cold power-up (`cold_reset`):
+//!   `CHIP_RESET.HAD_POR` set, no RUN-pin / debugger (PSM restart) reset flag, and no watchdog
+//!   reset reason. `HAD_POR` is ALSO set by brown-out detection and the chip has no bit that tells
+//!   the two apart, so a brown-out can still pass: the balance check in `enroll` is only a
+//!   heuristic, and the behaviour must be measured on real silicon. Decoding is attempted on every
+//!   boot: after a warm reset the sample is usually still intact and the check decides.
 //!
 //! What it buys, honestly: a copy of the FLASH alone (dump, backup, desoldered chip read in a
 //! programmer) no longer contains enough to attack the PIN or recover the seed. It does NOT stop
@@ -56,9 +59,25 @@ const HASH_LEN: usize = 16;
 const IMG_LEN: usize = 4 + CHECK_LEN + CODE_BYTES + HASH_LEN;
 const _: () = core::assert!(IMG_LEN <= SECTOR);
 
-/// CHIP_RESET register (VREG_AND_CHIP_RESET + 0x08), bit 8 = HAD_POR.
+/// CHIP_RESET register (VREG_AND_CHIP_RESET + 0x08): bit 8 HAD_POR (power-on reset OR brown-out),
+/// bit 16 HAD_RUN (RUN pin), bit 20 HAD_PSM_RESTART (debugger).
 const CHIP_RESET: *const u32 = 0x4006_4008 as *const u32;
 const HAD_POR: u32 = 1 << 8;
+const HAD_RUN: u32 = 1 << 16;
+const HAD_PSM_RESTART: u32 = 1 << 20;
+/// WATCHDOG.REASON (0x4005_8000 + 0x08): bit 0 TIMER, bit 1 FORCE (a watchdog / software reset).
+const WATCHDOG_REASON: *const u32 = 0x4005_8008 as *const u32;
+
+/// True only if the last reset looks like a cold power-up: HAD_POR set, and neither the RUN pin,
+/// a debugger restart nor the watchdog is reported. Returns the raw registers for logging.
+/// Fail-closed: any doubt means "not cold" (unplug for 10 s and retry). It cannot exclude a
+/// brown-out (HAD_POR covers both), see the module docs.
+fn cold_reset() -> (bool, u32, u32) {
+    // SAFETY: fixed, always-readable chip registers.
+    let (chip, wd) = unsafe { (CHIP_RESET.read_volatile(), WATCHDOG_REASON.read_volatile()) };
+    let cold = chip & HAD_POR != 0 && chip & (HAD_RUN | HAD_PSM_RESTART) == 0 && wd & 0b11 == 0;
+    (cold, chip, wd)
+}
 
 /// Set whenever the PUF is required (`sram_puf`) but its key is not available, or a record that
 /// depends on it cannot be used. The LED blinker shows it (3 short blinks, pause) until the
@@ -208,8 +227,7 @@ impl Puf {
         let mut p = Puf {
             flash,
             status: Status::Disabled,
-            // SAFETY: fixed, always-readable chip register.
-            por: unsafe { CHIP_RESET.read_volatile() } & HAD_POR != 0,
+            por: cold_reset().0,
             slots: [None, None],
             active: 0,
         };
@@ -240,9 +258,10 @@ impl Puf {
         } else {
             Status::Damaged
         };
+        let (_, chip, wd) = cold_reset();
         info!(
-            "puf: status {}, helper slot {}, power-on reset {}",
-            p.status, p.active, p.por
+            "puf: status {}, helper slot {}, cold reset {} (CHIP_RESET {:#x}, WATCHDOG_REASON {:#x})",
+            p.status, p.active, p.por, chip, wd
         );
         p.publish();
         p
@@ -373,7 +392,7 @@ impl Puf {
             return false;
         }
         if !self.por {
-            warn!("puf: not a power-on reset, cannot enrol; unplug for 10 s and retry");
+            warn!("puf: not a cold power-up (power-on flag missing, or RUN / debugger / watchdog reset), cannot enrol; unplug for 10 s and retry");
             return false;
         }
         let mut r = [0u8; CODE_BYTES];

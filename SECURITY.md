@@ -110,7 +110,7 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   cells; the entropy of the 128-bit secret is assumed, not measured. The repetition code leaks structure in the
   helper data; if the cells are strongly biased the effective secret is smaller than 128 bits.
 * **Remanence / warm resets:** a quick unplug-replug can leave the old RAM content in place (not a fresh power-up
-  pattern). Enrolment is only done on a power-on reset and checks that the sample is roughly balanced; recovery is
+  pattern). Enrolment is only done after a reset that looks like a cold power-up (HAD_POR set; RUN-pin, debugger and watchdog resets refused; HAD_POR also covers brown-out, which the chip cannot tell apart, so this is not proof) and checks that the sample is roughly balanced; recovery is
   attempted every boot and verified by the check. If it fails, the PIN dialog errors out without counting a wrong PIN:
   unplug for about 10 s. After a UF2 reflash the bootloader may have overwritten the reserved RAM; same remedy.
 * **Fail closed:** with `sram_puf` the key is required. If it is unavailable the device locks and the LED blinks 3
