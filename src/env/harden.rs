@@ -278,7 +278,7 @@ impl HardenPersist {
                 puf::set_fault(true);
             } else if !r.wrapped {
                 // Without a PIN the seed is available right away (unmasked with the PUF key).
-                let kref = if r.puf { key.as_ref().map(|k| &**k) } else { None };
+                let kref = if r.puf { key.as_deref() } else { None };
                 match wrap::plain_seed(&r, kref) {
                     Some(seed) if guard::store_seed(&seed) => {
                         let mut keep = r;
@@ -349,7 +349,7 @@ impl HardenPersist {
             puf::set_sec_fault(true);
         }
         // Boot after an interrupted re-enrolment: the unreferenced helper is obsolete.
-        if st.rec.as_ref().map_or(false, |r| r.puf) {
+        if st.rec.as_ref().is_some_and(|r| r.puf) {
             puf.commit();
         }
         HardenPersist {
@@ -486,7 +486,7 @@ impl Persist for HardenPersist {
             error!("puf: key unavailable - unplug for 10 s and retry (not counted as a wrong PIN)");
             return Err(hw_fail());
         }
-        let kref = if rec.puf { key.as_ref().map(|k| &**k) } else { None };
+        let kref = if rec.puf { key.as_deref() } else { None };
         guard::refresh_now();
         let ok = match wrap::unwrap(&rec, pin_hash, kref) {
             Some(seed) => {
@@ -563,7 +563,7 @@ impl Persist for HardenPersist {
             if !guard::has_seed() {
                 return Err(Ctap2StatusCode::CTAP2_ERR_PUAT_REQUIRED);
             }
-            if key.is_none() && (self.puf.required() || st.rec.as_ref().map_or(false, |r| r.puf)) {
+            if key.is_none() && (self.puf.required() || st.rec.as_ref().is_some_and(|r| r.puf)) {
                 // Never wrap a seed without PUF binding while the PUF is required.
                 puf::set_fault(true);
                 error!("set_pin: PUF key unavailable - PIN not set");
@@ -582,7 +582,7 @@ impl Persist for HardenPersist {
                 let mut salt = [0u8; 16];
                 fill_random(&mut salt);
                 bind_slot(
-                    wrap::wrap(&seed, pin_hash, salt, key.as_ref().map(|k| &**k)).ok_or_else(hw_fail)?,
+                    wrap::wrap(&seed, pin_hash, salt, key.as_deref()).ok_or_else(hw_fail)?,
                     &self.puf,
                 )
             };

@@ -106,6 +106,8 @@ struct Slot {
     helper: [u8; CODE_BYTES],
 }
 
+// Short-lived stack value (one flash sector read at a time): boxing would only add heap use.
+#[allow(clippy::large_enum_variant)]
 enum Parsed {
     Blank,
     Valid(Slot),

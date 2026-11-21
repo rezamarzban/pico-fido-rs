@@ -17,9 +17,10 @@ if [ -f ../OPENSK_REV ]; then
   have=$(git rev-parse HEAD 2>/dev/null || true)
   [ -z "$have" ] || [ "$have" = "$want" ] || echo "warning: OpenSK is at $have, third_party/OPENSK_REV pins $want" >&2
 fi
+# the repo-level .cargo/config.toml defaults to the Pico target: force the host target everywhere
+HOST_TARGET=$(rustc -vV | sed -n 's/^host: //p')
 ( cd libraries/opensk
-  cargo test --no-default-features --features=std
-  cargo test --features=std,config_command,ctap1 )
-cargo test --manifest-path=libraries/cbor/Cargo.toml
-# the repo-level .cargo/config.toml defaults to the Pico target: force the host target here
-( cd "$HERE/guard" && cargo test --target "$(rustc -vV | sed -n 's/^host: //p')" )
+  cargo test --target "$HOST_TARGET" --no-default-features --features=std
+  cargo test --target "$HOST_TARGET" --features=std,config_command,ctap1 )
+cargo test --target "$HOST_TARGET" --manifest-path=libraries/cbor/Cargo.toml
+( cd "$HERE/guard" && cargo test --target "$HOST_TARGET" )

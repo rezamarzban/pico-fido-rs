@@ -246,8 +246,8 @@ impl Oled {
         });
 
         // ---- 3: RAM
-        // SAFETY: only the addresses of linker symbols are taken.
-        let (statics, flash_end, top) = unsafe {
+        // Only the addresses of linker symbols are taken (`&raw const`, no read).
+        let (statics, flash_end, top) = {
             let sdata = &raw const __sdata as usize;
             (
                 (&raw const __ebss as usize).saturating_sub(sdata),
@@ -299,7 +299,7 @@ impl Oled {
             st::LIFE_USED.load(Ordering::Relaxed) as u64,
             st::LIFE_TOTAL.load(Ordering::Relaxed) as u64,
         );
-        let wear = if lt > 0 { Some(lu * 100 / lt) } else { None };
+        let wear = lu.checked_mul(100).and_then(|n| n.checked_div(lt));
         line(&mut self.buf, 7, &|s| {
             let _ = match wear {
                 Some(w) => write!(s, "FW{}K ST{}/{}K W{}%", fw_k, su, st_total, w),

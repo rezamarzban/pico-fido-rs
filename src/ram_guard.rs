@@ -120,6 +120,8 @@ impl<const N: usize> Masked<N> {
     }
 
     /// Re-randomises all shares without reconstructing the secret (all `PAIRS` steps in a row).
+    // Used by the host tests (host-test/guard); the firmware refreshes pair by pair.
+    #[allow(dead_code)]
     pub fn refresh<R: RngCore + CryptoRng>(&self, pool: &mut Pool, rng: &mut R) {
         for k in 0..Self::PAIRS {
             self.refresh_pair(pool, rng, k);
