@@ -42,7 +42,7 @@ OpenSK defaults are `true` and `150`. With `0`, `makeCredential` with `rk=true` 
 
 ## Unchanged
 
-PIN retry counter and lockout, PIN + PUF protection (Argon2id), U2F.
+PIN retry counter and lockout, PIN + PUF protection (AES-256-GCM), U2F.
 
 ## Status
 

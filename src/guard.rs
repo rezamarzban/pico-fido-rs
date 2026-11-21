@@ -5,7 +5,7 @@
 //! refresh task (interrupt executor) and the main thread can both touch them safely. Critical
 //! sections here are short: a refresh is split in 7 independent pair steps, each one ChaCha20
 //! block plus two XORs of 32 bytes, each in its own critical section (interrupts, USB included,
-//! are served between the steps). Anything heavy (HMAC expansion, Argon2) happens OUTSIDE the
+//! are served between the steps). Anything heavy (HMAC expansion, AES-GCM) happens OUTSIDE the
 //! lock, on a `Zeroizing` copy.
 //!
 //! Refresh scheduling (see `tick_task`): fast while the device is in use, slower when it is idle,

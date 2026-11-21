@@ -223,3 +223,6 @@ Fixes the issue that a PUF failure could silently produce a plain / unbound seed
 * LED: 3 short blinks + pause while `puf::fault()`.
 * [ ] Build and test: blank first boot, enrolment failure (non-POR first boot), noisy sample with an unbound record,
   noisy sample with a PUF-bound record, reset with and without a power-on reset, a flash write failure during binding.
+
+---
+**Update:** Argon2id was removed. `src/wrap.rs` now wraps the master seed with AES-256-GCM (key = HMAC-SHA-256(salt, PIN hash or PUF-mixed PIN hash)). Mentions of Argon2 above describe the earlier design. Old Argon2id records are refused (CTAP reset needed).

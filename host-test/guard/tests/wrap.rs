@@ -13,13 +13,34 @@ fn pin_wrap_roundtrip_and_wrong_pin() {
 }
 
 #[test]
-fn stored_time_cost_is_bounded() {
-    let mut rec = wrap(&SEED, &[1; 16], [9; 16], None).unwrap();
-    rec.t_cost = MAX_T_COST + 1;
-    assert!(unwrap(&rec, &[1; 16], None).is_none(), "t_cost above the limit must be refused");
-    rec.t_cost = 255;
-    assert!(unwrap(&rec, &[1; 16], None).is_none());
-    rec.t_cost = 0;
+fn old_argon2_records_and_tampering_are_refused() {
+    let rec = wrap(&SEED, &[1; 16], [9; 16], None).unwrap();
+    let mut r = wrap(&SEED, &[1; 16], [9; 16], None).unwrap();
+    r.m_kib = 64; // an Argon2id record from an older build
+    r.t_cost = 24;
+    assert!(unwrap(&r, &[1; 16], None).is_none());
+    for i in 0..32 {
+        let mut d = wrap(&SEED, &[1; 16], [9; 16], None).unwrap();
+        d.body[i] ^= 1;
+        assert!(unwrap(&d, &[1; 16], None).is_none(), "body byte {i}");
+    }
+    for i in 0..32 {
+        let mut d = wrap(&SEED, &[1; 16], [9; 16], None).unwrap();
+        d.tag[i] ^= 1;
+        assert!(unwrap(&d, &[1; 16], None).is_none(), "tag byte {i}");
+    }
+    let mut d = wrap(&SEED, &[1; 16], [9; 16], None).unwrap();
+    d.salt[0] ^= 1;
+    assert!(unwrap(&d, &[1; 16], None).is_none());
+    assert_ne!(rec.body, SEED, "the seed must not be stored in the clear");
+}
+
+#[test]
+fn pin_wrap_with_puf_roundtrip() {
+    let rec = wrap(&SEED, &[1; 16], [9; 16], Some(&KEY)).unwrap();
+    assert!(rec.puf);
+    assert_eq!(*unwrap(&rec, &[1; 16], Some(&KEY)).unwrap(), SEED);
+    assert!(unwrap(&rec, &[1; 16], Some(&[0x22; 32])).is_none());
     assert!(unwrap(&rec, &[1; 16], None).is_none());
 }
 

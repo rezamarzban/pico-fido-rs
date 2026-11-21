@@ -10,7 +10,7 @@ around it (USB, flash store, button, RNG). This branch adds a PIN-wrapped master
 | CTAP2 / CTAP1 (U2F), CTAPHID, ClientPIN, credential logic | OpenSK, `third_party/OpenSK/libraries/opensk` (git submodule; commit in `third_party/OPENSK_REV`) |
 | `opensk::env::Env` for the Pico | `src/env/mod.rs` (`PicoEnv`; customization: minimum PIN length 10, batch attestation off) |
 | Persistent store (credentials, metadata, PIN length) | `src/env/persist.rs` + `src/env/flash_store.rs`, on the `wasefire-store` crate (cleartext backend) |
-| Hardening: master key + resident-credential encryption, PIN check (Argon2id tag, no stored PIN hash), retry counter | `src/env/harden.rs` (`HardenPersist`), `src/vault.rs`, `src/store.rs`, `src/wrap.rs`; PIN hook in `third_party/opensk-harden.patch` |
+| Hardening: master key + resident-credential encryption, PIN check (AES-256-GCM tag, no stored PIN hash), retry counter | `src/env/harden.rs` (`HardenPersist`), `src/vault.rs`, `src/store.rs`, `src/wrap.rs`; PIN hook in `third_party/opensk-harden.patch` |
 | User presence = fresh BOOTSEL press | `src/env/user_presence.rs` |
 | Packet bridge between USB (async) and OpenSK (blocking) | `src/env/hid.rs` (two queues) |
 | Random numbers | `src/env/rng.rs` -> `src/keys.rs` (ring oscillator + SHA-256, `src/health.rs` health tests) |
@@ -77,7 +77,7 @@ the right `--features` (`-s` flash size in MiB, `-u` adds the USB serial number)
 
 ## Watchdog (optional)
 Build with `--features watchdog` to enable the RP2040 watchdog (8 s). Only the main thread feeds it (`src/wdog.rs`), so a hang or a
-stack-overflow fault ends in a reset. It is off by default: a single blocking step longer than 8 s without feeding (Argon2, a signature, a
+stack-overflow fault ends in a reset. It is off by default: a single blocking step longer than 8 s without feeding (a signature, a
 store compaction) would reset the device in the middle of a command, so time the longest step on your hardware first. Not built or tested.
 
 ## Stack protection and measurement
@@ -96,8 +96,7 @@ U2F registration needs an attestation key and certificate, which this firmware d
 At least **10 code points** (`default_min_pin_length` in `src/env/mod.rs`). Set it with any FIDO2 client
 (`fido2-token -S`, `ykman fido access change-pin`, Chrome/Windows security-key settings).
 
-With a PIN set, the 32-byte master seed is wrapped with **Argon2id** (64 KiB static buffer; `M_KIB` = 64, `T_COST` = 24 in
-`src/wrap.rs`) and no PIN hash is stored; a wrong PIN is detected by the record's HMAC-SHA-256 tag (keys derived with Argon2id), so no separate PIN
+With a PIN set, the 32-byte master seed is encrypted with **AES-256-GCM** (key = HMAC-SHA-256 of the PIN hash, `src/wrap.rs`; no memory-hard KDF) and no PIN hash is stored; a wrong PIN is detected by the GCM tag, so no separate PIN
 verifier exists. The 128 bytes of OpenSK master keys
 are derived on demand from the seed, which after a correct PIN lives in RAM only as XOR shares (see **RAM
 guard** below) and is dropped on USB reset / suspend / unplug. Resident
@@ -106,10 +105,9 @@ credentials are encrypted under keys derived from the master. The PIN retry coun
 ## SRAM PUF
 `src/puf.rs`. The power-up pattern of 496 reserved RAM bytes is turned into a device-bound key by a fuzzy extractor
 (128-bit secret, 31x repetition code, helper data + 8-byte check in the PUF sector). The key is reconstructed on demand and never stored; it exists in RAM only while it is used, in `Zeroizing` buffers that are wiped when
-their lifetime ends (including the temporary secret of the helper-data check). It is mixed into the Argon2 password (`HMAC(K_puf, PIN hash)`) and masks the seed of a no-PIN
+their lifetime ends (including the temporary secret of the helper-data check). It is mixed into the key input (`HMAC(K_puf, PIN hash)`) and masks the seed of a no-PIN
 record, so **a copy of the flash alone no longer allows offline PIN guessing or recovering the seed**. Records written
-by an older build are bound automatically (no-PIN: at boot; PIN set: after the next correct PIN, one extra Argon2
-run). First boot enrols the PUF (needs a power-on reset, i.e. plugging the Pico in). Every boot logs the measured
+by an older build are bound automatically (no-PIN: at boot; PIN set: after the next correct PIN, one extra wrap). First boot enrols the PUF (needs a power-on reset, i.e. plugging the Pico in). Every boot logs the measured
 bit errors (`puf: N bit errors of 3968`): read them over RTT on your chip before trusting it. If the key cannot be
 recovered (power-up pattern too noisy, RAM still charged from a quick unplug), the PIN dialog fails with a hardware
 error that is **not** counted as a wrong PIN: unplug for about 10 s and retry.
@@ -228,7 +226,7 @@ Re-check it whenever `OPENSK_REV` changes.
 
 ## Tests
     sh host-test/run.sh     # OpenSK's own library unit tests (the protocol logic), run on the host
-                            # + host-test/guard: ram_guard, vault (store.rs) and wrap (PIN wrap, Argon2 bounds, PUF-masked record) unit tests
+                            # + host-test/guard: ram_guard, vault (store.rs) and wrap (PIN wrap with AES-GCM, tamper checks, PUF-masked record) unit tests
 
 The earlier host tests (custom CBOR, CTAPHID, PIN, key store, python-fido2 end-to-end) tested code that no longer
 exists and were removed. **Nothing in this repository tests `src/env/*`, the USB bridge or the executor split**:

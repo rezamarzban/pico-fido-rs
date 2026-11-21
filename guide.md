@@ -18,7 +18,7 @@ The maintainer reports this branch working on a Pico with Linux, Windows and And
 
 ## 2. Set a PIN
 - Without a PIN, anyone who touches the key can use it. In the default build the seed in flash is wrapped with
-  Argon2id when a PIN is set and bound to this chip's SRAM PUF (it is only masked by the PUF when no PIN is set), so a
+  AES-256-GCM when a PIN is set and bound to this chip's SRAM PUF (it is only masked by the PUF when no PIN is set), so a
   copy of the flash alone is not enough to guess the PIN offline or to recover the seed; **still use a long
   passphrase**. Anyone who can run code on the device (BOOTSEL, SWD) gets past the PUF (see `SECURITY.md`).
 - Set the PIN with `fido2-token -S <device>`, `ykman fido access change-pin`, or the browser's security-key settings:
@@ -50,7 +50,7 @@ key is locked** (unplug it for about 10 seconds and plug it in again; if it pers
   could not be recovered (for example after a very short unplug), unplug the key for about 10 seconds and plug it in
   again. This is not counted as a wrong PIN.
 - **PIN after every plug-in:** the key is locked on USB reset, suspend and unplug. Enter the PIN once (any site that asks
-  for it) before U2F or no-PIN-prompt logins work; until then they fail. The Argon2 cost is tuned for a target of roughly 0.5 to 1 s per PIN check (`src/wrap.rs`), but the real time
+  for it) before U2F or no-PIN-prompt logins work; until then they fail. The PIN check is now one HMAC + one AES-GCM decryption (fast); the real time
   has not been systematically measured.
 - **First install:** erase the whole flash first (the layout changed), then flash the UF2.
 - **Wrong PINs:** the usual CTAP rules apply: after 3 wrong PINs in a row, unplug and replug; after 8 wrong PINs

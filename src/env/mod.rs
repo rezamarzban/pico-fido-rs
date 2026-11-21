@@ -27,9 +27,9 @@ use opensk::api::key_store;
 use opensk::env::Env;
 
 /// OpenSK defaults, except:
-/// * PINs must have at least 10 code points. The master key is wrapped with Argon2id under the
-///   PIN, but the RP2040 cannot make offline guessing expensive enough for short PINs: a long
-///   passphrase is the real protection of a stolen device.
+/// * PINs must have at least 10 code points. The master key is wrapped with AES-256-GCM under a
+///   key derived from the PIN (no memory-hard KDF): offline guessing is cheap, so a long
+///   passphrase (and the SRAM PUF) is the real protection of a stolen device.
 /// * `use_batch_attestation` stays false (packed self-attestation): switching it on without a
 ///   provisioned attestation key would make every makeCredential fail. U2F registration needs the
 ///   key anyway (provision it with OpenSK's tools/configure.py).

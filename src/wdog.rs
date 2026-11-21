@@ -7,7 +7,7 @@
 //! leaving the token dead until it is unplugged.
 //!
 //! Why it is not on by default: any single blocking step longer than the timeout without feeding
-//! (the Argon2 PIN derivation, a P-256 signature, a flash-store compaction that erases many
+//! (a P-256 signature, a flash-store compaction that erases many
 //! sectors) would reset the device in the middle of a command. Measure the longest such step on
 //! hardware first (`stack_probe`-style logging of command times) and keep a wide margin.
 //!

@@ -2,12 +2,12 @@
 //! retry counter in a third sector.
 //!
 //! Record (110 bytes, "FK03"):
-//!   magic[4] | seq u32 LE | wrapped u8 | argon2 m_kib u32 LE | argon2 t u8 | salt[16] |
+//!   magic[4] | seq u32 LE | wrapped u8 | fmt u32 LE (0 = AES-256-GCM; old Argon2id records have m_kib >= 8 and are refused) | unused u8 | salt[16] |
 //!   body[32] | tag[32] | first 16 bytes of SHA-256 over the previous 94 bytes
 //! * `wrapped = 0`: `body` is the plain master key (no PIN set), salt/params are zero. With the PUF bit set
 //!   `body` is masked with the PUF key and `tag` authenticates it (all-zero tag = older record without it).
 //! * `wrapped = 1`: `body` is the master key encrypted under a key derived from the PIN
-//!   (wrap.rs), `tag` authenticates it. The plain key is NOT in flash.
+//!   (wrap.rs, AES-256-GCM; the 16-byte GCM tag is in `tag[..16]`). The plain key is NOT in flash.
 //!
 //! The older 56-byte "FK02" record (plain key only) is still read, and replaced on the next write.
 //!

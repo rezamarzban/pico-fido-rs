@@ -1,17 +1,16 @@
-//! Wrapping of the 32-byte master seed under a key derived from the PIN.
+//! Wrapping of the 32-byte master seed under a key derived from the PIN, with AES-256-GCM.
 //!
-//! KEK material = Argon2id(password = LEFT(SHA-256(PIN), 16), salt = random 16 bytes, m, t, p = 1),
-//! 64 bytes: the first 32 are the encryption key, the last 32 the MAC key.
-//! Encrypt-then-MAC with HMAC-SHA-256 only:
-//!   keystream = HMAC(enc_key, "fido-wrap-ks" || salt)      (one block = 32 bytes = the seed size)
-//!   body      = seed XOR keystream
-//!   tag       = HMAC(mac_key, "fido-wrap-tag" || m_kib || t || salt || body)
-//! A wrong PIN is detected by the tag; no PIN verifier is stored.
+//! key   = HMAC-SHA-256(salt, "fido-wrap-key" || password)         (32 bytes, the AES-256 key)
+//! nonce = salt[..12]                                               (salt is fresh random per wrap)
+//! body || tag = AES-256-GCM(key, nonce, aad = "fido-wrap-v3" || puf flag, seed)
+//! The 16-byte GCM tag is stored in `Record::tag[..16]` (the rest is zero). A wrong PIN is detected
+//! by the tag; no PIN verifier is stored.
 //!
-//! Argon2 works in a static 64 KiB buffer, so it never touches the OpenSK heap. It is only called
-//! from the main thread, one call at a time.
-use argon2::{Algorithm, Argon2, Block, Params, Version};
-use core::mem::MaybeUninit;
+//! There is NO memory-hard KDF any more: the only cost of a PIN guess is one HMAC + one AES-GCM
+//! decryption. Offline guessing against a flash dump is therefore only limited by the PUF input
+//! (`password` below) and by the PIN's own entropy.
+use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce, Tag};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -19,25 +18,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::store::Record;
 
-/// Argon2 memory in KiB / passes for new wraps. NOT measured on hardware: check the logged
-/// time of a PIN check and tune `T_COST` (target about 0.5 - 1 s per guess).
-pub const M_KIB: u32 = 64;
-pub const T_COST: u8 = 24;
-/// Largest memory cost a stored record may ask for: the size of the static buffer.
-pub const MAX_M_KIB: u32 = 64;
-/// Upper bound for a stored time cost. The value comes from flash, so a damaged or forged record
-/// must not be able to make a PIN check run for minutes.
-pub const MAX_T_COST: u8 = 64;
+/// `Record::m_kib` / `t_cost` of an AES-GCM wrap. Old Argon2id records (m_kib >= 8) are no longer
+/// readable and are refused: do a CTAP reset (or re-set the PIN on a device that has none).
+const FMT_AES: u32 = 0;
 
-const BLOCKS: usize = MAX_M_KIB as usize;
-const _: () = core::assert!(core::mem::size_of::<Block>() == 1024);
-
-static mut ARGON_MEM: [MaybeUninit<Block>; BLOCKS] = {
-    const U: MaybeUninit<Block> = MaybeUninit::uninit();
-    [U; BLOCKS]
-};
-
-/// The Argon2 password: the 16-byte PIN hash, or - for PUF-bound records - an HMAC of it under
+/// The key input: the 16-byte PIN hash, or - for PUF-bound records - an HMAC of it under
 /// the SRAM-PUF key (so a flash dump alone cannot be used to test PIN guesses).
 fn password(pin_hash: &[u8; 16], puf: Option<&[u8; 32]>) -> (Zeroizing<[u8; 32]>, usize) {
     let mut pw = Zeroizing::new([0u8; 32]);
@@ -54,36 +39,6 @@ fn password(pin_hash: &[u8; 16], puf: Option<&[u8; 32]>) -> (Zeroizing<[u8; 32]>
     }
 }
 
-fn kdf(password: &[u8], salt: &[u8; 16], m_kib: u32, t: u8) -> Option<[u8; 64]> {
-    if !(8..=MAX_M_KIB).contains(&m_kib) || !m_kib.is_multiple_of(4) || !(1..=MAX_T_COST).contains(&t) {
-        return None;
-    }
-    let params = Params::new(m_kib, t as u32, 1, Some(64)).ok()?;
-    let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut out = [0u8; 64];
-    // SAFETY: single core, called from the main thread only and never re-entrantly, so nothing
-    // else touches ARGON_MEM. All-zero bytes are a valid `Block` (an array of u64).
-    let ok = unsafe {
-        let base = core::ptr::addr_of_mut!(ARGON_MEM) as *mut u8;
-        core::ptr::write_bytes(base, 0, BLOCKS * 1024);
-        let mem = core::slice::from_raw_parts_mut(base as *mut Block, m_kib as usize);
-        let ok = a
-            .hash_password_into_with_memory(password, salt, &mut out, mem)
-            .is_ok();
-        // Wipe the working set (volatile: must not be optimised away).
-        for i in 0..BLOCKS * 1024 {
-            core::ptr::write_volatile(base.add(i), 0);
-        }
-        ok
-    };
-    if ok {
-        Some(out)
-    } else {
-        out.zeroize();
-        None
-    }
-}
-
 fn hmac_of(key: &[u8], parts: &[&[u8]]) -> Hmac<Sha256> {
     let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).unwrap();
     for p in parts {
@@ -92,14 +47,21 @@ fn hmac_of(key: &[u8], parts: &[&[u8]]) -> Hmac<Sha256> {
     m
 }
 
-fn tag_of(mac_key: &[u8], m_kib: u32, t: u8, salt: &[u8; 16], body: &[u8; 32]) -> Hmac<Sha256> {
-    hmac_of(
-        mac_key,
-        &[b"fido-wrap-tag", &m_kib.to_le_bytes(), &[t], salt, body],
-    )
+fn aes_key(password: &[u8], salt: &[u8; 16]) -> Zeroizing<[u8; 32]> {
+    let k: [u8; 32] = hmac_of(salt, &[b"fido-wrap-key", password])
+        .finalize()
+        .into_bytes()
+        .into();
+    Zeroizing::new(k)
 }
 
-/// Wraps `seed` under the PIN (and the PUF key if given). `None` only if the key derivation fails.
+fn aad(puf: bool) -> [u8; 13] {
+    let mut a = *b"fido-wrap-v3\0";
+    a[12] = puf as u8;
+    a
+}
+
+/// Wraps `seed` under the PIN (and the PUF key if given). `None` only on an internal AES error.
 pub fn wrap(
     seed: &[u8; 32],
     pin_hash: &[u8; 16],
@@ -107,35 +69,28 @@ pub fn wrap(
     puf: Option<&[u8; 32]>,
 ) -> Option<Record> {
     let (pw, n) = password(pin_hash, puf);
-    let mut k = kdf(&pw[..n], &salt, M_KIB, T_COST)?;
-    let mut ks: [u8; 32] = hmac_of(&k[..32], &[b"fido-wrap-ks", &salt])
-        .finalize()
-        .into_bytes()
-        .into();
-    let mut body = [0u8; 32];
-    for ((b, m), s) in body.iter_mut().zip(seed).zip(&ks) {
-        *b = m ^ s;
-    }
-    ks.zeroize();
-    let tag: [u8; 32] = tag_of(&k[32..], M_KIB, T_COST, &salt, &body)
-        .finalize()
-        .into_bytes()
-        .into();
-    k.zeroize();
+    let key = aes_key(&pw[..n], &salt);
+    let cipher = Aes256Gcm::new_from_slice(&key[..]).ok()?;
+    let mut body = *seed;
+    let t = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(&salt[..12]), &aad(puf.is_some()), &mut body)
+        .ok()?;
+    let mut tag = [0u8; 32];
+    tag[..16].copy_from_slice(&t);
     Some(Record {
         wrapped: true,
         puf: puf.is_some(),
         puf_slot: 0, // the caller sets the real slot (`bind_slot` in env/harden.rs)
-        m_kib: M_KIB,
-        t_cost: T_COST,
+        m_kib: FMT_AES,
+        t_cost: 0,
         salt,
         body,
         tag,
     })
 }
 
-/// Recovers the seed. `None` = wrong PIN (or damaged / unsupported record). The tag comparison is
-/// constant-time (`subtle`), the result is wiped on drop.
+/// Recovers the seed. `None` = wrong PIN (or damaged / unsupported record). The GCM tag check is
+/// constant-time, the result is wiped on drop.
 ///
 /// `puf` must be `Some` exactly when `rec.puf` is set.
 pub fn unwrap(
@@ -143,27 +98,24 @@ pub fn unwrap(
     pin_hash: &[u8; 16],
     puf: Option<&[u8; 32]>,
 ) -> Option<Zeroizing<[u8; 32]>> {
-    if !rec.wrapped || rec.puf != puf.is_some() {
+    if !rec.wrapped || rec.puf != puf.is_some() || rec.m_kib != FMT_AES || rec.t_cost != 0 {
+        return None;
+    }
+    if rec.tag[16..] != [0u8; 16] {
         return None;
     }
     let (pw, n) = password(pin_hash, puf);
-    let mut k = Zeroizing::new(kdf(&pw[..n], &rec.salt, rec.m_kib, rec.t_cost)?);
-    let expect = tag_of(&k[32..], rec.m_kib, rec.t_cost, &rec.salt, &rec.body)
-        .finalize()
-        .into_bytes();
-    if !bool::from(expect.as_slice().ct_eq(&rec.tag)) {
-        k.zeroize();
-        return None;
-    }
-    let mut ks: [u8; 32] = hmac_of(&k[..32], &[b"fido-wrap-ks", &rec.salt])
-        .finalize()
-        .into_bytes()
-        .into();
-    let mut m = Zeroizing::new([0u8; 32]);
-    for ((o, b), s) in m.iter_mut().zip(&rec.body).zip(&ks) {
-        *o = b ^ s;
-    }
-    ks.zeroize();
+    let key = aes_key(&pw[..n], &rec.salt);
+    let cipher = Aes256Gcm::new_from_slice(&key[..]).ok()?;
+    let mut m = Zeroizing::new(rec.body);
+    cipher
+        .decrypt_in_place_detached(
+            Nonce::from_slice(&rec.salt[..12]),
+            &aad(rec.puf),
+            &mut m[..],
+            Tag::from_slice(&rec.tag[..16]),
+        )
+        .ok()?;
     Some(m)
 }
 

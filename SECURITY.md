@@ -18,10 +18,10 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   no secure storage, no flash encryption and no OTP key area, and the USB bootloader or SWD can read the whole
   flash. A secure element that signs internally would keep the key out of flash, but is not a complete fix: the ATECC608 used in the `atecc-*` branches, for example, has no user-presence check, so anyone with access to its bus can still request signatures.
 * **Offline PIN guessing, when a PIN is set and the attacker has the PUF secret or the PUF is off.** With the default SRAM PUF
-  working, a flash-only dump does not contain the PUF-derived value mixed into the Argon2 password, so guesses cannot be tested
+  working, a flash-only dump does not contain the PUF-derived value mixed into the AES key input, so guesses cannot be tested
   offline. If the PUF is disabled (`build.sh -P`) or its secret is obtained (code execution on the device: BOOTSEL, SWD), guessing
-  is limited only by Argon2id (64 KiB), which the RP2040 can only afford at a small cost: a short PIN then falls quickly to a
-  GPU/ASIC attacker. Use a long passphrase.
+  is limited only by one HMAC + one AES-GCM decryption per guess (there is no memory-hard KDF): a PIN then falls in seconds to a
+  GPU/ASIC attacker unless it is a long passphrase. Use a long passphrase.
 * **Short PINs.** The firmware requires at least 10 code points because of the point above; use a long
   passphrase.
 * **Reading RAM** (debugger/SWD): the RP2040 has no debug lockout. The RAM guard (below) only raises the cost of
@@ -66,7 +66,7 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
 ## Hardened key storage (vault + HardenPersist)
 
 * The master seed (32 bytes) lives in a dual-slot, power-cut-safe vault in the last 12 KiB of flash.
-  With a PIN set it is wrapped with Argon2id (64 KiB, `T_COST` passes) + HMAC-SHA-256; the PIN
+  With a PIN set it is encrypted with AES-256-GCM (key = HMAC-SHA-256 of the PIN hash and a random salt); the PIN
   check is the wrap tag, no PIN hash is stored (the OpenSK PIN record holds zeros and the length).
 * From the seed, 128 bytes of OpenSK master keys are derived in RAM. Non-resident credentials
   (credential IDs) and cred-random depend on them; resident credentials are additionally encrypted
@@ -79,7 +79,7 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   locked, credential-ID operations (including U2F and `uv=false` assertions) fail until the PIN is
   entered once.
 * **Offline guessing:** without the SRAM PUF, an attacker with a flash dump can try PINs offline at the cost
-  of Argon2 with 64 KiB; with it (see below) a flash-only dump is not enough, but code execution on the device is. The RP2040 cannot make that expensive; use a long passphrase (min. 10 code points
+  of one HMAC + AES-GCM per guess; with it (see below) a flash-only dump is not enough, but code execution on the device is. Use a long passphrase (min. 10 code points
   by default).
 * Not protected: RAM while a session is open, side channels, fault injection; the RNG is the ROSC
   (not a certified TRNG).
@@ -95,7 +95,7 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
 
 * **What it does:** the power-up state of 496 reserved RAM bytes (first 512 bytes of SRAM, outside the linker's RAM)
   is turned into a 256-bit key by a code-offset fuzzy extractor (128-bit secret, 31x repetition code, interleaved).
-  The public helper data and an 8-byte check sit in one flash sector. The key is mixed into the Argon2 password of a
+  The public helper data and an 8-byte check sit in one flash sector. The key is mixed into the AES key input of a
   PIN-wrapped seed and masks the seed of a no-PIN record, and is derived on demand (never stored in RAM).
 * **What it buys:** a dump, backup or programmer read of the **flash only** is no longer enough to test PIN guesses
   offline or to recover the seed, and a seed cannot be moved to another RP2040.
@@ -133,7 +133,7 @@ A small, software-only FIDO2/U2F key for the RP2040 on top of OpenSK. Read this 
   vaults written by older firmware, a PIN-wrapped vault without metadata (restored with the minimum PIN length). No CTAP reset is
   needed any more. A failed commit that leaves the old plain record removes the metadata again.
 * **Watchdog (feature `watchdog`, off by default):** fed only by the main thread (polling waits and the main loop), so a hang or a
-  stack-overflow HardFault ends in a reset after 8 s. Off because a single blocking step longer than that (Argon2, a signature, a
+  stack-overflow HardFault ends in a reset after 8 s. Off because a single blocking step longer than that (a signature, a
   store compaction) would reset the device mid-command: measure the longest step on hardware first.
 * **set_pin with an unwipable older record:** the new record and the PIN metadata are both written, then an error is returned; the
   device then needs the older record wiped (next boot retries; with the PUF required the vault stays locked until then).

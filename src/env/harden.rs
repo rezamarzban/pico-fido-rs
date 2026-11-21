@@ -1,7 +1,7 @@
 //! `Persist` wrapper that puts the secrets behind the PIN.
 //!
 //! * The 32-byte master seed lives in the vault (src/vault.rs), wrapped under the PIN with
-//!   Argon2id once a PIN is set. After a correct PIN the seed is kept in RAM ONLY as XOR shares
+//!   AES-256-GCM once a PIN is set. After a correct PIN the seed is kept in RAM ONLY as XOR shares
 //!   (src/ram_guard.rs, src/guard.rs), refreshed (adaptively, every 0.5 to 2 ms while a seed is held) and around every key use, until
 //!   `lock_now()` (USB reset / suspend / unplug) or power-off. The 128 bytes OpenSK's key store
 //!   uses are derived from the seed on demand and wiped right after.
@@ -11,7 +11,7 @@
 //! * Resident credentials (CREDENTIALS key range) are encrypted + authenticated under keys
 //!   derived from the master. Everything else (RP IDs of non-resident credentials are never
 //!   stored; counters, large blobs, settings) stays in clear.
-//! * PIN verification: the Argon2 tag is the verifier. The stored PIN "hash" is all zeros. The
+//! * PIN verification: the AES-GCM tag is the verifier. The stored PIN "hash" is all zeros. The
 //!   patched `verify_pin_hash_enc` (third_party/opensk-harden.patch) calls `unlock_with_pin`.
 //! * The PIN retry counter is the vault's power-cut-safe counter, not OpenSK's.
 use alloc::vec::Vec;
@@ -457,7 +457,7 @@ impl Persist for HardenPersist {
 
     // ---- PIN ---------------------------------------------------------------------------------
 
-    /// Called by the patched `verify_pin_hash_enc`. Argon2 tag = verifier (compared in constant
+    /// Called by the patched `verify_pin_hash_enc`. AES-GCM tag = verifier (compared in constant
     /// time in `wrap::unwrap`).
     fn unlock_with_pin(&mut self, pin_hash: &[u8; 16]) -> CtapResult<Option<bool>> {
         let st = self.st.get_mut();
@@ -587,7 +587,7 @@ impl Persist for HardenPersist {
             //    seed is untouched) and "old PIN record + new length" (harmless). The reverse
             //    (PIN-wrapped vault, no metadata) cannot be produced any more.
             let was_wrapped = st.rec.as_ref().is_some_and(|r| r.wrapped);
-            // The stored PIN "hash" is zeros: the real check is the Argon2 tag in the vault.
+            // The stored PIN "hash" is zeros: the real check is the AES-GCM tag in the vault.
             let mut props = [0u8; 17];
             props[0] = pin_code_point_length;
             self.raw.insert(keys::PIN_PROPERTIES, &props)?;

@@ -13,6 +13,6 @@ rand_chacha = "0.3"
 sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"
-argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 zeroize_derive = "=1.4.2"  # only needed with Cargo < 1.85 (1.5 needs edition 2024)

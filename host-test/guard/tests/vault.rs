@@ -23,7 +23,7 @@ impl Sectors for Mock {
         self.t = [0xFF; TRIES_PAGES]; Ok(())
     }
 }
-fn wrapped() -> Record { Record { wrapped: true, puf: false, puf_slot: 0, m_kib: 64, t_cost: 3, salt: [5; 16], body: [6; 32], tag: [7; 32] } }
+fn wrapped() -> Record { Record { wrapped: true, puf: false, puf_slot: 0, m_kib: 0, t_cost: 0, salt: [5; 16], body: [6; 32], tag: [7; 32] } }
 
 #[test]
 fn old_plain_record_wiped_normally() {
